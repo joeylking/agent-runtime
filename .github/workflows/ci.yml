@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      - name: scripted example
+        run: go run ./examples/scripted -db "$RUNNER_TEMP/example.db"
+
+  # Tests that need a subprocess or on-disk crash simulation are added under
+  # the "crash" build tag in later milestones. This job invokes them explicitly
+  # so they are never skipped silently by a tag mismatch. It currently runs the
+  # same suite because no tagged tests exist yet.
+  crash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -tags crash -count=1 ./...
