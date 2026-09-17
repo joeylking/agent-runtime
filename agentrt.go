@@ -49,6 +49,10 @@ const (
 	ReasonGoalCompleted        TerminalReason = "goal_completed"
 	ReasonGoalFailed           TerminalReason = "goal_failed"
 	ReasonLimitSteps           TerminalReason = "limit_steps"
+	ReasonLimitModelCalls      TerminalReason = "limit_model_calls"
+	ReasonLimitTokens          TerminalReason = "limit_tokens"
+	ReasonLimitCost            TerminalReason = "limit_cost"
+	ReasonModelUnavailable     TerminalReason = "model_unavailable"
 	ReasonRepeatedToolFailures TerminalReason = "repeated_tool_failures"
 	ReasonLoopDetected         TerminalReason = "loop_detected"
 	ReasonPolicyAbort          TerminalReason = "policy_abort"
@@ -71,6 +75,17 @@ type Limits struct {
 	// arguments has produced the same observation this many times in a row.
 	// Repeating a call whose result changed is progress and is allowed.
 	LoopThreshold int `json:"loop_threshold"`
+	// MaxModelCalls counts every attempt, including retries and ambiguous
+	// ones. Zero means unlimited.
+	MaxModelCalls int `json:"max_model_calls,omitempty"`
+	// MaxOutputTokensPerCall caps each request's output. Zero leaves the
+	// agent's value.
+	MaxOutputTokensPerCall int `json:"max_output_tokens_per_call,omitempty"`
+	// MaxTotalTokens and MaxEstimatedCost are estimated limits: they are
+	// checked before each call against totals plus a conservative estimate
+	// for the call. Zero means unlimited.
+	MaxTotalTokens   int    `json:"max_total_tokens,omitempty"`
+	MaxEstimatedCost Micros `json:"max_estimated_cost_micros,omitempty"`
 }
 
 // DefaultLimits returns conservative defaults.
@@ -106,6 +121,10 @@ type Run struct {
 	FinishedAt time.Time
 	// Result is the payload of a Complete decision, if any.
 	Result json.RawMessage
+	// Model accounting totals across every attempt.
+	ModelCalls    int
+	Usage         Usage
+	EstimatedCost Micros
 }
 
 // StepStatus is the state of one step.
@@ -324,6 +343,9 @@ type StepInput struct {
 	Steps     []Step
 	Approvals []Approval
 	Tools     []ToolSpec
+	// Model is the agent's only handle to the model. It is nil when the
+	// driver was configured without one, as for scripted agents.
+	Model ModelCaller
 }
 
 // Agent decides what happens next.
@@ -359,6 +381,9 @@ const (
 	EventRunResumed        = "run.resumed"
 	EventRunInterrupted    = "run.interrupted"
 	EventStepInterrupted   = "step.interrupted"
+	EventModelDispatched   = "model.dispatched"
+	EventModelCompleted    = "model.completed"
+	EventModelFailed       = "model.failed"
 )
 
 // Observer receives every event after it has been committed.

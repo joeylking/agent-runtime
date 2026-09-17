@@ -113,6 +113,28 @@ var migrations = []string{
 		note TEXT NOT NULL DEFAULT ''
 	);
 	CREATE INDEX approvals_run ON approvals(run_id, created_at);`,
+	`CREATE TABLE model_calls (
+		id TEXT PRIMARY KEY,
+		run_id TEXT NOT NULL REFERENCES runs(id),
+		step_id TEXT NOT NULL,
+		attempt INTEGER NOT NULL,
+		status TEXT NOT NULL,
+		model TEXT NOT NULL,
+		input_tokens INTEGER NOT NULL DEFAULT 0,
+		output_tokens INTEGER NOT NULL DEFAULT 0,
+		cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+		cost_micros INTEGER NOT NULL DEFAULT 0,
+		latency_ms INTEGER NOT NULL DEFAULT 0,
+		error TEXT NOT NULL DEFAULT '',
+		dispatched_at TEXT NOT NULL,
+		completed_at TEXT NOT NULL DEFAULT ''
+	);
+	CREATE INDEX model_calls_run ON model_calls(run_id, dispatched_at);
+	ALTER TABLE runs ADD COLUMN model_calls INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE runs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE runs ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE runs ADD COLUMN estimated_cost_micros INTEGER NOT NULL DEFAULT 0;`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -191,13 +213,13 @@ func (s *Store) CreateRun(ctx context.Context, r Run) error {
 
 // GetRun loads a run by id.
 func (s *Store) GetRun(ctx context.Context, id string) (Run, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json FROM runs WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros FROM runs WHERE id = ?`, id)
 	return scanRun(row)
 }
 
 // ListRuns returns every run, newest first.
 func (s *Store) ListRuns(ctx context.Context) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json FROM runs ORDER BY created_at DESC, id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros FROM runs ORDER BY created_at DESC, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +240,9 @@ type scanner interface{ Scan(dest ...any) error }
 func scanRun(sc scanner) (Run, error) {
 	var r Run
 	var limits, created, started, finished, result string
-	err := sc.Scan(&r.ID, &r.Goal, &r.Status, &r.Reason, &r.ReasonDetail, &limits, &r.StepCount, &created, &started, &finished, &result)
+	var cost int64
+	err := sc.Scan(&r.ID, &r.Goal, &r.Status, &r.Reason, &r.ReasonDetail, &limits, &r.StepCount, &created, &started, &finished, &result, &r.ModelCalls, &r.Usage.InputTokens, &r.Usage.OutputTokens, &r.Usage.CachedInputTokens, &cost)
+	r.EstimatedCost = Micros(cost)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Run{}, ErrNotFound
 	}
@@ -282,6 +306,33 @@ func (s *Store) ListSteps(ctx context.Context, runID string) ([]Step, error) {
 			return nil, err
 		}
 		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+// ListModelCalls returns a run's model call attempts in dispatch order.
+func (s *Store) ListModelCalls(ctx context.Context, runID string) ([]ModelCall, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, step_id, attempt, status, model, input_tokens, output_tokens, cached_input_tokens, cost_micros, latency_ms, error, dispatched_at, completed_at FROM model_calls WHERE run_id = ? ORDER BY dispatched_at, id`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ModelCall
+	for rows.Next() {
+		var c ModelCall
+		var cost, latency int64
+		var dispatched, completed string
+		if err := rows.Scan(&c.ID, &c.RunID, &c.StepID, &c.Attempt, &c.Status, &c.Model, &c.Usage.InputTokens, &c.Usage.OutputTokens, &c.Usage.CachedInputTokens, &cost, &latency, &c.Error, &dispatched, &completed); err != nil {
+			return nil, err
+		}
+		c.Cost, c.Latency = Micros(cost), time.Duration(latency)*time.Millisecond
+		if c.DispatchedAt, err = parseTime(dispatched); err != nil {
+			return nil, err
+		}
+		if c.CompletedAt, err = parseTime(completed); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
 	}
 	return out, rows.Err()
 }
@@ -381,8 +432,8 @@ func (s *Store) tx(ctx context.Context, obs Observer, fn func(t *txn) error) err
 }
 
 func (t *txn) insertRun(ctx context.Context, r Run) error {
-	_, err := t.tx.ExecContext(ctx, `INSERT INTO runs (id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.Goal, r.Status, r.Reason, r.ReasonDetail, string(mustJSON(r.Limits)), r.StepCount, formatTime(r.CreatedAt), formatTime(r.StartedAt), formatTime(r.FinishedAt), marshalOpt(r.Result))
+	_, err := t.tx.ExecContext(ctx, `INSERT INTO runs (id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.Goal, r.Status, r.Reason, r.ReasonDetail, string(mustJSON(r.Limits)), r.StepCount, formatTime(r.CreatedAt), formatTime(r.StartedAt), formatTime(r.FinishedAt), marshalOpt(r.Result), r.ModelCalls, r.Usage.InputTokens, r.Usage.OutputTokens, r.Usage.CachedInputTokens, int64(r.EstimatedCost))
 	return err
 }
 
@@ -414,6 +465,30 @@ func (t *txn) updateStep(ctx context.Context, st Step) error {
 		return fmt.Errorf("agentrt: update step %s: %w", st.ID, ErrNotFound)
 	}
 	return nil
+}
+
+func (t *txn) insertModelCall(ctx context.Context, c ModelCall) error {
+	_, err := t.tx.ExecContext(ctx, `INSERT INTO model_calls (id, run_id, step_id, attempt, status, model, dispatched_at) VALUES (?,?,?,?,?,?,?)`,
+		c.ID, c.RunID, c.StepID, c.Attempt, c.Status, c.Model, formatTime(c.DispatchedAt))
+	return err
+}
+
+func (t *txn) updateModelCall(ctx context.Context, c ModelCall) error {
+	res, err := t.tx.ExecContext(ctx, `UPDATE model_calls SET status=?, input_tokens=?, output_tokens=?, cached_input_tokens=?, cost_micros=?, latency_ms=?, error=?, completed_at=? WHERE id=?`,
+		c.Status, c.Usage.InputTokens, c.Usage.OutputTokens, c.Usage.CachedInputTokens, int64(c.Cost), c.Latency.Milliseconds(), c.Error, formatTime(c.CompletedAt), c.ID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("agentrt: update model call %s: %w", c.ID, ErrNotFound)
+	}
+	return nil
+}
+
+func (t *txn) addRunUsage(ctx context.Context, runID string, u Usage, cost Micros) error {
+	_, err := t.tx.ExecContext(ctx, `UPDATE runs SET model_calls = model_calls + 1, input_tokens = input_tokens + ?, output_tokens = output_tokens + ?, cached_input_tokens = cached_input_tokens + ?, estimated_cost_micros = estimated_cost_micros + ? WHERE id=?`,
+		u.InputTokens, u.OutputTokens, u.CachedInputTokens, int64(cost), runID)
+	return err
 }
 
 func (t *txn) insertApproval(ctx context.Context, a Approval) error {

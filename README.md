@@ -47,5 +47,9 @@ run, _ := driver.Start(ctx, "goal", agentrt.DefaultLimits())
 ```
 
 A run ends `COMPLETED`, `FAILED` with a terminal reason, or pauses in
-`WAITING_FOR_APPROVAL` when policy requires approval. Resuming a paused run is
-not implemented in this milestone.
+`WAITING_FOR_APPROVAL` on a hash-bound approval that `Approve` and `Resume`
+continue. A `Model` given to the driver is wrapped in an accounting caller
+that agents receive in `StepInput`: it records every attempt, enforces call,
+token, and cost limits before dispatch, and retries transient failures. The
+`replay` package provides scripted, recording, and replaying models so tests
+never call a provider.

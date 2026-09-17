@@ -16,6 +16,9 @@ type Config struct {
 	Policy   Policy
 	Tools    []Tool
 	Observer Observer
+	// Model, when set, is wrapped in a ModelCaller that agents receive in
+	// StepInput. Scripted agents leave it nil.
+	Model *ModelConfig
 	// Reconcile, when set, runs before a run found mid-step is continued by
 	// Resume. Consumers use it to reconcile their own journaled operations.
 	Reconcile func(ctx context.Context, view RunView) error
@@ -34,6 +37,7 @@ type Driver struct {
 	schemas   map[string]*compiledSchema
 	specs     []ToolSpec
 	observer  Observer
+	model     *ModelConfig
 	reconcile func(ctx context.Context, view RunView) error
 	now       func() time.Time
 	newID     func() string
@@ -50,6 +54,9 @@ func NewDriver(cfg Config) (*Driver, error) {
 	if cfg.Policy == nil {
 		return nil, errors.New("agentrt: policy is required")
 	}
+	if cfg.Model != nil && cfg.Model.Model == nil {
+		return nil, errors.New("agentrt: model config without a model")
+	}
 	d := &Driver{
 		store:     cfg.Store,
 		agent:     cfg.Agent,
@@ -57,6 +64,7 @@ func NewDriver(cfg Config) (*Driver, error) {
 		tools:     map[string]Tool{},
 		schemas:   map[string]*compiledSchema{},
 		observer:  cfg.Observer,
+		model:     cfg.Model,
 		reconcile: cfg.Reconcile,
 		now:       cfg.Now,
 		newID:     cfg.NewID,
@@ -177,12 +185,29 @@ func (d *Driver) loop(ctx context.Context, runID string) (Run, error) {
 			return Run{}, err
 		}
 
-		decision, err := d.agent.Decide(ctx, StepInput{Run: run, Steps: steps, Approvals: approvals, Tools: d.specs})
+		var mc ModelCaller
+		if d.model != nil {
+			mc = &caller{d: d, cfg: *d.model, runID: run.ID, stepID: step.ID}
+		}
+		decision, err := d.agent.Decide(ctx, StepInput{Run: run, Steps: steps, Approvals: approvals, Tools: d.specs, Model: mc})
 		if err != nil {
 			if ferr := d.failStep(ctx, &step, nil, "agent error: "+err.Error()); ferr != nil {
 				return Run{}, ferr
 			}
-			return d.finish(ctx, run, StatusFailed, ReasonAgentError, err.Error(), nil, false)
+			reason := ReasonAgentError
+			var lim ErrLimit
+			var unavailable ErrModelUnavailable
+			switch {
+			case errors.As(err, &lim):
+				reason = lim.Reason
+			case errors.As(err, &unavailable):
+				reason = ReasonModelUnavailable
+			}
+			// Reload: the caller may have recorded usage during this step.
+			if fresh, gerr := d.store.GetRun(ctx, run.ID); gerr == nil {
+				run = fresh
+			}
+			return d.finish(ctx, run, StatusFailed, reason, err.Error(), nil, reason != ReasonAgentError)
 		}
 		step.Decision = &decision
 
@@ -733,6 +758,10 @@ func (d *Driver) resumeInterrupted(ctx context.Context, run Run) (Run, error) {
 
 func (d *Driver) finish(ctx context.Context, run Run, status RunStatus, reason TerminalReason, detail string, result json.RawMessage, limit bool) (Run, error) {
 	now := d.now()
+	// Model accounting may have advanced since the run was loaded.
+	if fresh, err := d.store.GetRun(ctx, run.ID); err == nil {
+		run.ModelCalls, run.Usage, run.EstimatedCost = fresh.ModelCalls, fresh.Usage, fresh.EstimatedCost
+	}
 	run.Status = status
 	run.Reason = reason
 	run.ReasonDetail = detail

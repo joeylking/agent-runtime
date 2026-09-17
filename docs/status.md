@@ -23,6 +23,12 @@ exists, reference given), **Verified** (a named test exercises it).
 | Terminal tools complete the run with their result | Verified | `TestDriver_TerminalToolCompletesRun` |
 | `ErrAbortRun` ends the run with `tool_abort` | Verified | `TestDriver_ToolAbortEndsRun` |
 | Resume of a run found mid-step: step marked interrupted, consumer reconciliation runs, side effects never re-executed | Verified | `TestResume_InterruptedStepIsReconciledAndContinued` |
+| Model interface with content blocks, tool uses, usage; the agent's only handle is the accounting wrapper | Verified | `model.go`, `TestModel_UsageAndCostRecorded` |
+| Every attempt reserved as a row before dispatch; usage, latency, cost recorded; run totals maintained | Verified | `TestModel_UsageAndCostRecorded`, `TestModel_TransientRetryThenSuccess` |
+| Call limit enforced before dispatch; token and cost limits enforced on totals plus a conservative projection | Verified | `TestModel_CallLimitStopsBeforeDispatch`, `TestModel_TokenAndCostLimitsProjected` |
+| Transient errors retried with backoff, each attempt counted; non-transient errors not retried; exhaustion ends the run as model_unavailable | Verified | `TestModel_TransientRetryThenSuccess`, `TestModel_ExhaustedRetriesIsUnavailable` |
+| Ambiguous attempts (timeout, connection lost) counted and charged at the conservative estimate | Verified | `TestModel_AmbiguousAttemptChargedConservatively` |
+| Record and replay models keyed by canonical request and model name; unrecorded requests fail | Verified | `replay`, `TestReplay_RecordThenReplay` |
 | Step limit | Verified | `TestDriver_StepLimit` |
 | Consecutive failure limit, reset on success | Verified | `TestDriver_ConsecutiveFailuresEndRun`, `TestDriver_FailureStreakResetsOnSuccess` |
 | Loop detection on (tool, arguments, observation); changing results are progress | Verified | `TestDriver_IdenticalCallAndResultStops`, `TestDriver_RepeatedCallWithChangingResultAllowed`, `TestDriver_LoopStreakResets` |
@@ -35,7 +41,8 @@ exists, reference given), **Verified** (a named test exercises it).
 
 | Capability | Milestone |
 |---|---|
-| Approval expiry | 2 |
+| Approval expiry | 3 |
+| Active and elapsed time limits | 3 |
 | Structured reconciliation outcomes (completed, continue, waiting, conflict) for publication recovery | 3 |
 | Model interface, wrapper with usage, cost, retries, ambiguous accounting, token and cost limits | 2 |
 | Active and elapsed time limits | 2 |
