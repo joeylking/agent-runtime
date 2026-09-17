@@ -24,9 +24,12 @@ const (
 	StatusCreated            RunStatus = "CREATED"
 	StatusRunning            RunStatus = "RUNNING"
 	StatusWaitingForApproval RunStatus = "WAITING_FOR_APPROVAL"
-	StatusCompleted          RunStatus = "COMPLETED"
-	StatusFailed             RunStatus = "FAILED"
-	StatusCancelled          RunStatus = "CANCELLED"
+	// StatusInterrupted marks a run found RUNNING with in-flight work by a
+	// process that did not start it; Resume reconciles and continues it.
+	StatusInterrupted RunStatus = "INTERRUPTED"
+	StatusCompleted   RunStatus = "COMPLETED"
+	StatusFailed      RunStatus = "FAILED"
+	StatusCancelled   RunStatus = "CANCELLED"
 )
 
 // Terminal reports whether no further steps can occur for a run in this status.
@@ -49,6 +52,8 @@ const (
 	ReasonRepeatedToolFailures TerminalReason = "repeated_tool_failures"
 	ReasonLoopDetected         TerminalReason = "loop_detected"
 	ReasonPolicyAbort          TerminalReason = "policy_abort"
+	ReasonToolAbort            TerminalReason = "tool_abort"
+	ReasonApprovalRejected     TerminalReason = "approval_rejected"
 	ReasonAgentError           TerminalReason = "agent_error"
 	ReasonInternalError        TerminalReason = "internal_error"
 )
@@ -112,6 +117,7 @@ const (
 	StepExecuting        StepStatus = "executing"
 	StepDone             StepStatus = "done"
 	StepFailed           StepStatus = "failed"
+	StepInterrupted      StepStatus = "interrupted"
 )
 
 // DecisionKind classifies what the agent asked for.
@@ -147,6 +153,7 @@ const (
 	ObserveToolError       ObservationKind = "tool_error"
 	ObservePolicyDenied    ObservationKind = "policy_denied"
 	ObserveInvalidDecision ObservationKind = "invalid_decision"
+	ObserveInterrupted     ObservationKind = "interrupted"
 )
 
 // Observation is what a step produced for the agent to consider next.
@@ -204,7 +211,19 @@ type ToolSpec struct {
 	SideEffect  SideEffect      `json:"side_effect"`
 	// Timeout bounds a single call. It is required.
 	Timeout time.Duration `json:"timeout"`
+	// Terminal tools complete the run when they succeed; their result
+	// becomes the run result and no further decision is requested.
+	Terminal bool `json:"terminal,omitempty"`
 }
+
+// ErrAbortRun may be returned by a tool to end the run as FAILED with
+// reason tool_abort. It is for conditions that make continuing pointless,
+// such as a frozen proposal found invalid at publication.
+type ErrAbortRun struct {
+	Detail string
+}
+
+func (e ErrAbortRun) Error() string { return "abort run: " + e.Detail }
 
 // ToolCall carries the driver-supplied execution identity into a tool.
 type ToolCall struct {
@@ -250,16 +269,46 @@ type PolicyDecision struct {
 
 // ToolRequest is a schema-validated request handed to the policy.
 type ToolRequest struct {
-	RunID  string
-	StepID string
-	Spec   ToolSpec
-	Args   json.RawMessage
+	RunID  string          `json:"run_id"`
+	StepID string          `json:"step_id"`
+	Spec   ToolSpec        `json:"spec"`
+	Args   json.RawMessage `json:"args"`
 }
 
 // RunView is the read-only view a policy may consult.
 type RunView struct {
-	Run   Run
-	Steps []Step
+	Run       Run
+	Steps     []Step
+	Approvals []Approval
+}
+
+// ApprovalStatus is the state of an approval.
+type ApprovalStatus string
+
+const (
+	ApprovalPending  ApprovalStatus = "pending"
+	ApprovalApproved ApprovalStatus = "approved"
+	ApprovalRejected ApprovalStatus = "rejected"
+)
+
+// Approval is a durable, hash-bound request for a human decision. Its hash
+// covers the kind, capability, presentation, and the exact tool request, so
+// a changed request cannot inherit an old approval. On resume the runtime
+// executes the recorded request and nothing else.
+type Approval struct {
+	ID           string          `json:"id"`
+	RunID        string          `json:"run_id"`
+	StepID       string          `json:"step_id"`
+	Kind         string          `json:"kind"`
+	Capability   json.RawMessage `json:"capability"`
+	Presentation json.RawMessage `json:"presentation"`
+	Request      ToolRequest     `json:"request"`
+	Hash         string          `json:"hash"`
+	Status       ApprovalStatus  `json:"status"`
+	CreatedAt    time.Time       `json:"created_at"`
+	DecidedAt    time.Time       `json:"decided_at,omitempty"`
+	DecidedBy    string          `json:"decided_by,omitempty"`
+	Note         string          `json:"note,omitempty"`
 }
 
 // Policy decides whether a validated tool request may execute. It is evaluated
@@ -271,9 +320,10 @@ type Policy interface {
 // StepInput is everything the agent receives when asked to decide. Steps are
 // all prior steps in order; the agent is stateless between calls.
 type StepInput struct {
-	Run   Run
-	Steps []Step
-	Tools []ToolSpec
+	Run       Run
+	Steps     []Step
+	Approvals []Approval
+	Tools     []ToolSpec
 }
 
 // Agent decides what happens next.
@@ -305,6 +355,10 @@ const (
 	EventApprovalRequested = "approval.requested"
 	EventLimitExceeded     = "limit.exceeded"
 	EventLoopDetected      = "loop.detected"
+	EventApprovalDecided   = "approval.decided"
+	EventRunResumed        = "run.resumed"
+	EventRunInterrupted    = "run.interrupted"
+	EventStepInterrupted   = "step.interrupted"
 )
 
 // Observer receives every event after it has been committed.

@@ -3,7 +3,7 @@
 Status values: **Required** (planned, not implemented), **Implemented** (code
 exists, reference given), **Verified** (a named test exercises it).
 
-## Milestone 0 (batches 0A and 0B)
+## Milestones 0 and 1
 
 | Capability | Status | Reference |
 |---|---|---|
@@ -15,7 +15,14 @@ exists, reference given), **Verified** (a named test exercises it).
 | Tool argument schema validation before policy | Verified | `schema.go`, `TestDriver_InvalidArgumentsBecomeObservation` |
 | Tool registration rejects missing schema, timeout, or side effect | Verified | `TestNewDriver_RejectsBadTools` |
 | Side-effect policy: allow, deny, abort, require_approval | Verified | `policy.go`, `TestDriver_PolicyDenyIsObservation`, `TestDriver_PolicyAbortEndsRun`, `TestDriver_RequireApprovalPausesRun` |
-| Pause in WAITING_FOR_APPROVAL with the request recorded | Verified | `TestDriver_RequireApprovalPausesRun` |
+| Pause in WAITING_FOR_APPROVAL with a hash-bound approval row | Verified | `TestDriver_RequireApprovalPausesRun`, `TestApproval_RecordedWithHash` |
+| Approve, then Resume executes exactly the recorded request and continues the loop | Verified | `TestApproval_ApproveThenResumeExecutesRecordedRequest` |
+| Reject cancels the run with `approval_rejected` | Verified | `TestApproval_RejectCancelsRun` |
+| A tampered approval row is refused by hash | Verified | `TestApproval_TamperedRowRefused` |
+| Policy re-evaluated on resume; a different required approval pauses again | Verified | `TestApproval_ResumeRepausesWhenPolicyWantsDifferentApproval` |
+| Terminal tools complete the run with their result | Verified | `TestDriver_TerminalToolCompletesRun` |
+| `ErrAbortRun` ends the run with `tool_abort` | Verified | `TestDriver_ToolAbortEndsRun` |
+| Resume of a run found mid-step: step marked interrupted, consumer reconciliation runs, side effects never re-executed | Verified | `TestResume_InterruptedStepIsReconciledAndContinued` |
 | Step limit | Verified | `TestDriver_StepLimit` |
 | Consecutive failure limit, reset on success | Verified | `TestDriver_ConsecutiveFailuresEndRun`, `TestDriver_FailureStreakResetsOnSuccess` |
 | Loop detection on (tool, arguments, observation); changing results are progress | Verified | `TestDriver_IdenticalCallAndResultStops`, `TestDriver_RepeatedCallWithChangingResultAllowed`, `TestDriver_LoopStreakResets` |
@@ -28,9 +35,8 @@ exists, reference given), **Verified** (a named test exercises it).
 
 | Capability | Milestone |
 |---|---|
-| Durable approval records, `Approve`, `Reject`, `Resume`, approval expiry | 1 |
-| `Terminal` tools and `ErrAbortRun` | 1 |
-| `Recover` with structured reconciliation, INTERRUPTED status, per-run OS lock | 1 (the executor lock exists in repo-steward) |
+| Approval expiry | 2 |
+| Structured reconciliation outcomes (completed, continue, waiting, conflict) for publication recovery | 3 |
 | Model interface, wrapper with usage, cost, retries, ambiguous accounting, token and cost limits | 2 |
 | Active and elapsed time limits | 2 |
 | Blob table for large tool outputs | 1 |

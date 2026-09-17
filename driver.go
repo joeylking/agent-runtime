@@ -16,6 +16,9 @@ type Config struct {
 	Policy   Policy
 	Tools    []Tool
 	Observer Observer
+	// Reconcile, when set, runs before a run found mid-step is continued by
+	// Resume. Consumers use it to reconcile their own journaled operations.
+	Reconcile func(ctx context.Context, view RunView) error
 	// Now and NewID may be overridden by tests.
 	Now   func() time.Time
 	NewID func() string
@@ -24,15 +27,16 @@ type Config struct {
 // Driver runs the step loop. It is safe to reuse for many runs but a single
 // run is executed by one call at a time.
 type Driver struct {
-	store    *Store
-	agent    Agent
-	policy   Policy
-	tools    map[string]Tool
-	schemas  map[string]*compiledSchema
-	specs    []ToolSpec
-	observer Observer
-	now      func() time.Time
-	newID    func() string
+	store     *Store
+	agent     Agent
+	policy    Policy
+	tools     map[string]Tool
+	schemas   map[string]*compiledSchema
+	specs     []ToolSpec
+	observer  Observer
+	reconcile func(ctx context.Context, view RunView) error
+	now       func() time.Time
+	newID     func() string
 }
 
 // NewDriver validates the configuration and compiles every tool schema.
@@ -47,14 +51,15 @@ func NewDriver(cfg Config) (*Driver, error) {
 		return nil, errors.New("agentrt: policy is required")
 	}
 	d := &Driver{
-		store:    cfg.Store,
-		agent:    cfg.Agent,
-		policy:   cfg.Policy,
-		tools:    map[string]Tool{},
-		schemas:  map[string]*compiledSchema{},
-		observer: cfg.Observer,
-		now:      cfg.Now,
-		newID:    cfg.NewID,
+		store:     cfg.Store,
+		agent:     cfg.Agent,
+		policy:    cfg.Policy,
+		tools:     map[string]Tool{},
+		schemas:   map[string]*compiledSchema{},
+		observer:  cfg.Observer,
+		reconcile: cfg.Reconcile,
+		now:       cfg.Now,
+		newID:     cfg.NewID,
 	}
 	if d.now == nil {
 		d.now = time.Now
@@ -132,6 +137,10 @@ func (d *Driver) loop(ctx context.Context, runID string) (Run, error) {
 		if err != nil {
 			return Run{}, err
 		}
+		approvals, err := d.store.ListApprovals(ctx, runID)
+		if err != nil {
+			return Run{}, err
+		}
 
 		// Limits are checked before a step is started.
 		if run.StepCount >= run.Limits.MaxSteps {
@@ -159,7 +168,7 @@ func (d *Driver) loop(ctx context.Context, runID string) (Run, error) {
 			return Run{}, err
 		}
 
-		decision, err := d.agent.Decide(ctx, StepInput{Run: run, Steps: steps, Tools: d.specs})
+		decision, err := d.agent.Decide(ctx, StepInput{Run: run, Steps: steps, Approvals: approvals, Tools: d.specs})
 		if err != nil {
 			if ferr := d.failStep(ctx, &step, nil, "agent error: "+err.Error()); ferr != nil {
 				return Run{}, ferr
@@ -197,7 +206,7 @@ func (d *Driver) loop(ctx context.Context, runID string) (Run, error) {
 
 		// tool_call
 		req := ToolRequest{RunID: run.ID, StepID: step.ID, Spec: d.tools[decision.Tool].Spec(), Args: orEmptyObject(decision.Args)}
-		pd, err := d.policy.Evaluate(ctx, req, RunView{Run: run, Steps: steps})
+		pd, err := d.policy.Evaluate(ctx, req, RunView{Run: run, Steps: steps, Approvals: approvals})
 		if err != nil {
 			if ferr := d.failStep(ctx, &step, nil, "policy error: "+err.Error()); ferr != nil {
 				return Run{}, ferr
@@ -211,13 +220,8 @@ func (d *Driver) loop(ctx context.Context, runID string) (Run, error) {
 
 		switch pd.Outcome {
 		case Allow:
-			obs := d.execute(ctx, req)
-			if obs.Failure() {
-				if err := d.failStep(ctx, &step, &obs, obs.Summary); err != nil {
-					return Run{}, err
-				}
-			} else if err := d.doneStep(ctx, &step, &obs); err != nil {
-				return Run{}, err
+			if fin, r, err := d.runTool(ctx, run, &step, req); err != nil || fin {
+				return r, err
 			}
 		case Deny:
 			obs := observation(ObservePolicyDenied, map[string]any{"tool": req.Spec.Name, "reason": pd.Reason}, "denied: "+pd.Reason)
@@ -231,7 +235,7 @@ func (d *Driver) loop(ctx context.Context, runID string) (Run, error) {
 			}
 			return d.finish(ctx, run, StatusFailed, ReasonPolicyAbort, pd.Reason, nil, false)
 		case RequireApproval:
-			return d.pause(ctx, run, step, pd)
+			return d.pause(ctx, run, step, req, pd)
 		default:
 			if ferr := d.failStep(ctx, &step, nil, "unknown policy outcome"); ferr != nil {
 				return Run{}, ferr
@@ -304,27 +308,58 @@ func (d *Driver) validateDecision(dec Decision) error {
 	}
 }
 
+// runTool executes an allowed request and records the outcome. It returns
+// finished=true with the final run when the tool ended the run, either as
+// a terminal tool or by aborting.
+func (d *Driver) runTool(ctx context.Context, run Run, step *Step, req ToolRequest) (bool, Run, error) {
+	obs, abort := d.execute(ctx, req)
+	if abort != nil {
+		if err := d.failStep(ctx, step, &obs, obs.Summary); err != nil {
+			return true, Run{}, err
+		}
+		r, err := d.finish(ctx, run, StatusFailed, ReasonToolAbort, abort.Detail, nil, false)
+		return true, r, err
+	}
+	if obs.Failure() {
+		return false, Run{}, d.failStep(ctx, step, &obs, obs.Summary)
+	}
+	if err := d.doneStep(ctx, step, &obs); err != nil {
+		return true, Run{}, err
+	}
+	if req.Spec.Terminal {
+		r, err := d.finish(ctx, run, StatusCompleted, ReasonGoalCompleted, "terminal tool "+req.Spec.Name, obs.Content, false)
+		return true, r, err
+	}
+	return false, Run{}, nil
+}
+
 // execute runs the tool with its timeout and converts the outcome into an
-// observation. Panics inside a tool are observed as errors.
-func (d *Driver) execute(ctx context.Context, req ToolRequest) (obs Observation) {
+// observation. Panics inside a tool are observed as errors. A returned
+// ErrAbortRun is reported separately so the run can end.
+func (d *Driver) execute(ctx context.Context, req ToolRequest) (obs Observation, abort *ErrAbortRun) {
 	tool := d.tools[req.Spec.Name]
 	tctx, cancel := context.WithTimeout(ctx, req.Spec.Timeout)
 	defer cancel()
 	defer func() {
 		if r := recover(); r != nil {
 			obs = observation(ObserveToolError, map[string]any{"tool": req.Spec.Name, "error": fmt.Sprint("panic: ", r)}, fmt.Sprintf("%s panicked", req.Spec.Name))
+			abort = nil
 		}
 	}()
 	res, err := tool.Call(tctx, ToolCall{RunID: req.RunID, StepID: req.StepID, Args: req.Args})
 	if err != nil {
+		var ab ErrAbortRun
+		if errors.As(err, &ab) {
+			return observation(ObserveToolError, map[string]any{"tool": req.Spec.Name, "error": ab.Detail, "failure": "abort"}, fmt.Sprintf("%s aborted the run: %s", req.Spec.Name, ab.Detail)), &ab
+		}
 		kind := "error"
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(tctx.Err(), context.DeadlineExceeded) {
 			kind = "timeout"
 		}
-		return observation(ObserveToolError, map[string]any{"tool": req.Spec.Name, "error": err.Error(), "failure": kind}, fmt.Sprintf("%s %s: %s", req.Spec.Name, kind, err.Error()))
+		return observation(ObserveToolError, map[string]any{"tool": req.Spec.Name, "error": err.Error(), "failure": kind}, fmt.Sprintf("%s %s: %s", req.Spec.Name, kind, err.Error())), nil
 	}
 	content := orEmptyObject(res.Content)
-	return Observation{Kind: ObserveToolResult, Content: content, Summary: res.Summary, ContentHash: contentHash(content)}
+	return Observation{Kind: ObserveToolResult, Content: content, Summary: res.Summary, ContentHash: contentHash(content)}, nil
 }
 
 func observation(kind ObservationKind, content any, summary string) Observation {
@@ -421,10 +456,20 @@ func (d *Driver) failStep(ctx context.Context, step *Step, obs *Observation, det
 	})
 }
 
-func (d *Driver) pause(ctx context.Context, run Run, step Step, pd PolicyDecision) (Run, error) {
+// approvalHash binds an approval to exactly what was asked and shown.
+func approvalHash(kind string, capability, presentation json.RawMessage, req ToolRequest) string {
+	return contentHash(mustJSON(map[string]any{
+		"kind": kind, "capability": orEmptyObject(capability), "presentation": orEmptyObject(presentation), "request": req,
+	}))
+}
+
+// pause records a hash-bound approval and parks the run.
+func (d *Driver) pause(ctx context.Context, run Run, step Step, req ToolRequest, pd PolicyDecision) (Run, error) {
 	now := d.now()
 	step.Status = StepAwaitingApproval
 	run.Status = StatusWaitingForApproval
+	a := Approval{ID: d.newID(), RunID: run.ID, StepID: step.ID, Kind: pd.Kind, Capability: orEmptyObject(pd.Capability), Presentation: orEmptyObject(pd.Presentation), Request: req, Status: ApprovalPending, CreatedAt: now}
+	a.Hash = approvalHash(a.Kind, a.Capability, a.Presentation, a.Request)
 	err := d.store.tx(ctx, d.observer, func(t *txn) error {
 		if err := t.updateStep(ctx, step); err != nil {
 			return err
@@ -432,14 +477,237 @@ func (d *Driver) pause(ctx context.Context, run Run, step Step, pd PolicyDecisio
 		if err := t.updateRun(ctx, run); err != nil {
 			return err
 		}
+		if err := t.insertApproval(ctx, a); err != nil {
+			return err
+		}
 		return t.appendEvent(ctx, Event{RunID: run.ID, StepID: step.ID, At: now, Type: EventApprovalRequested, Payload: mustJSON(map[string]any{
-			"kind": pd.Kind, "reason": pd.Reason, "capability": orEmptyObject(pd.Capability), "presentation": orEmptyObject(pd.Presentation),
+			"approval_id": a.ID, "kind": pd.Kind, "reason": pd.Reason, "capability": a.Capability, "presentation": a.Presentation, "hash": a.Hash,
 		})})
 	})
 	if err != nil {
 		return Run{}, err
 	}
 	return run, nil
+}
+
+// ErrApprovalHash means a stored approval no longer matches its own fields.
+var ErrApprovalHash = errors.New("agentrt: approval hash does not match its recorded request")
+
+// Approve marks a pending approval approved after recomputing its hash
+// from the stored fields. The run stays WAITING until Resume.
+func (d *Driver) Approve(ctx context.Context, runID, approvalID, by, note string) error {
+	return d.decide(ctx, runID, approvalID, by, note, ApprovalApproved)
+}
+
+// Reject marks a pending approval rejected and ends the run as CANCELLED.
+func (d *Driver) Reject(ctx context.Context, runID, approvalID, by, note string) error {
+	return d.decide(ctx, runID, approvalID, by, note, ApprovalRejected)
+}
+
+func (d *Driver) decide(ctx context.Context, runID, approvalID, by, note string, status ApprovalStatus) error {
+	run, err := d.store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if run.Status != StatusWaitingForApproval {
+		return fmt.Errorf("agentrt: run %s is %s, not waiting for approval", runID, run.Status)
+	}
+	a, err := d.store.GetApproval(ctx, runID, approvalID)
+	if err != nil {
+		return err
+	}
+	if a.Status != ApprovalPending {
+		return fmt.Errorf("agentrt: approval %s is already %s", approvalID, a.Status)
+	}
+	if approvalHash(a.Kind, a.Capability, a.Presentation, a.Request) != a.Hash {
+		return ErrApprovalHash
+	}
+	now := d.now()
+	a.Status, a.DecidedAt, a.DecidedBy, a.Note = status, now, by, note
+	// Loaded before the transaction: the store has a single connection.
+	steps, err := d.store.ListSteps(ctx, runID)
+	if err != nil {
+		return err
+	}
+	return d.store.tx(ctx, d.observer, func(t *txn) error {
+		if err := t.decideApproval(ctx, a); err != nil {
+			return err
+		}
+		if err := t.appendEvent(ctx, Event{RunID: runID, StepID: a.StepID, At: now, Type: EventApprovalDecided, Payload: mustJSON(map[string]any{"approval_id": a.ID, "status": status, "by": by, "note": note})}); err != nil {
+			return err
+		}
+		if status == ApprovalRejected {
+			for _, st := range steps {
+				if st.ID == a.StepID {
+					st.Status = StepFailed
+					obs := observation(ObservePolicyDenied, map[string]any{"approval_id": a.ID, "note": note}, "approval rejected: "+note)
+					st.Observation = &obs
+					st.FinishedAt = now
+					if err := t.updateStep(ctx, st); err != nil {
+						return err
+					}
+				}
+			}
+			run.Status, run.Reason, run.ReasonDetail, run.FinishedAt = StatusCancelled, ReasonApprovalRejected, note, now
+			if err := t.updateRun(ctx, run); err != nil {
+				return err
+			}
+			return t.appendEvent(ctx, Event{RunID: runID, At: now, Type: EventRunFinished, Payload: mustJSON(map[string]any{"status": run.Status, "reason": run.Reason, "detail": note, "steps": run.StepCount})})
+		}
+		return nil
+	})
+}
+
+// Resume continues a run. A WAITING run needs an approved approval for its
+// awaiting step: policy is re-evaluated, and the recorded request is
+// executed only if policy allows it or asks for exactly the approval that
+// was granted. A RUNNING run with in-flight work was interrupted: the step
+// is failed with an interrupted observation, the consumer's reconciliation
+// runs, and the loop continues.
+func (d *Driver) Resume(ctx context.Context, runID string) (Run, error) {
+	run, err := d.store.GetRun(ctx, runID)
+	if err != nil {
+		return Run{}, err
+	}
+	switch run.Status {
+	case StatusWaitingForApproval:
+		return d.resumeApproved(ctx, run)
+	case StatusRunning, StatusInterrupted:
+		return d.resumeInterrupted(ctx, run)
+	default:
+		return Run{}, fmt.Errorf("agentrt: run %s is %s and cannot be resumed", runID, run.Status)
+	}
+}
+
+func (d *Driver) resumeApproved(ctx context.Context, run Run) (Run, error) {
+	steps, err := d.store.ListSteps(ctx, run.ID)
+	if err != nil {
+		return Run{}, err
+	}
+	approvals, err := d.store.ListApprovals(ctx, run.ID)
+	if err != nil {
+		return Run{}, err
+	}
+	var step *Step
+	for i := range steps {
+		if steps[i].Status == StepAwaitingApproval {
+			step = &steps[i]
+		}
+	}
+	if step == nil {
+		return Run{}, fmt.Errorf("agentrt: run %s is waiting but has no awaiting step", run.ID)
+	}
+	var granted *Approval
+	for i := range approvals {
+		a := &approvals[i]
+		if a.StepID == step.ID && a.Status == ApprovalApproved {
+			granted = a
+		}
+	}
+	if granted == nil {
+		return Run{}, fmt.Errorf("agentrt: run %s has no approved approval for step %s", run.ID, step.ID)
+	}
+	if approvalHash(granted.Kind, granted.Capability, granted.Presentation, granted.Request) != granted.Hash {
+		return Run{}, ErrApprovalHash
+	}
+	req := granted.Request
+	if _, ok := d.tools[req.Spec.Name]; !ok {
+		return Run{}, fmt.Errorf("agentrt: approved tool %q is not registered", req.Spec.Name)
+	}
+	req.Spec = d.tools[req.Spec.Name].Spec()
+	now := d.now()
+	run.Status = StatusRunning
+	prior := steps[:step.Index]
+	if err := d.store.tx(ctx, d.observer, func(t *txn) error {
+		if err := t.updateRun(ctx, run); err != nil {
+			return err
+		}
+		return t.appendEvent(ctx, Event{RunID: run.ID, StepID: step.ID, At: now, Type: EventRunResumed, Payload: mustJSON(map[string]any{"approval_id": granted.ID})})
+	}); err != nil {
+		return Run{}, err
+	}
+	pd, err := d.policy.Evaluate(ctx, req, RunView{Run: run, Steps: prior, Approvals: approvals})
+	if err != nil {
+		if ferr := d.failStep(ctx, step, nil, "policy error: "+err.Error()); ferr != nil {
+			return Run{}, ferr
+		}
+		return d.finish(ctx, run, StatusFailed, ReasonInternalError, "policy: "+err.Error(), nil, false)
+	}
+	switch pd.Outcome {
+	case Allow:
+	case RequireApproval:
+		if approvalHash(pd.Kind, pd.Capability, pd.Presentation, req) != granted.Hash {
+			// The policy now wants something different: pause again.
+			return d.pause(ctx, run, *step, req, pd)
+		}
+	case Deny:
+		obs := observation(ObservePolicyDenied, map[string]any{"tool": req.Spec.Name, "reason": pd.Reason}, "denied on resume: "+pd.Reason)
+		if err := d.failStep(ctx, step, &obs, obs.Summary); err != nil {
+			return Run{}, err
+		}
+		return d.loop(ctx, run.ID)
+	case Abort:
+		obs := observation(ObservePolicyDenied, map[string]any{"tool": req.Spec.Name, "reason": pd.Reason}, "aborted on resume: "+pd.Reason)
+		if err := d.failStep(ctx, step, &obs, obs.Summary); err != nil {
+			return Run{}, err
+		}
+		return d.finish(ctx, run, StatusFailed, ReasonPolicyAbort, pd.Reason, nil, false)
+	}
+	step.Status = StepExecuting
+	if err := d.store.tx(ctx, d.observer, func(t *txn) error {
+		if err := t.updateStep(ctx, *step); err != nil {
+			return err
+		}
+		return t.appendEvent(ctx, Event{RunID: run.ID, StepID: step.ID, At: d.now(), Type: EventStepToolStarted, Payload: mustJSON(map[string]any{"tool": req.Spec.Name, "args": req.Args, "approval_id": granted.ID})})
+	}); err != nil {
+		return Run{}, err
+	}
+	if fin, r, err := d.runTool(ctx, run, step, req); err != nil || fin {
+		return r, err
+	}
+	return d.loop(ctx, run.ID)
+}
+
+func (d *Driver) resumeInterrupted(ctx context.Context, run Run) (Run, error) {
+	steps, err := d.store.ListSteps(ctx, run.ID)
+	if err != nil {
+		return Run{}, err
+	}
+	approvals, err := d.store.ListApprovals(ctx, run.ID)
+	if err != nil {
+		return Run{}, err
+	}
+	now := d.now()
+	for i := range steps {
+		st := &steps[i]
+		if st.Status == StepDeciding || st.Status == StepExecuting {
+			obs := observation(ObserveInterrupted, map[string]any{"previous_status": st.Status}, "step interrupted while "+string(st.Status))
+			st.Status, st.Observation, st.FinishedAt = StepInterrupted, &obs, now
+			if err := d.store.tx(ctx, d.observer, func(t *txn) error {
+				if err := t.updateStep(ctx, *st); err != nil {
+					return err
+				}
+				return t.appendEvent(ctx, Event{RunID: run.ID, StepID: st.ID, At: now, Type: EventStepInterrupted, Payload: mustJSON(map[string]any{"previous_status": obs.Content})})
+			}); err != nil {
+				return Run{}, err
+			}
+		}
+	}
+	if d.reconcile != nil {
+		if err := d.reconcile(ctx, RunView{Run: run, Steps: steps, Approvals: approvals}); err != nil {
+			return d.finish(ctx, run, StatusFailed, ReasonInternalError, "reconcile: "+err.Error(), nil, false)
+		}
+	}
+	run.Status = StatusRunning
+	if err := d.store.tx(ctx, d.observer, func(t *txn) error {
+		if err := t.updateRun(ctx, run); err != nil {
+			return err
+		}
+		return t.appendEvent(ctx, Event{RunID: run.ID, At: now, Type: EventRunResumed, Payload: mustJSON(map[string]any{"after": "interruption"})})
+	}); err != nil {
+		return Run{}, err
+	}
+	return d.loop(ctx, run.ID)
 }
 
 func (d *Driver) finish(ctx context.Context, run Run, status RunStatus, reason TerminalReason, detail string, result json.RawMessage, limit bool) (Run, error) {

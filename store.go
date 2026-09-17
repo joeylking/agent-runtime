@@ -57,6 +57,10 @@ func OpenStore(path string) (*Store, error) {
 // Close releases the database.
 func (s *Store) Close() error { return s.db.Close() }
 
+// DB exposes the underlying database for consumers that keep their own
+// tables in the same file and for tests. The runtime's tables are its own.
+func (s *Store) DB() *sql.DB { return s.db }
+
 var migrations = []string{
 	`CREATE TABLE runs (
 		id TEXT PRIMARY KEY,
@@ -93,6 +97,22 @@ var migrations = []string{
 		payload_json TEXT NOT NULL
 	);
 	CREATE INDEX events_run ON events(run_id, seq);`,
+	`CREATE TABLE approvals (
+		id TEXT PRIMARY KEY,
+		run_id TEXT NOT NULL REFERENCES runs(id),
+		step_id TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		capability_json TEXT NOT NULL,
+		presentation_json TEXT NOT NULL,
+		request_json TEXT NOT NULL,
+		hash TEXT NOT NULL,
+		status TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		decided_at TEXT NOT NULL DEFAULT '',
+		decided_by TEXT NOT NULL DEFAULT '',
+		note TEXT NOT NULL DEFAULT ''
+	);
+	CREATE INDEX approvals_run ON approvals(run_id, created_at);`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -266,6 +286,49 @@ func (s *Store) ListSteps(ctx context.Context, runID string) ([]Step, error) {
 	return out, rows.Err()
 }
 
+// ListApprovals returns a run's approvals in creation order.
+func (s *Store) ListApprovals(ctx context.Context, runID string) ([]Approval, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, step_id, kind, capability_json, presentation_json, request_json, hash, status, created_at, decided_at, decided_by, note FROM approvals WHERE run_id = ? ORDER BY created_at, id`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Approval
+	for rows.Next() {
+		var a Approval
+		var capability, presentation, request, created, decided string
+		if err := rows.Scan(&a.ID, &a.RunID, &a.StepID, &a.Kind, &capability, &presentation, &request, &a.Hash, &a.Status, &created, &decided, &a.DecidedBy, &a.Note); err != nil {
+			return nil, err
+		}
+		a.Capability, a.Presentation = json.RawMessage(capability), json.RawMessage(presentation)
+		if err := json.Unmarshal([]byte(request), &a.Request); err != nil {
+			return nil, err
+		}
+		if a.CreatedAt, err = parseTime(created); err != nil {
+			return nil, err
+		}
+		if a.DecidedAt, err = parseTime(decided); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// GetApproval loads one approval.
+func (s *Store) GetApproval(ctx context.Context, runID, id string) (Approval, error) {
+	all, err := s.ListApprovals(ctx, runID)
+	if err != nil {
+		return Approval{}, err
+	}
+	for _, a := range all {
+		if a.ID == id {
+			return a, nil
+		}
+	}
+	return Approval{}, ErrNotFound
+}
+
 // ListEvents returns the events of a run in sequence order.
 func (s *Store) ListEvents(ctx context.Context, runID string) ([]Event, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT seq, run_id, step_id, at, type, payload_json FROM events WHERE run_id = ? ORDER BY seq`, runID)
@@ -349,6 +412,28 @@ func (t *txn) updateStep(ctx context.Context, st Step) error {
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("agentrt: update step %s: %w", st.ID, ErrNotFound)
+	}
+	return nil
+}
+
+func (t *txn) insertApproval(ctx context.Context, a Approval) error {
+	req, err := json.Marshal(a.Request)
+	if err != nil {
+		return err
+	}
+	_, err = t.tx.ExecContext(ctx, `INSERT INTO approvals (id, run_id, step_id, kind, capability_json, presentation_json, request_json, hash, status, created_at, decided_at, decided_by, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		a.ID, a.RunID, a.StepID, a.Kind, string(orEmptyObject(a.Capability)), string(orEmptyObject(a.Presentation)), string(req), a.Hash, a.Status, formatTime(a.CreatedAt), formatTime(a.DecidedAt), a.DecidedBy, a.Note)
+	return err
+}
+
+func (t *txn) decideApproval(ctx context.Context, a Approval) error {
+	res, err := t.tx.ExecContext(ctx, `UPDATE approvals SET status=?, decided_at=?, decided_by=?, note=? WHERE id=? AND status=?`,
+		a.Status, formatTime(a.DecidedAt), a.DecidedBy, a.Note, a.ID, ApprovalPending)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("agentrt: approval %s is not pending: %w", a.ID, ErrNotFound)
 	}
 	return nil
 }
