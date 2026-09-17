@@ -505,23 +505,35 @@ var ErrApprovalHash = errors.New("agentrt: approval hash does not match its reco
 // Approve marks a pending approval approved after recomputing its hash
 // from the stored fields. The run stays WAITING until Resume.
 func (d *Driver) Approve(ctx context.Context, runID, approvalID, by, note string) error {
-	return d.decide(ctx, runID, approvalID, by, note, ApprovalApproved)
+	return Approve(ctx, d.store, d.observer, runID, approvalID, by, note)
 }
 
 // Reject marks a pending approval rejected and ends the run as CANCELLED.
 func (d *Driver) Reject(ctx context.Context, runID, approvalID, by, note string) error {
-	return d.decide(ctx, runID, approvalID, by, note, ApprovalRejected)
+	return Reject(ctx, d.store, d.observer, runID, approvalID, by, note)
 }
 
-func (d *Driver) decide(ctx context.Context, runID, approvalID, by, note string, status ApprovalStatus) error {
-	run, err := d.store.GetRun(ctx, runID)
+// Approve records an approval decision without a driver, for command-line
+// front ends that decide approvals in a process that will not resume the
+// run. The hash is recomputed from the stored fields first.
+func Approve(ctx context.Context, store *Store, obs Observer, runID, approvalID, by, note string) error {
+	return decide(ctx, store, obs, runID, approvalID, by, note, ApprovalApproved)
+}
+
+// Reject records a rejection without a driver and ends the run as CANCELLED.
+func Reject(ctx context.Context, store *Store, obs Observer, runID, approvalID, by, note string) error {
+	return decide(ctx, store, obs, runID, approvalID, by, note, ApprovalRejected)
+}
+
+func decide(ctx context.Context, store *Store, obs Observer, runID, approvalID, by, note string, status ApprovalStatus) error {
+	run, err := store.GetRun(ctx, runID)
 	if err != nil {
 		return err
 	}
 	if run.Status != StatusWaitingForApproval {
 		return fmt.Errorf("agentrt: run %s is %s, not waiting for approval", runID, run.Status)
 	}
-	a, err := d.store.GetApproval(ctx, runID, approvalID)
+	a, err := store.GetApproval(ctx, runID, approvalID)
 	if err != nil {
 		return err
 	}
@@ -531,14 +543,14 @@ func (d *Driver) decide(ctx context.Context, runID, approvalID, by, note string,
 	if approvalHash(a.Kind, a.Capability, a.Presentation, a.Request) != a.Hash {
 		return ErrApprovalHash
 	}
-	now := d.now()
+	now := time.Now()
 	a.Status, a.DecidedAt, a.DecidedBy, a.Note = status, now, by, note
 	// Loaded before the transaction: the store has a single connection.
-	steps, err := d.store.ListSteps(ctx, runID)
+	steps, err := store.ListSteps(ctx, runID)
 	if err != nil {
 		return err
 	}
-	return d.store.tx(ctx, d.observer, func(t *txn) error {
+	return store.tx(ctx, obs, func(t *txn) error {
 		if err := t.decideApproval(ctx, a); err != nil {
 			return err
 		}
@@ -549,8 +561,8 @@ func (d *Driver) decide(ctx context.Context, runID, approvalID, by, note string,
 			for _, st := range steps {
 				if st.ID == a.StepID {
 					st.Status = StepFailed
-					obs := observation(ObservePolicyDenied, map[string]any{"approval_id": a.ID, "note": note}, "approval rejected: "+note)
-					st.Observation = &obs
+					o := observation(ObservePolicyDenied, map[string]any{"approval_id": a.ID, "note": note}, "approval rejected: "+note)
+					st.Observation = &o
 					st.FinishedAt = now
 					if err := t.updateStep(ctx, st); err != nil {
 						return err
