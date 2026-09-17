@@ -553,3 +553,19 @@ func TestDriver_LoopStreakResets(t *testing.T) {
 	}
 	requireStatus(t, run, agentrt.StatusCompleted, agentrt.ReasonGoalCompleted)
 }
+
+func TestDriver_StartWithID(t *testing.T) {
+	h := newHarness(t, ":memory:")
+	read := echoTool("read", agentrt.ReadOnly)
+	d := h.driver(&scripted.Agent{Decisions: []agentrt.Decision{scripted.Complete(`{}`)}}, agentrt.DefaultPolicy(), read)
+	run, err := d.StartWithID(context.Background(), "task-42", "g", limits(5, 3))
+	if err != nil || run.ID != "task-42" {
+		t.Fatalf("run = %+v, %v", run, err)
+	}
+	if _, err := d.StartWithID(context.Background(), "task-42", "g", limits(5, 3)); err == nil {
+		t.Fatal("duplicate id accepted")
+	}
+	if _, err := d.StartWithID(context.Background(), "", "g", limits(5, 3)); err == nil {
+		t.Fatal("empty id accepted")
+	}
+}

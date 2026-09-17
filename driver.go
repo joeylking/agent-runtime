@@ -96,12 +96,21 @@ func NewDriver(cfg Config) (*Driver, error) {
 // Start creates a run and executes it until it reaches a terminal status or
 // pauses for approval. The returned run reflects the persisted state.
 func (d *Driver) Start(ctx context.Context, goal string, limits Limits) (Run, error) {
+	return d.StartWithID(ctx, d.newID(), goal, limits)
+}
+
+// StartWithID is Start with a caller-chosen run id, so a consumer can key
+// its own tables by the same identifier. The id must be unique.
+func (d *Driver) StartWithID(ctx context.Context, id, goal string, limits Limits) (Run, error) {
 	if err := limits.validate(); err != nil {
 		return Run{}, fmt.Errorf("agentrt: %w", err)
 	}
+	if id == "" {
+		return Run{}, errors.New("agentrt: run id is required")
+	}
 	now := d.now()
 	run := Run{
-		ID:        d.newID(),
+		ID:        id,
 		Goal:      goal,
 		Status:    StatusRunning,
 		Limits:    limits,
