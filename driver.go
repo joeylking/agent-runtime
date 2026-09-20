@@ -20,8 +20,9 @@ type Config struct {
 	// StepInput. Scripted agents leave it nil.
 	Model *ModelConfig
 	// Reconcile, when set, runs before a run found mid-step is continued by
-	// Resume. Consumers use it to reconcile their own journaled operations.
-	Reconcile func(ctx context.Context, view RunView) error
+	// Resume. Consumers reconcile their own journaled operations and say
+	// whether the run continues, completed, waits, or is in conflict.
+	Reconcile func(ctx context.Context, view RunView) (Reconciliation, error)
 	// Now and NewID may be overridden by tests.
 	Now   func() time.Time
 	NewID func() string
@@ -38,7 +39,7 @@ type Driver struct {
 	specs     []ToolSpec
 	observer  Observer
 	model     *ModelConfig
-	reconcile func(ctx context.Context, view RunView) error
+	reconcile func(ctx context.Context, view RunView) (Reconciliation, error)
 	now       func() time.Time
 	newID     func() string
 }
@@ -740,8 +741,21 @@ func (d *Driver) resumeInterrupted(ctx context.Context, run Run) (Run, error) {
 		}
 	}
 	if d.reconcile != nil {
-		if err := d.reconcile(ctx, RunView{Run: run, Steps: steps, Approvals: approvals}); err != nil {
+		rec, err := d.reconcile(ctx, RunView{Run: run, Steps: steps, Approvals: approvals})
+		if err != nil {
 			return d.finish(ctx, run, StatusFailed, ReasonInternalError, "reconcile: "+err.Error(), nil, false)
+		}
+		switch rec.Outcome {
+		case ReconcileCompleted:
+			return d.finish(ctx, run, StatusCompleted, ReasonGoalCompleted, "completed by reconciliation: "+rec.Detail, rec.Result, false)
+		case ReconcileConflict:
+			return d.finish(ctx, run, StatusFailed, ReasonReconcileConflict, rec.Detail, nil, false)
+		case ReconcileWaiting:
+			run.Status = StatusWaitingForApproval
+			if err := d.store.tx(ctx, d.observer, func(t *txn) error { return t.updateRun(ctx, run) }); err != nil {
+				return Run{}, err
+			}
+			return run, nil
 		}
 	}
 	run.Status = StatusRunning

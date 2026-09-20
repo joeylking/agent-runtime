@@ -58,6 +58,7 @@ const (
 	ReasonPolicyAbort          TerminalReason = "policy_abort"
 	ReasonToolAbort            TerminalReason = "tool_abort"
 	ReasonApprovalRejected     TerminalReason = "approval_rejected"
+	ReasonReconcileConflict    TerminalReason = "reconcile_conflict"
 	ReasonAgentError           TerminalReason = "agent_error"
 	ReasonInternalError        TerminalReason = "internal_error"
 )
@@ -351,6 +352,30 @@ type StepInput struct {
 // Agent decides what happens next.
 type Agent interface {
 	Decide(ctx context.Context, in StepInput) (Decision, error)
+}
+
+// ReconcileOutcome is what a consumer's reconciliation concluded about a
+// run found mid-step.
+type ReconcileOutcome string
+
+const (
+	// ReconcileContinue means the loop may proceed with the next decision.
+	ReconcileContinue ReconcileOutcome = "continue"
+	// ReconcileCompleted means the interrupted operation had already
+	// succeeded; the run completes with Result and no further decision.
+	ReconcileCompleted ReconcileOutcome = "completed"
+	// ReconcileWaiting means the run must wait for an approval again.
+	ReconcileWaiting ReconcileOutcome = "waiting"
+	// ReconcileConflict means external state contradicts the record; the
+	// run fails with reconcile_conflict and Detail.
+	ReconcileConflict ReconcileOutcome = "conflict"
+)
+
+// Reconciliation is the structured result of a consumer's reconciliation.
+type Reconciliation struct {
+	Outcome ReconcileOutcome
+	Result  json.RawMessage
+	Detail  string
 }
 
 // Event is one row of the append-only audit log.
