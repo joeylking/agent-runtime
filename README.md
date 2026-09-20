@@ -23,8 +23,9 @@ v0.1: the runtime that [repo-steward](https://github.com/joeylking/repo-steward)
 runs on. [docs/architecture.md](docs/architecture.md) describes the loop,
 approvals, interruption, and persistence; [docs/status.md](docs/status.md)
 lists every control with the test that verifies it; [docs/decisions](docs/decisions)
-records why it is built this way. The API is pre-1.0 and changes when its
-consumer needs it to.
+records why it is built this way. The [wiki](https://github.com/joeylking/agent-runtime/wiki)
+covers the same material at length for people using, extending, or evaluating
+the runtime. The API is pre-1.0 and changes when its consumer needs it to.
 
 ## Quick start
 
