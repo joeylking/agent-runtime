@@ -135,6 +135,8 @@ var migrations = []string{
 	ALTER TABLE runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
 	ALTER TABLE runs ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0;
 	ALTER TABLE runs ADD COLUMN estimated_cost_micros INTEGER NOT NULL DEFAULT 0;`,
+	`ALTER TABLE runs ADD COLUMN active_ms INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE approvals ADD COLUMN expires_at TEXT NOT NULL DEFAULT '';`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -213,13 +215,13 @@ func (s *Store) CreateRun(ctx context.Context, r Run) error {
 
 // GetRun loads a run by id.
 func (s *Store) GetRun(ctx context.Context, id string) (Run, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros FROM runs WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros, active_ms FROM runs WHERE id = ?`, id)
 	return scanRun(row)
 }
 
 // ListRuns returns every run, newest first.
 func (s *Store) ListRuns(ctx context.Context) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros FROM runs ORDER BY created_at DESC, id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros, active_ms FROM runs ORDER BY created_at DESC, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -240,9 +242,10 @@ type scanner interface{ Scan(dest ...any) error }
 func scanRun(sc scanner) (Run, error) {
 	var r Run
 	var limits, created, started, finished, result string
-	var cost int64
-	err := sc.Scan(&r.ID, &r.Goal, &r.Status, &r.Reason, &r.ReasonDetail, &limits, &r.StepCount, &created, &started, &finished, &result, &r.ModelCalls, &r.Usage.InputTokens, &r.Usage.OutputTokens, &r.Usage.CachedInputTokens, &cost)
+	var cost, activeMS int64
+	err := sc.Scan(&r.ID, &r.Goal, &r.Status, &r.Reason, &r.ReasonDetail, &limits, &r.StepCount, &created, &started, &finished, &result, &r.ModelCalls, &r.Usage.InputTokens, &r.Usage.OutputTokens, &r.Usage.CachedInputTokens, &cost, &activeMS)
 	r.EstimatedCost = Micros(cost)
+	r.ActiveTime = time.Duration(activeMS) * time.Millisecond
 	if errors.Is(err, sql.ErrNoRows) {
 		return Run{}, ErrNotFound
 	}
@@ -339,7 +342,7 @@ func (s *Store) ListModelCalls(ctx context.Context, runID string) ([]ModelCall, 
 
 // ListApprovals returns a run's approvals in creation order.
 func (s *Store) ListApprovals(ctx context.Context, runID string) ([]Approval, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, step_id, kind, capability_json, presentation_json, request_json, hash, status, created_at, decided_at, decided_by, note FROM approvals WHERE run_id = ? ORDER BY created_at, id`, runID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, step_id, kind, capability_json, presentation_json, request_json, hash, status, created_at, decided_at, decided_by, note, expires_at FROM approvals WHERE run_id = ? ORDER BY created_at, id`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -347,8 +350,11 @@ func (s *Store) ListApprovals(ctx context.Context, runID string) ([]Approval, er
 	var out []Approval
 	for rows.Next() {
 		var a Approval
-		var capability, presentation, request, created, decided string
-		if err := rows.Scan(&a.ID, &a.RunID, &a.StepID, &a.Kind, &capability, &presentation, &request, &a.Hash, &a.Status, &created, &decided, &a.DecidedBy, &a.Note); err != nil {
+		var capability, presentation, request, created, decided, expires string
+		if err := rows.Scan(&a.ID, &a.RunID, &a.StepID, &a.Kind, &capability, &presentation, &request, &a.Hash, &a.Status, &created, &decided, &a.DecidedBy, &a.Note, &expires); err != nil {
+			return nil, err
+		}
+		if a.ExpiresAt, err = parseTime(expires); err != nil {
 			return nil, err
 		}
 		a.Capability, a.Presentation = json.RawMessage(capability), json.RawMessage(presentation)
@@ -438,8 +444,8 @@ func (t *txn) insertRun(ctx context.Context, r Run) error {
 }
 
 func (t *txn) updateRun(ctx context.Context, r Run) error {
-	res, err := t.tx.ExecContext(ctx, `UPDATE runs SET status=?, reason=?, reason_detail=?, step_count=?, started_at=?, finished_at=?, result_json=? WHERE id=?`,
-		r.Status, r.Reason, r.ReasonDetail, r.StepCount, formatTime(r.StartedAt), formatTime(r.FinishedAt), marshalOpt(r.Result), r.ID)
+	res, err := t.tx.ExecContext(ctx, `UPDATE runs SET status=?, reason=?, reason_detail=?, step_count=?, started_at=?, finished_at=?, result_json=?, active_ms=? WHERE id=?`,
+		r.Status, r.Reason, r.ReasonDetail, r.StepCount, formatTime(r.StartedAt), formatTime(r.FinishedAt), marshalOpt(r.Result), r.ActiveTime.Milliseconds(), r.ID)
 	if err != nil {
 		return err
 	}
@@ -456,8 +462,8 @@ func (t *txn) insertStep(ctx context.Context, st Step) error {
 }
 
 func (t *txn) updateStep(ctx context.Context, st Step) error {
-	res, err := t.tx.ExecContext(ctx, `UPDATE steps SET status=?, decision_json=?, policy_json=?, observation_json=?, observation_hash=?, finished_at=? WHERE id=?`,
-		st.Status, marshalOpt(st.Decision), marshalOpt(st.Policy), marshalOpt(st.Observation), obsHash(st.Observation), formatTime(st.FinishedAt), st.ID)
+	res, err := t.tx.ExecContext(ctx, `UPDATE steps SET status=?, decision_json=?, policy_json=?, observation_json=?, observation_hash=?, started_at=?, finished_at=? WHERE id=?`,
+		st.Status, marshalOpt(st.Decision), marshalOpt(st.Policy), marshalOpt(st.Observation), obsHash(st.Observation), formatTime(st.StartedAt), formatTime(st.FinishedAt), st.ID)
 	if err != nil {
 		return err
 	}
@@ -485,6 +491,11 @@ func (t *txn) updateModelCall(ctx context.Context, c ModelCall) error {
 	return nil
 }
 
+func (t *txn) addActiveTime(ctx context.Context, runID string, dur time.Duration) error {
+	_, err := t.tx.ExecContext(ctx, `UPDATE runs SET active_ms = active_ms + ? WHERE id=?`, dur.Milliseconds(), runID)
+	return err
+}
+
 func (t *txn) addRunUsage(ctx context.Context, runID string, u Usage, cost Micros) error {
 	_, err := t.tx.ExecContext(ctx, `UPDATE runs SET model_calls = model_calls + 1, input_tokens = input_tokens + ?, output_tokens = output_tokens + ?, cached_input_tokens = cached_input_tokens + ?, estimated_cost_micros = estimated_cost_micros + ? WHERE id=?`,
 		u.InputTokens, u.OutputTokens, u.CachedInputTokens, int64(cost), runID)
@@ -496,8 +507,8 @@ func (t *txn) insertApproval(ctx context.Context, a Approval) error {
 	if err != nil {
 		return err
 	}
-	_, err = t.tx.ExecContext(ctx, `INSERT INTO approvals (id, run_id, step_id, kind, capability_json, presentation_json, request_json, hash, status, created_at, decided_at, decided_by, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.RunID, a.StepID, a.Kind, string(orEmptyObject(a.Capability)), string(orEmptyObject(a.Presentation)), string(req), a.Hash, a.Status, formatTime(a.CreatedAt), formatTime(a.DecidedAt), a.DecidedBy, a.Note)
+	_, err = t.tx.ExecContext(ctx, `INSERT INTO approvals (id, run_id, step_id, kind, capability_json, presentation_json, request_json, hash, status, created_at, decided_at, decided_by, note, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		a.ID, a.RunID, a.StepID, a.Kind, string(orEmptyObject(a.Capability)), string(orEmptyObject(a.Presentation)), string(req), a.Hash, a.Status, formatTime(a.CreatedAt), formatTime(a.DecidedAt), a.DecidedBy, a.Note, formatTime(a.ExpiresAt))
 	return err
 }
 

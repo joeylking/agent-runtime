@@ -169,6 +169,12 @@ func (d *Driver) loop(ctx context.Context, runID string) (Run, error) {
 			return d.finish(ctx, run, StatusFailed, ReasonRepeatedToolFailures,
 				fmt.Sprintf("%d consecutive failed steps", n), nil, true)
 		}
+		if l := run.Limits; l.MaxActiveTime > 0 && run.ActiveTime >= l.MaxActiveTime {
+			return d.finish(ctx, run, StatusFailed, ReasonLimitActiveTime, fmt.Sprintf("active time %s reached limit %s", run.ActiveTime.Round(time.Millisecond), l.MaxActiveTime), nil, true)
+		}
+		if l := run.Limits; l.MaxElapsedTime > 0 && d.now().Sub(run.CreatedAt) >= l.MaxElapsedTime {
+			return d.finish(ctx, run, StatusFailed, ReasonLimitElapsedTime, fmt.Sprintf("elapsed time reached limit %s", l.MaxElapsedTime), nil, true)
+		}
 		if n, sig := repeatedOutcome(steps); n >= run.Limits.LoopThreshold {
 			now := d.now()
 			err := d.store.tx(ctx, d.observer, func(t *txn) error {
@@ -457,6 +463,9 @@ func (d *Driver) doneStep(ctx context.Context, step *Step, obs *Observation) err
 		if err := t.updateStep(ctx, *step); err != nil {
 			return err
 		}
+		if err := t.addActiveTime(ctx, step.RunID, now.Sub(step.StartedAt)); err != nil {
+			return err
+		}
 		if obs != nil {
 			return t.appendEvent(ctx, Event{RunID: step.RunID, StepID: step.ID, At: now, Type: EventStepToolFinished, Payload: mustJSON(map[string]any{
 				"tool": step.Decision.Tool, "summary": obs.Summary, "content_hash": obs.ContentHash, "duration_ms": now.Sub(step.StartedAt).Milliseconds(),
@@ -473,6 +482,9 @@ func (d *Driver) failStep(ctx context.Context, step *Step, obs *Observation, det
 	step.FinishedAt = now
 	return d.store.tx(ctx, d.observer, func(t *txn) error {
 		if err := t.updateStep(ctx, *step); err != nil {
+			return err
+		}
+		if err := t.addActiveTime(ctx, step.RunID, now.Sub(step.StartedAt)); err != nil {
 			return err
 		}
 		payload := map[string]any{"detail": detail}
@@ -504,6 +516,9 @@ func (d *Driver) pause(ctx context.Context, run Run, step Step, req ToolRequest,
 	step.Status = StepAwaitingApproval
 	run.Status = StatusWaitingForApproval
 	a := Approval{ID: d.newID(), RunID: run.ID, StepID: step.ID, Kind: pd.Kind, Capability: orEmptyObject(pd.Capability), Presentation: orEmptyObject(pd.Presentation), Request: req, Status: ApprovalPending, CreatedAt: now}
+	if run.Limits.ApprovalTTL > 0 {
+		a.ExpiresAt = now.Add(run.Limits.ApprovalTTL)
+	}
 	a.Hash = approvalHash(a.Kind, a.Capability, a.Presentation, a.Request)
 	err := d.store.tx(ctx, d.observer, func(t *txn) error {
 		if err := t.updateStep(ctx, step); err != nil {
@@ -570,6 +585,12 @@ func decide(ctx context.Context, store *Store, obs Observer, runID, approvalID, 
 		return ErrApprovalHash
 	}
 	now := time.Now()
+	if !a.ExpiresAt.IsZero() && now.After(a.ExpiresAt) {
+		if err := expireApproval(ctx, store, obs, run, a, now); err != nil {
+			return err
+		}
+		return fmt.Errorf("agentrt: approval %s expired at %s", approvalID, a.ExpiresAt.Format(time.RFC3339))
+	}
 	a.Status, a.DecidedAt, a.DecidedBy, a.Note = status, now, by, note
 	// Loaded before the transaction: the store has a single connection.
 	steps, err := store.ListSteps(ctx, runID)
@@ -602,6 +623,24 @@ func decide(ctx context.Context, store *Store, obs Observer, runID, approvalID, 
 			return t.appendEvent(ctx, Event{RunID: runID, At: now, Type: EventRunFinished, Payload: mustJSON(map[string]any{"status": run.Status, "reason": run.Reason, "detail": note, "steps": run.StepCount})})
 		}
 		return nil
+	})
+}
+
+// expireApproval marks a pending approval expired and cancels the run.
+func expireApproval(ctx context.Context, store *Store, obs Observer, run Run, a Approval, now time.Time) error {
+	a.Status, a.DecidedAt, a.Note = ApprovalExpired, now, "expired"
+	run.Status, run.Reason, run.ReasonDetail, run.FinishedAt = StatusCancelled, ReasonApprovalExpired, "approval "+a.ID+" expired", now
+	return store.tx(ctx, obs, func(t *txn) error {
+		if err := t.decideApproval(ctx, a); err != nil {
+			return err
+		}
+		if err := t.updateRun(ctx, run); err != nil {
+			return err
+		}
+		if err := t.appendEvent(ctx, Event{RunID: run.ID, StepID: a.StepID, At: now, Type: EventApprovalDecided, Payload: mustJSON(map[string]any{"approval_id": a.ID, "status": ApprovalExpired})}); err != nil {
+			return err
+		}
+		return t.appendEvent(ctx, Event{RunID: run.ID, At: now, Type: EventRunFinished, Payload: mustJSON(map[string]any{"status": run.Status, "reason": run.Reason, "detail": run.ReasonDetail, "steps": run.StepCount})})
 	})
 }
 
@@ -647,6 +686,12 @@ func (d *Driver) resumeApproved(ctx context.Context, run Run) (Run, error) {
 	var granted *Approval
 	for i := range approvals {
 		a := &approvals[i]
+		if a.StepID == step.ID && a.Status == ApprovalPending && !a.ExpiresAt.IsZero() && d.now().After(a.ExpiresAt) {
+			if err := expireApproval(ctx, d.store, d.observer, run, *a, d.now()); err != nil {
+				return Run{}, err
+			}
+			return d.store.GetRun(ctx, run.ID)
+		}
 		if a.StepID == step.ID && a.Status == ApprovalApproved {
 			granted = a
 		}
@@ -700,12 +745,15 @@ func (d *Driver) resumeApproved(ctx context.Context, run Run) (Run, error) {
 		}
 		return d.finish(ctx, run, StatusFailed, ReasonPolicyAbort, pd.Reason, nil, false)
 	}
+	// The step's clock restarts here: the wait for the human is not
+	// active time.
 	step.Status = StepExecuting
+	step.StartedAt = d.now()
 	if err := d.store.tx(ctx, d.observer, func(t *txn) error {
 		if err := t.updateStep(ctx, *step); err != nil {
 			return err
 		}
-		return t.appendEvent(ctx, Event{RunID: run.ID, StepID: step.ID, At: d.now(), Type: EventStepToolStarted, Payload: mustJSON(map[string]any{"tool": req.Spec.Name, "args": req.Args, "approval_id": granted.ID})})
+		return t.appendEvent(ctx, Event{RunID: run.ID, StepID: step.ID, At: step.StartedAt, Type: EventStepToolStarted, Payload: mustJSON(map[string]any{"tool": req.Spec.Name, "args": req.Args, "approval_id": granted.ID})})
 	}); err != nil {
 		return Run{}, err
 	}

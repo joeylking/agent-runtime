@@ -1,5 +1,7 @@
 # agent-runtime
 
+[![ci](https://github.com/joeylking/agent-runtime/actions/workflows/ci.yml/badge.svg)](https://github.com/joeylking/agent-runtime/actions/workflows/ci.yml)
+
 A small Go runtime for executing tool-using agents under deterministic control.
 
 The model loop is not the point. Any SDK gives you that. This runtime exists for
@@ -17,8 +19,12 @@ need, not before.
 
 ## Status
 
-Milestone 0A. See [docs/status.md](docs/status.md) for what is implemented,
-what is verified by which tests, and what is still required.
+v0.1: the runtime that [repo-steward](https://github.com/joeylking/repo-steward)
+runs on. [docs/architecture.md](docs/architecture.md) describes the loop,
+approvals, interruption, and persistence; [docs/status.md](docs/status.md)
+lists every control with the test that verifies it; [docs/decisions](docs/decisions)
+records why it is built this way. The API is pre-1.0 and changes when its
+consumer needs it to.
 
 ## Quick start
 

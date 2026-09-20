@@ -29,6 +29,10 @@ exists, reference given), **Verified** (a named test exercises it).
 | Transient errors retried with backoff, each attempt counted; non-transient errors not retried; exhaustion ends the run as model_unavailable | Verified | `TestModel_TransientRetryThenSuccess`, `TestModel_ExhaustedRetriesIsUnavailable` |
 | Ambiguous attempts (timeout, connection lost) counted and charged at the conservative estimate | Verified | `TestModel_AmbiguousAttemptChargedConservatively` |
 | Record and replay models keyed by canonical request and model name; unrecorded requests fail | Verified | `replay`, `TestReplay_RecordThenReplay` |
+| Active time limit sums step durations and excludes approval waits; a resumed step's clock restarts | Verified | `TestLimits_ActiveTimeExcludesApprovalWait`, `TestLimits_ActiveTimeStopsRun` |
+| Elapsed time limit is an absolute deadline including waits | Verified | `TestLimits_ElapsedTimeIncludesWaits` |
+| Approval expiry cancels the run on approve or resume | Verified | `TestApproval_ExpiryCancelsRun` |
+| Structured reconciliation outcomes | Verified | `TestResume_ReconcileOutcomes` |
 | Step limit | Verified | `TestDriver_StepLimit` |
 | Consecutive failure limit, reset on success | Verified | `TestDriver_ConsecutiveFailuresEndRun`, `TestDriver_FailureStreakResetsOnSuccess` |
 | Loop detection on (tool, arguments, observation); changing results are progress | Verified | `TestDriver_IdenticalCallAndResultStops`, `TestDriver_RepeatedCallWithChangingResultAllowed`, `TestDriver_LoopStreakResets` |

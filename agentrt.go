@@ -52,6 +52,9 @@ const (
 	ReasonLimitModelCalls      TerminalReason = "limit_model_calls"
 	ReasonLimitTokens          TerminalReason = "limit_tokens"
 	ReasonLimitCost            TerminalReason = "limit_cost"
+	ReasonLimitActiveTime      TerminalReason = "limit_active_time"
+	ReasonLimitElapsedTime     TerminalReason = "limit_elapsed_time"
+	ReasonApprovalExpired      TerminalReason = "approval_expired"
 	ReasonModelUnavailable     TerminalReason = "model_unavailable"
 	ReasonRepeatedToolFailures TerminalReason = "repeated_tool_failures"
 	ReasonLoopDetected         TerminalReason = "loop_detected"
@@ -87,6 +90,14 @@ type Limits struct {
 	// for the call. Zero means unlimited.
 	MaxTotalTokens   int    `json:"max_total_tokens,omitempty"`
 	MaxEstimatedCost Micros `json:"max_estimated_cost_micros,omitempty"`
+	// MaxActiveTime bounds the sum of step durations while RUNNING;
+	// approval waits are excluded. MaxElapsedTime is an absolute deadline
+	// from creation, including waits. ApprovalTTL expires a pending
+	// approval and cancels the run when it is next touched. Zero disables
+	// each.
+	MaxActiveTime  time.Duration `json:"max_active_time,omitempty"`
+	MaxElapsedTime time.Duration `json:"max_elapsed_time,omitempty"`
+	ApprovalTTL    time.Duration `json:"approval_ttl,omitempty"`
 }
 
 // DefaultLimits returns conservative defaults.
@@ -126,6 +137,8 @@ type Run struct {
 	ModelCalls    int
 	Usage         Usage
 	EstimatedCost Micros
+	// ActiveTime is the sum of finished step durations.
+	ActiveTime time.Duration
 }
 
 // StepStatus is the state of one step.
@@ -309,6 +322,7 @@ const (
 	ApprovalPending  ApprovalStatus = "pending"
 	ApprovalApproved ApprovalStatus = "approved"
 	ApprovalRejected ApprovalStatus = "rejected"
+	ApprovalExpired  ApprovalStatus = "expired"
 )
 
 // Approval is a durable, hash-bound request for a human decision. Its hash
@@ -326,6 +340,7 @@ type Approval struct {
 	Hash         string          `json:"hash"`
 	Status       ApprovalStatus  `json:"status"`
 	CreatedAt    time.Time       `json:"created_at"`
+	ExpiresAt    time.Time       `json:"expires_at,omitempty"`
 	DecidedAt    time.Time       `json:"decided_at,omitempty"`
 	DecidedBy    string          `json:"decided_by,omitempty"`
 	Note         string          `json:"note,omitempty"`
