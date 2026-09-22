@@ -183,3 +183,40 @@ func TestDriver_ToolAbortEndsRun(t *testing.T) {
 		t.Fatalf("detail = %q", run.ReasonDetail)
 	}
 }
+
+func TestCancel_ApprovedButUnresumedRun(t *testing.T) {
+	h := newHarness(t, ":memory:")
+	push, read := echoTool("push", agentrt.RemoteMutation), echoTool("read", agentrt.ReadOnly)
+	d, run, a := pausedRun(t, h, push, read)
+	if err := d.Approve(context.Background(), run.ID, a.ID, "joey", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	// Approved, never resumed, and now unwanted: reject cannot apply to a
+	// decided approval, so cancel is the only way to close the run.
+	if err := d.Reject(context.Background(), run.ID, a.ID, "joey", "changed my mind"); err == nil {
+		t.Fatal("reject of a decided approval must fail")
+	}
+	if err := d.Cancel(context.Background(), run.ID, "joey", "changed my mind"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := h.store.GetRun(context.Background(), run.ID)
+	requireStatus(t, got, agentrt.StatusCancelled, agentrt.ReasonOperatorCancelled)
+	if len(push.calls) != 0 {
+		t.Fatal("cancelled tool ran")
+	}
+	steps, _ := h.store.ListSteps(context.Background(), run.ID)
+	last := steps[len(steps)-1]
+	if last.Status != agentrt.StepFailed || last.Observation == nil || last.Observation.Kind != agentrt.ObserveInterrupted {
+		t.Fatalf("awaiting step = %+v", last)
+	}
+	if _, err := d.Resume(context.Background(), run.ID); err == nil {
+		t.Fatal("resume of a cancelled run must fail")
+	}
+	if err := d.Cancel(context.Background(), run.ID, "joey", "again"); err == nil {
+		t.Fatal("cancel of a terminal run must fail")
+	}
+	events, _ := h.store.ListEvents(context.Background(), run.ID)
+	if events[len(events)-1].Type != agentrt.EventRunFinished {
+		t.Fatalf("last event = %s", events[len(events)-1].Type)
+	}
+}

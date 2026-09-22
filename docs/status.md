@@ -32,6 +32,7 @@ exists, reference given), **Verified** (a named test exercises it).
 | Active time limit sums step durations and excludes approval waits; a resumed step's clock restarts | Verified | `TestLimits_ActiveTimeExcludesApprovalWait`, `TestLimits_ActiveTimeStopsRun` |
 | Elapsed time limit is an absolute deadline including waits | Verified | `TestLimits_ElapsedTimeIncludesWaits` |
 | Approval expiry cancels the run on approve or resume | Verified | `TestApproval_ExpiryCancelsRun` |
+| Operator cancel ends a non-terminal run as `operator_cancelled`, fails the in-flight step, refuses terminal runs; the only way to close a run whose approval was granted but never resumed | Verified | `TestCancel_ApprovedButUnresumedRun` |
 | Structured reconciliation outcomes | Verified | `TestResume_ReconcileOutcomes` |
 | Step limit | Verified | `TestDriver_StepLimit` |
 | Consecutive failure limit, reset on success | Verified | `TestDriver_ConsecutiveFailuresEndRun`, `TestDriver_FailureStreakResetsOnSuccess` |

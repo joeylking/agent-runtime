@@ -626,6 +626,54 @@ func decide(ctx context.Context, store *Store, obs Observer, runID, approvalID, 
 	})
 }
 
+// Cancel ends a run that is not terminal as CANCELLED with reason
+// operator_cancelled. It is for a run the operator no longer wants: one
+// waiting for an approval, one already approved but not yet resumed, or
+// one left interrupted. The caller must ensure no process is executing the
+// run; the runtime does not lock. A step still in flight is failed with an
+// observation naming the cancellation, and pending approvals are left as
+// they are.
+func (d *Driver) Cancel(ctx context.Context, runID, by, note string) error {
+	return Cancel(ctx, d.store, d.observer, runID, by, note)
+}
+
+// Cancel is Driver.Cancel without a driver, for command-line tools that
+// decide on runs they did not start.
+func Cancel(ctx context.Context, store *Store, obs Observer, runID, by, note string) error {
+	run, err := store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if run.Status.Terminal() {
+		return fmt.Errorf("agentrt: run %s is already %s", runID, run.Status)
+	}
+	// Loaded before the transaction: the store has a single connection.
+	steps, err := store.ListSteps(ctx, runID)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	run.Status, run.Reason, run.ReasonDetail, run.FinishedAt = StatusCancelled, ReasonOperatorCancelled, note, now
+	return store.tx(ctx, obs, func(t *txn) error {
+		for _, st := range steps {
+			if st.Status == StepDone || st.Status == StepFailed || st.Status == StepInterrupted {
+				continue
+			}
+			st.Status = StepFailed
+			o := observation(ObserveInterrupted, map[string]any{"by": by, "note": note}, "cancelled by operator: "+note)
+			st.Observation = &o
+			st.FinishedAt = now
+			if err := t.updateStep(ctx, st); err != nil {
+				return err
+			}
+		}
+		if err := t.updateRun(ctx, run); err != nil {
+			return err
+		}
+		return t.appendEvent(ctx, Event{RunID: runID, At: now, Type: EventRunFinished, Payload: mustJSON(map[string]any{"status": run.Status, "reason": run.Reason, "detail": note, "by": by, "steps": run.StepCount})})
+	})
+}
+
 // expireApproval marks a pending approval expired and cancels the run.
 func expireApproval(ctx context.Context, store *Store, obs Observer, run Run, a Approval, now time.Time) error {
 	a.Status, a.DecidedAt, a.Note = ApprovalExpired, now, "expired"

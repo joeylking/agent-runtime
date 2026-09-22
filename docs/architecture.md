@@ -44,6 +44,9 @@ hash before accepting the decision. `Resume` re-evaluates policy and
 executes the recorded request only when policy allows it or asks for
 exactly the approval that was granted; a different answer pauses again.
 Approvals may carry an expiry that cancels the run when next touched.
+`Cancel` ends any non-terminal run as `operator_cancelled`; it exists
+because an approval, once granted, cannot be rejected, so a run approved
+but never resumed would otherwise have no way to be closed.
 
 ## Interruption
 

@@ -61,6 +61,7 @@ const (
 	ReasonPolicyAbort          TerminalReason = "policy_abort"
 	ReasonToolAbort            TerminalReason = "tool_abort"
 	ReasonApprovalRejected     TerminalReason = "approval_rejected"
+	ReasonOperatorCancelled    TerminalReason = "operator_cancelled"
 	ReasonReconcileConflict    TerminalReason = "reconcile_conflict"
 	ReasonAgentError           TerminalReason = "agent_error"
 	ReasonInternalError        TerminalReason = "internal_error"
