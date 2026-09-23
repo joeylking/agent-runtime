@@ -1,8 +1,11 @@
 package agentrt_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -229,5 +232,83 @@ func TestReplay_RecordThenReplay(t *testing.T) {
 	req.System = "s"
 	if _, err := other.Generate(context.Background(), req); !errors.Is(err, replay.ErrNotRecorded) {
 		t.Fatal("recording served for a different model name")
+	}
+}
+
+// A replayed response must carry the provider's raw bytes unchanged: not
+// HTML-escaped, not re-indented. Compared as bytes, because a decode would
+// hide exactly the difference at issue.
+func TestReplay_RawBytesRoundTrip(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "recordings")
+	raw := json.RawMessage("{\"message\": {\"content\": \"Tom & Jerry <http://x.test/?a=1&b=2>\",\n  \"nested\":\t[1, 2]}}")
+	inner := &replay.Scripted{ModelName: "m", Responses: []agentrt.ModelResponse{{Text: "a & b <c>", Raw: raw}}}
+	rec := &replay.Recorder{Inner: inner, Dir: dir}
+	req := agentrt.ModelRequest{System: "s", Messages: []agentrt.Message{{Role: "user", Content: []agentrt.ContentBlock{{Type: "text", Text: "x & <y>"}}}}}
+	if _, err := rec.Generate(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	again, err := (&replay.Replayer{ModelName: "m", Dir: dir}).Generate(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(again.Raw, raw) {
+		t.Fatalf("raw changed:\n got %q\nwant %q", again.Raw, raw)
+	}
+	if again.Text != "a & b <c>" {
+		t.Fatalf("text = %q", again.Text)
+	}
+	files, _ := filepath.Glob(filepath.Join(dir, "*.json"))
+	b, _ := os.ReadFile(files[0])
+	// The escape sequences are built without a backslash literal so the
+	// intent survives any transcription of this file.
+	bs := string(rune(92))
+	if bytes.Contains(b, []byte(bs+"u0026")) || bytes.Contains(b, []byte(bs+"u003c")) {
+		t.Fatalf("file on disk is HTML-escaped:\n%s", b)
+	}
+}
+
+// Identical requests are recorded in sequence and replayed in order; a
+// request made more times than it was recorded is unrecorded; and a new
+// recording session replaces the whole sequence for a key.
+func TestReplay_IdenticalRequestsKeepTheirOrder(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "recordings")
+	req := agentrt.ModelRequest{System: "s", Messages: []agentrt.Message{{Role: "user", Content: []agentrt.ContentBlock{{Type: "text", Text: "hi"}}}}}
+	inner := &replay.Scripted{ModelName: "m", Responses: []agentrt.ModelResponse{{Text: "first"}, {Text: "second"}, {Text: "third"}}}
+	rec := &replay.Recorder{Inner: inner, Dir: dir}
+	for i := 0; i < 3; i++ {
+		if _, err := rec.Generate(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rep := &replay.Replayer{ModelName: "m", Dir: dir}
+	for _, want := range []string{"first", "second", "third"} {
+		got, err := rep.Generate(context.Background(), req)
+		if err != nil || got.Text != want {
+			t.Fatalf("got %q, %v; want %q", got.Text, err, want)
+		}
+	}
+	if _, err := rep.Generate(context.Background(), req); !errors.Is(err, replay.ErrNotRecorded) {
+		t.Fatalf("fourth call: %v, want ErrNotRecorded", err)
+	}
+	// A fresh replayer starts the sequence again.
+	got, err := (&replay.Replayer{ModelName: "m", Dir: dir}).Generate(context.Background(), req)
+	if err != nil || got.Text != "first" {
+		t.Fatalf("fresh replayer: %q, %v", got.Text, err)
+	}
+	// Re-recording with one exchange leaves no stale second or third file.
+	inner2 := &replay.Scripted{ModelName: "m", Responses: []agentrt.ModelResponse{{Text: "only"}}}
+	if _, err := (&replay.Recorder{Inner: inner2, Dir: dir}).Generate(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	files, _ := filepath.Glob(filepath.Join(dir, "*.json"))
+	if len(files) != 1 {
+		t.Fatalf("files after re-record = %v", files)
+	}
+	rep = &replay.Replayer{ModelName: "m", Dir: dir}
+	if got, _ := rep.Generate(context.Background(), req); got.Text != "only" {
+		t.Fatalf("re-recorded = %q", got.Text)
+	}
+	if _, err := rep.Generate(context.Background(), req); !errors.Is(err, replay.ErrNotRecorded) {
+		t.Fatal("stale second exchange served after re-record")
 	}
 }

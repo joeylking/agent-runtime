@@ -5,6 +5,7 @@
 package replay
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 
 	agentrt "github.com/joeylking/agent-runtime"
@@ -74,17 +76,32 @@ func Key(model string, req agentrt.ModelRequest) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// record is one stored exchange.
+// record is one stored exchange. The provider's raw bytes are stored as a
+// JSON string rather than embedded JSON so that re-encoding cannot touch
+// them: an embedded json.RawMessage would be re-indented and, with the
+// default encoder, HTML-escaped, and the replayed bytes would differ from
+// what the provider sent. Files written before this field existed carry
+// the raw bytes embedded in response.raw and are still read.
 type record struct {
 	Model    string                `json:"model"`
 	Request  agentrt.ModelRequest  `json:"request"`
 	Response agentrt.ModelResponse `json:"response"`
+	Raw      string                `json:"raw_bytes,omitempty"`
 }
 
 // Recorder wraps a model and stores every successful exchange in Dir.
+//
+// Exchanges with identical requests are stored in sequence: the first at
+// <key>.json, the second at <key>.2.json, and so on, so a replay serves
+// them in the order they were recorded rather than the last one for every
+// call. The first exchange for a key in a Recorder's lifetime replaces
+// whatever an earlier session recorded under that key, including any
+// higher-numbered files, so re-recording a run leaves nothing stale.
 type Recorder struct {
 	Inner agentrt.Model
 	Dir   string
+	mu    sync.Mutex
+	seen  map[string]int
 }
 
 // Name implements agentrt.Model.
@@ -103,24 +120,72 @@ func (r *Recorder) Generate(ctx context.Context, req agentrt.ModelRequest) (agen
 	if err := os.MkdirAll(r.Dir, 0o755); err != nil {
 		return resp, err
 	}
-	b, err := json.MarshalIndent(record{Model: r.Inner.Name(), Request: req, Response: resp}, "", "  ")
-	if err != nil {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.seen == nil {
+		r.seen = map[string]int{}
+	}
+	n := r.seen[key] + 1
+	r.seen[key] = n
+	if n == 1 {
+		if err := removeSequence(r.Dir, key); err != nil {
+			return resp, err
+		}
+	}
+	stored := resp
+	stored.Raw = nil
+	rec := record{Model: r.Inner.Name(), Request: req, Response: stored, Raw: string(resp.Raw)}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(rec); err != nil {
 		return resp, err
 	}
 	tmp := filepath.Join(r.Dir, key+".tmp")
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil {
 		return resp, err
 	}
-	return resp, os.Rename(tmp, filepath.Join(r.Dir, key+".json"))
+	return resp, os.Rename(tmp, sequencePath(r.Dir, key, n))
 }
 
-// ErrNotRecorded means the replayer has no response for the request.
+// sequencePath names the nth exchange for a key. The first keeps the
+// original <key>.json name so earlier recordings stay valid.
+func sequencePath(dir, key string, n int) string {
+	if n == 1 {
+		return filepath.Join(dir, key+".json")
+	}
+	return filepath.Join(dir, key+"."+strconv.Itoa(n)+".json")
+}
+
+// removeSequence deletes the higher-numbered files of a key left by an
+// earlier recording session. The first file is overwritten by rename.
+func removeSequence(dir, key string) error {
+	matches, err := filepath.Glob(filepath.Join(dir, key+".*.json"))
+	if err != nil {
+		return err
+	}
+	for _, m := range matches {
+		if err := os.Remove(m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ErrNotRecorded means the replayer has no response for the request, or
+// the request has been made more times than it was recorded.
 var ErrNotRecorded = errors.New("replay: no recorded response for this request")
 
 // Replayer serves recorded responses and fails on anything unrecorded.
+// Identical requests are served in the order they were recorded; a
+// request made more times than it was recorded is unrecorded, because the
+// replayed session has diverged from the recorded one.
 type Replayer struct {
 	ModelName string
 	Dir       string
+	mu        sync.Mutex
+	served    map[string]int
 }
 
 // Name implements agentrt.Model.
@@ -132,9 +197,18 @@ func (p *Replayer) Generate(_ context.Context, req agentrt.ModelRequest) (agentr
 	if err != nil {
 		return agentrt.ModelResponse{}, err
 	}
-	b, err := os.ReadFile(filepath.Join(p.Dir, key+".json"))
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.served == nil {
+		p.served = map[string]int{}
+	}
+	n := p.served[key] + 1
+	b, err := os.ReadFile(sequencePath(p.Dir, key, n))
 	if errors.Is(err, os.ErrNotExist) {
-		return agentrt.ModelResponse{}, fmt.Errorf("%w (key %s)", ErrNotRecorded, key[:12])
+		if n == 1 {
+			return agentrt.ModelResponse{}, fmt.Errorf("%w (key %s)", ErrNotRecorded, key[:12])
+		}
+		return agentrt.ModelResponse{}, fmt.Errorf("%w (key %s: recorded %d times, requested %d)", ErrNotRecorded, key[:12], n-1, n)
 	}
 	if err != nil {
 		return agentrt.ModelResponse{}, err
@@ -143,5 +217,10 @@ func (p *Replayer) Generate(_ context.Context, req agentrt.ModelRequest) (agentr
 	if err := json.Unmarshal(b, &rec); err != nil {
 		return agentrt.ModelResponse{}, err
 	}
-	return rec.Response, nil
+	p.served[key] = n
+	resp := rec.Response
+	if rec.Raw != "" {
+		resp.Raw = json.RawMessage(rec.Raw)
+	}
+	return resp, nil
 }
