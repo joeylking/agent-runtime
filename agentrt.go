@@ -161,6 +161,15 @@ const (
 	DecideToolCall DecisionKind = "tool_call"
 	DecideComplete DecisionKind = "complete"
 	DecideFail     DecisionKind = "fail"
+	// KindTruncated and KindNoToolCall are what a model agent records when
+	// the model asked for nothing executable: a reply cut off by the output
+	// cap, and a reply with no tool use at all. They are deliberately not
+	// valid decisions, so the driver records an invalid_decision
+	// observation, the step counts against the consecutive failure limit,
+	// and the next render nudges the model from the recorded kind. See
+	// render.Decide.
+	KindTruncated  DecisionKind = "truncated"
+	KindNoToolCall DecisionKind = "no_tool_call"
 )
 
 // Decision is the agent's output for one step. It is recorded verbatim before

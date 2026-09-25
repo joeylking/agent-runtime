@@ -537,6 +537,11 @@ func (d *Driver) pause(ctx context.Context, run Run, step Step, req ToolRequest,
 	if err != nil {
 		return Run{}, err
 	}
+	// The model caller adds to the run's totals in its own transactions, so
+	// the copy in hand is behind; return what the store holds, as finish does.
+	if fresh, err := d.store.GetRun(ctx, run.ID); err == nil {
+		run.ModelCalls, run.Usage, run.EstimatedCost = fresh.ModelCalls, fresh.Usage, fresh.EstimatedCost
+	}
 	return run, nil
 }
 

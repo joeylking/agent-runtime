@@ -195,6 +195,40 @@ func TestDriver_InvalidArgumentsBecomeObservation(t *testing.T) {
 	}
 }
 
+// The pseudo kinds a model agent records for a reply that asked for nothing
+// executable must be invalid decisions: the step fails with an
+// invalid_decision observation the next render nudges on, and no tool runs.
+func TestDriver_PseudoDecisionKindsAreInvalid(t *testing.T) {
+	h := newHarness(t, ":memory:")
+	read := echoTool("read", agentrt.ReadOnly)
+	agent := &scripted.Agent{Decisions: []agentrt.Decision{
+		{Kind: agentrt.KindNoToolCall, Reason: "narrating instead of acting"},
+		{Kind: agentrt.KindTruncated, Reason: "cut off by the output cap"},
+		scripted.ToolCall("read", `{"n":1}`, ""),
+		scripted.Complete(`{}`),
+	}}
+	run, err := h.driver(agent, agentrt.DefaultPolicy(), read).Start(context.Background(), "g", limits(10, 5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireStatus(t, run, agentrt.StatusCompleted, agentrt.ReasonGoalCompleted)
+	steps, _ := h.store.ListSteps(context.Background(), run.ID)
+	for i, kind := range []agentrt.DecisionKind{agentrt.KindNoToolCall, agentrt.KindTruncated} {
+		if steps[i].Status != agentrt.StepFailed || steps[i].Observation.Kind != agentrt.ObserveInvalidDecision {
+			t.Fatalf("step %d = %+v", i, steps[i])
+		}
+		if steps[i].Decision == nil || steps[i].Decision.Kind != kind {
+			t.Fatalf("step %d must record %s verbatim", i, kind)
+		}
+		if steps[i].Policy != nil {
+			t.Fatalf("step %d: policy must not be evaluated", i)
+		}
+	}
+	if len(read.calls) != 1 {
+		t.Fatalf("tool called %d times, want 1", len(read.calls))
+	}
+}
+
 func TestDriver_PolicyDenyIsObservation(t *testing.T) {
 	h := newHarness(t, ":memory:")
 	wipe := echoTool("wipe", agentrt.Destructive)
