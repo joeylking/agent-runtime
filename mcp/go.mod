@@ -3,7 +3,7 @@ module github.com/joeylking/agent-runtime/mcp
 go 1.27
 
 require (
-	github.com/joeylking/agent-runtime v0.1.2
+	github.com/joeylking/agent-runtime v0.1.3-0.20260925184720-dea7c371b3bb
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 )
 

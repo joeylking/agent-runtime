@@ -2,8 +2,25 @@ module github.com/joeylking/agent-runtime/examples/live
 
 go 1.27
 
-// The provider modules this example imports live in this repository and
-// resolve through the workspace the README builds. They are named here as
-// requirements only once they are tagged: a requirement on a version that
-// does not exist yet fails every build in the workspace as well.
-require github.com/joeylking/agent-runtime v0.1.2
+require (
+	// Sibling modules are pinned to the commit that holds them; the workspace
+	// the README builds overrides these for development inside the repository.
+	github.com/joeylking/agent-runtime v0.1.3-0.20260925184720-dea7c371b3bb
+	github.com/joeylking/agent-runtime/providers/ollama v0.0.0-20260925184720-dea7c371b3bb
+	github.com/joeylking/agent-runtime/providers/openai v0.0.0-20260925184720-dea7c371b3bb
+)
+
+require (
+	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/mattn/go-isatty v0.0.24 // indirect
+	github.com/ncruces/go-strftime v1.0.0 // indirect
+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/text v0.14.0 // indirect
+	modernc.org/libc v1.75.7 // indirect
+	modernc.org/mathutil v1.7.1 // indirect
+	modernc.org/memory v1.12.1 // indirect
+	modernc.org/sqlite v1.59.0 // indirect
+)
