@@ -1,0 +1,23 @@
+{
+  "read_text_file": {
+    "side_effect": "read_only",
+    "timeout": "5s"
+  },
+  "read_file": {
+    "side_effect": "read_only",
+    "timeout": "5s"
+  },
+  "list_directory": {
+    "side_effect": "read_only",
+    "timeout": "5s"
+  },
+  "directory_tree": {
+    "side_effect": "read_only",
+    "timeout": "5s"
+  },
+  "write_file": {
+    "side_effect": "local_mutation",
+    "timeout": "10s",
+    "allow_hint_mismatch": true
+  }
+}

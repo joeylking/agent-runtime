@@ -16,6 +16,42 @@ jobs:
       - run: go test -race -count=1 ./...
       - name: scripted example
         run: go run ./examples/scripted -db "$RUNNER_TEMP/example.db"
+      - name: operator command
+        run: |
+          db="$RUNNER_TEMP/example.db"
+          go run ./cmd/agentrt -db "$db" runs
+          run=$(go run ./cmd/agentrt -db "$db" -json runs | jq -r '.[0].id')
+          go run ./cmd/agentrt -db "$db" show "$run"
+          go run ./cmd/agentrt -db "$db" events "$run" | tail -3
+          go run ./cmd/agentrt -db "$db" -json events "$run" | jq -e -s 'length > 8' > /dev/null
+          # The example's run completed, so there is nothing left to decide.
+          if go run ./cmd/agentrt -db "$db" approve "$run"; then
+            echo "approving a completed run must fail" >&2
+            exit 1
+          fi
+
+  # The nested modules (the provider adapters, the MCP adapter) and the two
+  # examples have their own go.mod files, so ./... in the root module does not
+  # reach them. A workspace makes them resolve the in-tree core rather than a
+  # published version. The live-tagged tests are not run: they need a local
+  # model server. Neither example is run either: examples/mcp needs Node and a
+  # model, so vetting and compiling it is all CI can do, which `go test` on a
+  # main package with no test files does.
+  providers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: workspace
+        run: go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./examples/live ./examples/mcp
+      - name: nested modules
+        run: |
+          for m in providers/ollama providers/anthropic providers/openai mcp examples/live examples/mcp; do
+            echo "== $m"
+            (cd "$m" && go vet ./... && go test -race -count=1 ./...)
+          done
 
   # Tests that need a subprocess or on-disk crash simulation are added under
   # the "crash" build tag in later milestones. This job invokes them explicitly
