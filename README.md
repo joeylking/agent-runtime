@@ -19,8 +19,13 @@ need, not before.
 
 ## Status
 
-v0.1: the runtime that [repo-steward](https://github.com/joeylking/repo-steward)
-runs on. [docs/architecture.md](docs/architecture.md) describes the loop,
+v0.2: the runtime that [repo-steward](https://github.com/joeylking/repo-steward)
+and [casework](https://github.com/joeylking/casework) run on, with the
+packages both rebuilt now shipped here and an MCP adapter that puts any
+server's tools behind the policy ([docs/roadmap.md](docs/roadmap.md) items 1
+and 2). The nested modules are tagged separately with a directory prefix:
+`providers/ollama/v0.1.0`, `providers/anthropic/v0.1.0`,
+`providers/openai/v0.1.0`, `mcp/v0.1.0`. [docs/architecture.md](docs/architecture.md) describes the loop,
 approvals, interruption, and persistence; [docs/status.md](docs/status.md)
 lists every control with the test that verifies it; [docs/decisions](docs/decisions)
 records why it is built this way. The [wiki](https://github.com/joeylking/agent-runtime/wiki)

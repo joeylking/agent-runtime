@@ -194,6 +194,8 @@ and previous Go release.
 
 ## Sequence
 
-Items 1 and 2 first, in that order, because 2 needs a provider adapter
-to demonstrate. Item 8 lands alongside them. Items 3 through 6 follow
-as consumer evidence arrives; 7 is continuous.
+Items 1 and 2 shipped in v0.2.0 (core) with the nested modules at
+v0.1.0, and both consumers deleted their copies with their recorded
+replays passing unchanged. Item 8 comes next because it needs no new
+code. Items 3 through 6 follow as consumer evidence arrives; 7 is
+continuous.
