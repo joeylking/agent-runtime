@@ -60,7 +60,7 @@ func TestMessages_WholeSequence(t *testing.T) {
 		toolStep(0, "read", `{"n":1}`, "look first", result(`{"value":1}`, "value=1")),
 		toolStep(1, "add", `{"n":"x"}`, "add one", failed(agentrt.ObserveInvalidDecision, `{"error":"bad type"}`, "invalid decision: bad type")),
 		agentrt.Step{ID: "s2", Index: 2, Status: agentrt.StepFailed, Decision: &agentrt.Decision{Kind: agentrt.KindNoToolCall, Reason: "I will now consider the options."},
-			Observation: failed(agentrt.ObserveInvalidDecision, `{"error":"unknown decision kind"}`, "invalid decision: unknown decision kind \"no_tool_call\"")},
+			Observation: failed(agentrt.ObserveInvalidDecision, `{"error":"the reply contained no tool call"}`, "invalid decision: the reply contained no tool call")},
 	)
 	msgs := render.Messages(in, render.Options{Opening: fixedOpening("Goal: g")})
 	requireGolden(t, msgs, `

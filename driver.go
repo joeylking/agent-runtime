@@ -344,6 +344,10 @@ func (d *Driver) validateDecision(dec Decision) error {
 		return cs.validate(dec.Args)
 	case "":
 		return errors.New("decision has no kind")
+	case KindTruncated:
+		return errors.New("the reply was cut off by the output cap before a tool call")
+	case KindNoToolCall:
+		return errors.New("the reply contained no tool call")
 	default:
 		return fmt.Errorf("unknown decision kind %q", dec.Kind)
 	}
