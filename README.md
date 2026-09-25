@@ -55,9 +55,8 @@ Pre-1.0, so the promise is narrow and written down rather than implied:
 
 ## Quick start
 
-The core module requires Go 1.26 or later, so the current release and the one
-before it both build it. The nested modules require 1.27 until they re-pin to a
-core release declaring 1.26; their `go.mod` files say why.
+Every module requires Go 1.26 or later, so the current release and the one
+before it both build them, and CI runs both.
 
 The demo the project leads with is `examples/mcp`: a local model driving the
 stock MCP filesystem server, where reads are allowed and a write stops the run

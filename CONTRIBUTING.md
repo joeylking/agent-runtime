@@ -40,12 +40,11 @@ go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp
 `go.work` is not committed.
 
 The core's `go` directive is the previous Go release, so a consumer on either of
-the last two builds it, and CI runs the core on both. A nested module's
-directive is whatever the core release it pins requires, which `go mod tidy`
-enforces; the comment above each one says so. Working on a nested module
-therefore needs 1.27 today, even in the workspace, because an older toolchain
-refuses the module graph. Do not raise the core's directive without a reason a
-consumer can read.
+the last two builds it, and CI runs every module on both. A nested module's
+directive can be no lower than what the core release it pins requires, which
+`go mod tidy` enforces, so a core release that raises its directive drags the
+nested modules up at their next re-pin. Do not raise the core's directive
+without a reason a consumer can read.
 
 ## Running every suite
 

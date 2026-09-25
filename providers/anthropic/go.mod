@@ -1,13 +1,10 @@
 module github.com/joeylking/agent-runtime/providers/anthropic
 
-// Held above the core module's go 1.26 because the core release this module
-// pins, v0.2.0, declares go 1.27; go mod tidy raises this line to match. It
-// drops to 1.26 when this module re-pins to a core release declaring 1.26.
-go 1.27
+go 1.26
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.75.0
-	github.com/joeylking/agent-runtime v0.2.0
+	github.com/joeylking/agent-runtime v0.2.1
 )
 
 require (
