@@ -1,6 +1,7 @@
 package providers
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -8,6 +9,10 @@ import (
 
 	agentrt "github.com/joeylking/agent-runtime"
 )
+
+// ErrNoPrice is wrapped by PriceFor for a name the table does not hold. A
+// paid model runs only with a known price.
+var ErrNoPrice = errors.New("no price for this model")
 
 // PriceFor returns the price recorded for a model. A name absent from the
 // table is an error rather than a price of zero: agentrt.PriceTable charges
@@ -17,7 +22,7 @@ import (
 func PriceFor(prices agentrt.PriceTable, name string) (agentrt.Price, error) {
 	p, ok := prices[name]
 	if !ok {
-		return agentrt.Price{}, fmt.Errorf("providers: no price for %s; a paid model runs only with a known price", name)
+		return agentrt.Price{}, fmt.Errorf("%s: %w", name, ErrNoPrice)
 	}
 	return p, nil
 }

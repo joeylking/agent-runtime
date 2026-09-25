@@ -1,6 +1,7 @@
 package providers_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -15,7 +16,7 @@ func TestPriceFor_UnpricedModelRefused(t *testing.T) {
 		t.Fatalf("price = %+v, err = %v", p, err)
 	}
 	_, err = providers.PriceFor(table, "anthropic:claude-opus-5")
-	if err == nil || !strings.Contains(err.Error(), "a paid model runs only with a known price") {
+	if !errors.Is(err, providers.ErrNoPrice) || !strings.Contains(err.Error(), "anthropic:claude-opus-5") {
 		t.Fatalf("err = %v", err)
 	}
 }

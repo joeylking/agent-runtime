@@ -6,6 +6,7 @@ package view
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -113,6 +114,14 @@ func Steps(ctx context.Context, store *agentrt.Store, runID string) ([]StepSumma
 	return out, nil
 }
 
+// Errors PendingApproval wraps, so a front end can match them and word its
+// own message; the text carries the ids.
+var (
+	ErrNotPending        = errors.New("approval is not pending")
+	ErrNoPendingApproval = errors.New("no pending approval")
+	ErrAmbiguousApproval = errors.New("more than one pending approval")
+)
+
 // PendingApproval selects the approval an operator means. With an id it
 // fetches that approval and requires it to be pending; without one the run
 // must have exactly one pending approval, and the error names the candidates
@@ -122,10 +131,10 @@ func PendingApproval(ctx context.Context, store *agentrt.Store, runID, approvalI
 	if approvalID != "" {
 		a, err := store.GetApproval(ctx, runID, approvalID)
 		if err != nil {
-			return agentrt.Approval{}, fmt.Errorf("view: approval %s of run %s: %w", approvalID, runID, err)
+			return agentrt.Approval{}, fmt.Errorf("approval %s of run %s: %w", approvalID, runID, err)
 		}
 		if a.Status != agentrt.ApprovalPending {
-			return agentrt.Approval{}, fmt.Errorf("view: approval %s is %s, not pending", a.ID, a.Status)
+			return agentrt.Approval{}, fmt.Errorf("approval %s is %s: %w", a.ID, a.Status, ErrNotPending)
 		}
 		return a, nil
 	}
@@ -137,13 +146,13 @@ func PendingApproval(ctx context.Context, store *agentrt.Store, runID, approvalI
 	case 1:
 		return pending[0], nil
 	case 0:
-		return agentrt.Approval{}, fmt.Errorf("view: run %s has no pending approval", runID)
+		return agentrt.Approval{}, fmt.Errorf("run %s: %w", runID, ErrNoPendingApproval)
 	default:
 		ids := make([]string, 0, len(pending))
 		for _, a := range pending {
 			ids = append(ids, a.ID)
 		}
-		return agentrt.Approval{}, fmt.Errorf("view: run %s has %d pending approvals; name one of %s", runID, len(pending), strings.Join(ids, ", "))
+		return agentrt.Approval{}, fmt.Errorf("run %s has %d pending approvals, name one of %s: %w", runID, len(pending), strings.Join(ids, ", "), ErrAmbiguousApproval)
 	}
 }
 

@@ -27,7 +27,7 @@
 //		},
 //		Assistant: func(st agentrt.Step, _ string) []agentrt.ContentBlock {
 //			if t, ok := turns[st.Index]; ok && t.Model == a.ModelName {
-//				return []agentrt.ContentBlock{{Type: RawAssistantBlock, Text: string(t.Raw)}}
+//				return []agentrt.ContentBlock{{Type: rawBlock, Text: string(t.Raw)}} // the adapter's RawAssistantBlock
 //			}
 //			return nil // synthesize
 //		},
@@ -96,6 +96,8 @@ type Options struct {
 	// own cap.
 	MaxContentBytes int
 	// ToolUseID names a step's tool_use block. Zero means "step_<index>".
+	// Hooks see only the Step, so its recorded Index is the identity to key
+	// on; the store orders steps by it and it has no gaps.
 	ToolUseID func(step agentrt.Step) string
 	// Assistant renders a step's assistant turn. Returning nil falls back
 	// to the synthesized turn, so a hook can override only the steps it
