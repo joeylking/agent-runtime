@@ -1,0 +1,67 @@
+name: Consumer need
+description: Something a consumer had to build itself that belongs in the runtime.
+labels: [consumer-need]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is how the roadmap is priced. [ADR 1](https://github.com/joeylking/agent-runtime/blob/main/docs/decisions/0001-custom-runtime.md)
+        says an abstraction is added when a consumer demonstrates the need, not
+        before, so an idea with no consumer behind it is refused rather than
+        deferred. Describe the need here before writing code.
+  - type: input
+    id: consumer
+    attributes:
+      label: Consumer
+      description: The project that ran into this. A link if it is public.
+      placeholder: github.com/joeylking/casework
+    validations:
+      required: true
+  - type: textarea
+    id: built
+    attributes:
+      label: What it had to build itself
+      description: |
+        The code you wrote around the runtime, and where it lives. Say whether a
+        second consumer has written it too: two copies is the strongest evidence
+        there is.
+    validations:
+      required: true
+  - type: textarea
+    id: home
+    attributes:
+      label: Why the runtime is the right home
+      description: |
+        What makes this the runtime's business rather than the consumer's. It
+        should touch the loop, policy, approvals, limits, persistence, or the
+        audit log. The roadmap's "What it is not for" lists what belongs
+        elsewhere: timers, fan-out, distributed workers, memory, retrieval.
+    validations:
+      required: true
+  - type: dropdown
+    id: item
+    attributes:
+      label: Roadmap item it supports
+      description: From [docs/roadmap.md](https://github.com/joeylking/agent-runtime/blob/main/docs/roadmap.md).
+      options:
+        - 1. Ship what both consumers rebuilt
+        - 2. MCP tool adapter
+        - 3. Evaluation vocabulary as a module
+        - 4. Test kit for consumers
+        - 5. Event export, not a UI
+        - 6. Portable approval channel
+        - 7. Publish the ideas
+        - 8. Open-source hygiene
+        - none of them, this is a new item
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: Shape it would take
+      description: |
+        Optional. The smallest public API that would serve the need, and what
+        you would delete from the consumer once it existed. No speculative
+        options.
+    validations:
+      required: false

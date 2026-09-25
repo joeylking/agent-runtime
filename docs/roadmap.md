@@ -37,6 +37,18 @@ refused, not deferred.
 
 ## Module layout
 
+The project is pre-1.0, and this is the whole compatibility promise. Within a
+minor version of the core, the exported API is additive only. A minor bump may
+change or remove exported API and the release notes say which symbols and what
+to do instead. The nested modules version independently, with their own
+directory-prefixed tags, and each names the core version it requires in its
+`go.mod`. The SQLite schema only migrates forward: a newer core opens a
+database written by an older one and applies what is missing, and there are no
+down migrations. Recordings stay valid across core versions, because the replay
+key is the model name and the canonical JSON of the request (`replay.Key`); a
+release that changed that shape would invalidate every recording and would say
+so.
+
 The core module `github.com/joeylking/agent-runtime` keeps two
 dependencies: a JSON Schema validator and SQLite. Everything below that
 adds a dependency lives in a nested module in this repository with its

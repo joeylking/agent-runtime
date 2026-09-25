@@ -4,14 +4,23 @@ on:
   push:
   pull_request:
 
+# The core module supports the current Go release and the one before it, so it
+# is built with both. GOTOOLCHAIN=local forbids a silent switch to a newer
+# toolchain, which would make the 1.26 job a second 1.27 job.
+env:
+  GOTOOLCHAIN: local
+
 jobs:
   unit:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ["1.26.x", "1.27.x"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go-version }}
       - run: go vet ./...
       - run: go test -race -count=1 ./...
       - name: scripted example
@@ -37,13 +46,18 @@ jobs:
   # model server. Neither example is run either: examples/mcp needs Node and a
   # model, so vetting and compiling it is all CI can do, which `go test` on a
   # main package with no test files does.
+  #
+  # 1.27 only, and not the core's matrix: every nested module pins the core at
+  # v0.2.0, whose go.mod declares go 1.27, and the module graph is refused by an
+  # older toolchain even under a workspace. They join the matrix when they
+  # re-pin to a core release declaring go 1.26.
   providers:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: "1.27.x"
       - name: workspace
         run: go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./examples/live ./examples/mcp
       - name: nested modules

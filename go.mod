@@ -1,6 +1,6 @@
 module github.com/joeylking/agent-runtime
 
-go 1.27
+go 1.26
 
 require (
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3

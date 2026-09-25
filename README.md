@@ -32,9 +32,32 @@ records why it is built this way. The [wiki](https://github.com/joeylking/agent-
 covers the same material at length for people using, extending, or evaluating
 the runtime. The API is pre-1.0 and changes when its consumer needs it to.
 
+### Compatibility
+
+Pre-1.0, so the promise is narrow and written down rather than implied:
+
+- within a minor version of the core, the exported API is additive only: a
+  patch release adds symbols and fields and takes none away;
+- a minor bump may change or remove exported API, and the release notes say
+  which symbols and what to do instead;
+- the nested modules version independently, with their own directory-prefixed
+  tags, and each names the core version it requires in its `go.mod`, so
+  upgrading one does not move the others;
+- the SQLite schema only migrates forward. A newer core opens a database
+  written by an older one and applies what is missing; there are no down
+  migrations, so a database is not handed back to an older core;
+- recordings stay valid across core versions. The replay key is the model name
+  and the canonical JSON of the request (`replay.Key`), so a release that
+  changed that shape would invalidate every recording and would say so.
+
+[CONTRIBUTING.md](CONTRIBUTING.md) is how a change gets in, and
+[SECURITY.md](SECURITY.md) is what the runtime does and does not defend against.
+
 ## Quick start
 
-Requires Go 1.27 or later.
+The core module requires Go 1.26 or later, so the current release and the one
+before it both build it. The nested modules require 1.27 until they re-pin to a
+core release declaring 1.26; their `go.mod` files say why.
 
 The demo the project leads with is `examples/mcp`: a local model driving the
 stock MCP filesystem server, where reads are allowed and a write stops the run

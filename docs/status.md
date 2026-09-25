@@ -120,6 +120,22 @@ exists, reference given), **Verified** (a named test exercises it).
 | A local model against the stock MCP filesystem server: the manifest pinned and the server's hints printed for the operator, four read tools registered, `write_file` a local mutation over the server's destructive hint, nine tools left unclassified and unavailable, the run paused before the write, approved with `cmd/agentrt`, resumed, and completed | Implemented | `examples/mcp`, `examples/mcp/rules.json` |
 | Why the side-effect class is the operator's, the pin covers the description, and a hint may refuse but never relax | Implemented | `docs/decisions/0004-operator-classified-tools.md` |
 
+## Item 8: open-source hygiene
+
+| Capability | Status | Reference |
+|---|---|---|
+| How the project decides what to add, how to propose it, the module layout and the workspace, every suite including the live-tagged tests and the examples, the recording convention, the style rules, and the commit shape; the maintainer merges and there is no CLA | Implemented | `CONTRIBUTING.md` |
+| What the runtime bounds and what it does not: untrusted content reaches the model and the action set is bounded by code, the database is trusted as the operator's filesystem is, no sandbox, no secret redaction, no multi-tenancy; private vulnerability reporting and the supported versions | Implemented | `SECURITY.md` |
+| Issue forms for a bug report (version, module, consumer, event trail) and a consumer need (who, what it built, why here, which roadmap item); blank issues off and security reports redirected to the private channel | Implemented | `.github/ISSUE_TEMPLATE` |
+| A denied destructive tool, an approval pause with Approve and Resume, and `NeedApproval` with `DecodePresentation`, as examples `go test` verifies against their printed output | Verified | `ExampleDefaultPolicy`, `ExampleDriver_Resume`, `ExampleNeedApproval` |
+| A rendered conversation over two recorded steps, and a tool-less reply becoming an invalid decision | Verified | `ExampleMessages`, `ExampleDecide` |
+| An unpriced model refused by `errors.Is`, and budgets parsed from dollars | Verified | `ExamplePriceFor`, `ExampleParseDollars` |
+| The exactly-one pending-approval rule | Verified | `ExamplePendingApproval` |
+| A pinned MCP tool with no operator rule left unregistered, over in-memory transports with no server | Verified | `ExampleLoad` |
+| Pre-1.0 compatibility promise: additive within a minor, release notes name what a minor bump changes, nested modules versioned independently and each naming its core version, forward-only migrations, recordings stable across core versions | Implemented | `README.md`, `docs/roadmap.md` |
+| The core module builds and tests on Go 1.26 and 1.27, with `GOTOOLCHAIN=local` so the older job cannot switch toolchains. The nested modules stay on 1.27 until they re-pin: the core release they require, v0.2.0, declares 1.27, and `go mod tidy` raises their `go` line to match | Implemented | `.github/workflows/ci.yml`, the comment above each nested `go` directive |
+| Public roadmap issue, pinned, mirroring the item list with a status per item | Implemented | [#3](https://github.com/joeylking/agent-runtime/issues/3) |
+
 ## Not implemented
 
 | Capability | Where it is planned |

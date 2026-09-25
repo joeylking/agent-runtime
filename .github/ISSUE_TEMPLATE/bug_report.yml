@@ -1,0 +1,74 @@
+name: Bug report
+description: A control did not hold, or the runtime did something other than what it records.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The event log is the explanation, so please bring it. If the bug is in a
+        provider adapter or the MCP adapter, say which module: they version
+        separately from the core.
+  - type: input
+    id: version
+    attributes:
+      label: Runtime version
+      description: The core module's version or commit, from `go list -m github.com/joeylking/agent-runtime`.
+      placeholder: v0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: module
+    attributes:
+      label: Module
+      description: Where the bug is. Add the nested module's version in the description if it is one of those.
+      options:
+        - core (github.com/joeylking/agent-runtime)
+        - cmd/agentrt
+        - providers/ollama
+        - providers/anthropic
+        - providers/openai
+        - mcp
+        - examples
+        - not sure
+    validations:
+      required: true
+  - type: input
+    id: consumer
+    attributes:
+      label: Consumer or example
+      description: What was driving the runtime — your own consumer, `examples/scripted`, `examples/live`, `examples/mcp`, or a test.
+      placeholder: examples/mcp
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: What the control should have done, and the sentence in the docs or the test name that says so.
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed
+      description: What happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: trail
+    attributes:
+      label: Event trail or failing test
+      description: |
+        The output of `agentrt -db <path> events <run>`, or the failing test and
+        its output. Trim it to the steps that matter, and redact anything your
+        tools put in the log.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: go
+    attributes:
+      label: Go version and OS
+      placeholder: go1.27.1 darwin/arm64
+    validations:
+      required: true
