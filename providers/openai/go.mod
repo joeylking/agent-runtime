@@ -2,7 +2,7 @@ module github.com/joeylking/agent-runtime/providers/openai
 
 go 1.27
 
-require github.com/joeylking/agent-runtime v0.1.3-0.20260925184720-dea7c371b3bb
+require github.com/joeylking/agent-runtime v0.2.0
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
