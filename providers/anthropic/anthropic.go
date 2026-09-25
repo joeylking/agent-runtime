@@ -73,7 +73,9 @@ type Config struct {
 	// another name.
 	Name string
 	// APIKey overrides the environment credential. Empty leaves the SDK to
-	// read ANTHROPIC_API_KEY.
+	// read ANTHROPIC_API_KEY at the first request, so an adapter with no
+	// key anywhere constructs fine and fails when first called; a consumer
+	// that wants to refuse earlier checks the environment itself.
 	APIKey string
 	// BaseURL overrides the API endpoint, which is how the tests point the
 	// adapter at a fake.

@@ -37,21 +37,32 @@
 // both turns, because its assistant turn carries no reason text and its
 // results are rendered as a labelled head plus content:
 //
+//	calls := func(st agentrt.Step) bool {
+//		return st.Decision.Kind == agentrt.DecideToolCall && st.Decision.Tool != ""
+//	}
 //	render.Options{
 //		Opening:       a.opening,
 //		RecentResults: a.RecentResults,
 //		Assistant: func(st agentrt.Step, id string) []agentrt.ContentBlock {
+//			if !calls(st) {
+//				return nil // the default text turn
+//			}
 //			return []agentrt.ContentBlock{{Type: "tool_use", ToolUseID: id, Name: st.Decision.Tool, Input: orEmpty(st.Decision.Args)}}
 //		},
 //		Observation: func(st agentrt.Step, id string, full bool) agentrt.ContentBlock {
+//			if !calls(st) {
+//				return agentrt.ContentBlock{} // the default nudge
+//			}
 //			return agentrt.ContentBlock{Type: "tool_result", ToolUseID: id, Name: st.Decision.Tool,
 //				Content: renderObservation(st, full), IsError: st.Observation != nil && st.Observation.Failure()}
 //		},
 //	}
 //
-// repo-steward also skips a step whose decision was not a tool call, which
-// its agent cannot produce before the last step of a run: its only other
-// decision is fail, and a fail decision ends the run.
+// The guards matter: since Decide records KindNoToolCall and KindTruncated,
+// every consumer's hooks are called for steps that called nothing, and
+// falling back to the defaults there is what delivers the nudge. A hook
+// that formats results its own way and wants the default for interrupted
+// steps calls DefaultObservation, or uses InterruptedText directly.
 package render
 
 import (
@@ -76,10 +87,11 @@ const (
 	ReasonBytes = 500
 )
 
-// interruptedText re-requests a tool whose outcome the interruption left
+// InterruptedText re-requests a tool whose outcome the interruption left
 // unknown. The runtime never re-executes a side effect itself, so the model
-// must ask again and the tool answers from its own record.
-const interruptedText = "The process was interrupted while this tool ran; its outcome is unknown to you. Re-request it to establish the outcome: an already applied change answers from its record."
+// must ask again and the tool answers from its own record. It is exported
+// so an Observation hook with its own result format keeps this sentence.
+const InterruptedText = "The process was interrupted while this tool ran; its outcome is unknown to you. Re-request it to establish the outcome: an already applied change answers from its record."
 
 // Options configure Messages. Only Opening is required; every hook may be
 // nil and the default applies.
@@ -101,10 +113,13 @@ type Options struct {
 	ToolUseID func(step agentrt.Step) string
 	// Assistant renders a step's assistant turn. Returning nil falls back
 	// to the synthesized turn, so a hook can override only the steps it
-	// knows about.
+	// knows about. It is called for every recorded step, including one
+	// whose decision was not a tool call.
 	Assistant func(step agentrt.Step, toolUseID string) []agentrt.ContentBlock
 	// Observation renders the user turn answering a step. Returning a block
-	// with no type falls back to the default.
+	// with no type falls back to the default, which is DefaultObservation
+	// with MaxContentBytes. It too is called for a step that called nothing;
+	// falling back there delivers the nudge.
 	Observation func(step agentrt.Step, toolUseID string, full bool) agentrt.ContentBlock
 }
 
@@ -150,7 +165,7 @@ func Messages(in agentrt.StepInput, opts Options) []agentrt.Message {
 			}
 		}
 		full := i >= n-opts.recent()
-		block := observation(st, id, full, opts.maxContent())
+		block := DefaultObservation(st, id, full, opts.maxContent())
 		if opts.Observation != nil {
 			if custom := opts.Observation(st, id, full); custom.Type != "" {
 				block = custom
@@ -182,9 +197,12 @@ func synthesize(st agentrt.Step, toolUseID string) []agentrt.ContentBlock {
 	return append(blocks, agentrt.ContentBlock{Type: "tool_use", ToolUseID: toolUseID, Name: d.Tool, Input: orEmptyObject(d.Args)})
 }
 
-// observation renders what a step produced, or a nudge when there was no
-// tool call to answer.
-func observation(st agentrt.Step, toolUseID string, full bool, maxBytes int) agentrt.ContentBlock {
+// DefaultObservation renders what a step produced, or a nudge when there
+// was no tool call to answer: the tool_result carries the content when the
+// step is within the recent window and under maxBytes, otherwise its
+// summary; an interrupted observation carries InterruptedText. An
+// Observation hook may call it for the steps it does not format itself.
+func DefaultObservation(st agentrt.Step, toolUseID string, full bool, maxBytes int) agentrt.ContentBlock {
 	if st.Decision.Kind != agentrt.DecideToolCall || st.Decision.Tool == "" || st.Observation == nil {
 		return agentrt.ContentBlock{Type: "text", Text: nudge(st)}
 	}
@@ -194,7 +212,7 @@ func observation(st agentrt.Step, toolUseID string, full bool, maxBytes int) age
 		content = "[summary] " + o.Summary
 	}
 	if o.Kind == agentrt.ObserveInterrupted {
-		content = interruptedText
+		content = InterruptedText
 	}
 	return agentrt.ContentBlock{Type: "tool_result", ToolUseID: toolUseID, Content: content, IsError: o.Failure()}
 }

@@ -69,7 +69,7 @@ func New(cfg Config) (*Model, error) {
 	}
 	m := &Model{cfg: cfg, name: cfg.Name, host: Host(cfg.Host), client: cfg.HTTPClient}
 	if m.name == "" {
-		m.name = "ollama:" + cfg.Model
+		m.name = Name(cfg.Model)
 	}
 	if m.cfg.NumCtx <= 0 {
 		m.cfg.NumCtx = DefaultNumCtx
@@ -96,6 +96,11 @@ func Host(host string) string {
 	}
 	return strings.TrimRight(host, "/")
 }
+
+// Name is what an adapter for model reports when Config.Name is unset, so
+// a consumer can key a price table or a recording directory before it
+// builds the adapter.
+func Name(model string) string { return "ollama:" + model }
 
 // Free records each adapter's model as costing nothing under the name it
 // reports, which is what a local model costs. Keying on the adapter keeps a
