@@ -141,7 +141,8 @@ correctness batch had already merged those writes.
 
 The guard at the start of each step transaction loaded and parsed the
 whole run row, limits JSON included. Where only the status matters, it
-now reads `status` alone (`requireStatus`). The error is the same.
+now reads `status` alone (`requireStatus`), and since the run lease,
+whether the writer holds it. The error is the same.
 
 ### Prepared statements
 
@@ -242,3 +243,29 @@ read the approvals twice, once in `view.Summary` and once itself;
   step.
 - **`ListRuns`** parses every run's limits JSON; it is most of the
   remaining 1.95 ms of `view.Runs` and linear in the runs listed.
+
+## The run lease
+
+The lease (ADR 5) was measured on the final code against the same
+benchmarks run just before it, `-count=3`, medians:
+
+| Run | time per step | | bytes per run | | allocations per run | |
+|---|---|---|---|---|---|---|
+| | before | after | before | after | before | after |
+| 10 steps, small | 215 µs | 223 µs | 437 KiB | 442 KiB | 7,617 | 7,729 |
+| 10 steps, 8 KiB | 297 µs | 298 µs | 1.59 MiB | 1.60 MiB | 7,882 | 7,995 |
+| 100 steps, small | 218 µs | 214 µs | 8.09 MiB | 8.13 MiB | 76,753 | 77,748 |
+| 100 steps, 8 KiB | 296 µs | 291 µs | 20.9 MiB | 21.0 MiB | 79,587 | 80,606 |
+| 400 steps, small | 236 µs | 232 µs | 83.2 MiB | 83.3 MiB | 309,773 | 313,789 |
+| 400 steps, 8 KiB | 300 µs | 294 µs | 134.6 MiB | 134.8 MiB | 320,292 | 324,287 |
+
+Time per step moves by less than run-to-run noise, in both directions.
+The heartbeat is time-based, a write every third of the TTL, so a
+benchmark run shorter than ten seconds renews nothing. What a step pays is
+in the guards: the status read compares the lease owner in SQL, returning
+a boolean rather than the owner's text, and the step claim binds the
+owner, whose boxed value is made once per driver. That is about ten
+allocations and a few hundred bytes per step, 1.3% of allocations. A run
+also pays one wall-clock read per tool call. Taking the lease is two
+columns in the write that moves the run to RUNNING, and resuming an
+interrupted run takes it in one extra transaction, once per resume.

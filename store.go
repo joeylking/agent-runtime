@@ -38,6 +38,28 @@ var ErrNotFound = errors.New("agentrt: not found")
 // transaction that makes them, so exactly one caller wins.
 var ErrRunState = errors.New("agentrt: run is not in the required state")
 
+// ErrRunLeased is returned by Resume for a RUNNING run whose lease is held
+// by another owner and has not expired: the run is being executed
+// elsewhere, and Resume changes nothing. It matches ErrRunState with
+// errors.Is. A loop finds it too when another owner took its run over.
+type ErrRunLeased struct {
+	RunID     string
+	Owner     string
+	ExpiresAt time.Time
+}
+
+func (e ErrRunLeased) Error() string {
+	return fmt.Sprintf("agentrt: run %s is leased by %s until %s", e.RunID, e.Owner, e.ExpiresAt.UTC().Format(time.RFC3339Nano))
+}
+
+func (e ErrRunLeased) Unwrap() error { return ErrRunState }
+
+// ErrLeaseLost is returned by a Start or Resume whose loop lost its lease
+// on the run: another owner took it over, or it expired unrenewed. The
+// loop stops before its next side effect and leaves the step in flight to
+// the next owner's reconciliation.
+var ErrLeaseLost = errors.New("agentrt: run lease lost")
+
 // ErrNotPending means an approval has already been decided or expired.
 var ErrNotPending = errors.New("agentrt: approval is not pending")
 
@@ -105,8 +127,8 @@ func OpenStore(path string) (*Store, error) {
 // The statements the loop runs at every step.
 const (
 	sqlSelectRun     = `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros, active_ms FROM runs WHERE id = ?`
-	sqlRunStatus     = `SELECT status FROM runs WHERE id = ?`
-	sqlClaimStep     = `UPDATE runs SET step_count = step_count + 1 WHERE id=? AND status=? AND step_count=?`
+	sqlRunStatus     = `SELECT status, lease_owner = ? FROM runs WHERE id = ?`
+	sqlClaimStep     = `UPDATE runs SET step_count = step_count + 1 WHERE id=? AND status=? AND step_count=? AND lease_owner=?`
 	sqlInsertStep    = `INSERT INTO steps (id, run_id, idx, status, decision_json, policy_json, observation_json, observation_hash, started_at, finished_at) VALUES (?,?,?,?,?,?,?,?,?,?)`
 	sqlUpdateStep    = `UPDATE steps SET status=?, decision_json=?, policy_json=?, observation_json=?, observation_hash=?, started_at=?, finished_at=? WHERE id=?`
 	sqlAddActiveTime = `UPDATE runs SET active_ms = active_ms + ? WHERE id=?`
@@ -305,6 +327,10 @@ var migrations = []string{
 	ALTER TABLE runs ADD COLUMN estimated_cost_micros INTEGER NOT NULL DEFAULT 0;`,
 	`ALTER TABLE runs ADD COLUMN active_ms INTEGER NOT NULL DEFAULT 0;
 	ALTER TABLE approvals ADD COLUMN expires_at TEXT NOT NULL DEFAULT '';`,
+	// The lease on a RUNNING run. A run written before it has none, which
+	// Resume treats as expired.
+	`ALTER TABLE runs ADD COLUMN lease_owner TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN lease_expires_at TEXT NOT NULL DEFAULT '';`,
 }
 
 func (s *Store) migrate(ctx context.Context) (err error) {
@@ -382,12 +408,6 @@ func marshalOpt(v any) string {
 		return string(x)
 	}
 	return string(toJSON(v))
-}
-
-// CreateRun inserts a new run. The caller is responsible for the run.created
-// event; the driver writes it in the same transaction.
-func (s *Store) CreateRun(ctx context.Context, r Run) error {
-	return s.tx(ctx, nil, func(t *txn) error { return t.insertRun(ctx, r) })
 }
 
 // GetRun loads a run by id.
@@ -714,6 +734,10 @@ type txn struct {
 	cache     *runCache
 	steps     []stepRow
 	approvals []approvalRow
+	// lease, set on a driver's writes, is the owner a write to a RUNNING
+	// run must hold, and the lease a move to RUNNING takes. The operator
+	// paths leave it nil: they need no lease.
+	lease *leaseTerms
 }
 
 func (s *Store) tx(ctx context.Context, obs Observer, fn func(t *txn) error) error {
@@ -764,8 +788,71 @@ func (t *txn) queryRow(ctx context.Context, query string, args ...any) *sql.Row 
 }
 
 func (t *txn) insertRun(ctx context.Context, r Run) error {
-	_, err := t.tx.ExecContext(ctx, `INSERT INTO runs (id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.Goal, r.Status, r.Reason, r.ReasonDetail, string(toJSON(r.Limits)), r.StepCount, formatTime(r.CreatedAt), formatTime(r.StartedAt), formatTime(r.FinishedAt), marshalOpt(r.Result), r.ModelCalls, r.Usage.InputTokens, r.Usage.OutputTokens, r.Usage.CachedInputTokens, int64(r.EstimatedCost))
+	owner, until := t.leaseFor(r.Status)
+	_, err := t.tx.ExecContext(ctx, `INSERT INTO runs (id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros, lease_owner, lease_expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.Goal, r.Status, r.Reason, r.ReasonDetail, string(toJSON(r.Limits)), r.StepCount, formatTime(r.CreatedAt), formatTime(r.StartedAt), formatTime(r.FinishedAt), marshalOpt(r.Result), r.ModelCalls, r.Usage.InputTokens, r.Usage.OutputTokens, r.Usage.CachedInputTokens, int64(r.EstimatedCost), owner, until)
+	return err
+}
+
+// leaseFor is the lease a run written in status holds: the writer's, while
+// it is RUNNING, and none otherwise, so pausing or finishing a run releases
+// its lease in the same transaction.
+func (t *txn) leaseFor(status RunStatus) (owner, until string) {
+	if status != StatusRunning || t.lease == nil {
+		return "", ""
+	}
+	return t.lease.owner, formatTime(t.lease.until())
+}
+
+// takeLease acquires the lease of a run in one of from for the writer,
+// unless another owner holds it unexpired at now, and returns the lease it
+// replaced. A run with no lease, as one written before leases, is free.
+func (t *txn) takeLease(ctx context.Context, id string, now time.Time, from ...RunStatus) (prevOwner string, prevUntil time.Time, err error) {
+	status, owner, until, err := t.runStatus(ctx, id)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	if err := inStatus(id, status, from); err != nil {
+		return "", time.Time{}, err
+	}
+	if owner != "" && owner != t.lease.owner && until.After(now) {
+		return "", time.Time{}, ErrRunLeased{RunID: id, Owner: owner, ExpiresAt: until}
+	}
+	if _, err := t.tx.ExecContext(ctx, `UPDATE runs SET lease_owner=?, lease_expires_at=? WHERE id=?`, t.lease.owner, formatTime(t.lease.until()), id); err != nil {
+		return "", time.Time{}, err
+	}
+	return owner, until, nil
+}
+
+// lease reads a run's lease outside a transaction.
+func (s *Store) lease(ctx context.Context, id string) (owner string, until time.Time, err error) {
+	var exp string
+	if err := s.db.QueryRowContext(ctx, `SELECT lease_owner, lease_expires_at FROM runs WHERE id = ?`, id).Scan(&owner, &exp); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", time.Time{}, ErrNotFound
+		}
+		return "", time.Time{}, err
+	}
+	until, err = parseTime(exp)
+	return owner, until, err
+}
+
+// renewLease moves the expiry of a lease its owner still holds, and
+// reports false when it does not. It is one statement outside any
+// transaction, so it waits for the store's connection like any other and
+// never holds it for long.
+func (s *Store) renewLease(ctx context.Context, id, owner string, until time.Time) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE runs SET lease_expires_at=? WHERE id=? AND lease_owner=?`, formatTime(until), id, owner)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// releaseLease clears a lease its owner still holds.
+func (s *Store) releaseLease(ctx context.Context, id, owner string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE runs SET lease_owner='', lease_expires_at='' WHERE id=? AND lease_owner=?`, id, owner)
 	return err
 }
 
@@ -775,26 +862,54 @@ func (t *txn) loadRun(ctx context.Context, id string) (Run, error) {
 	return scanRun(t.queryRow(ctx, sqlSelectRun, id))
 }
 
-// requireRun fails with ErrRunState unless the run is in one of from.
+// requireRun is requireStatus returning the run.
 func (t *txn) requireRun(ctx context.Context, id string, from ...RunStatus) (Run, error) {
-	r, err := t.loadRun(ctx, id)
-	if err != nil {
+	if err := t.requireStatus(ctx, id, from...); err != nil {
 		return Run{}, err
 	}
-	return r, inStatus(id, r.Status, from)
+	return t.loadRun(ctx, id)
 }
 
-// requireStatus is requireRun for a caller that needs only the check: it
-// reads the status alone.
+// requireStatus fails with ErrRunState unless the run is in one of from,
+// and, for a driver's write to a RUNNING run, with ErrRunLeased unless the
+// writer holds its lease.
 func (t *txn) requireStatus(ctx context.Context, id string, from ...RunStatus) error {
+	var owner any = ""
+	if t.lease != nil {
+		owner = t.lease.arg
+	}
 	var status RunStatus
-	if err := t.queryRow(ctx, sqlRunStatus, id).Scan(&status); err != nil {
+	var held bool
+	if err := t.queryRow(ctx, sqlRunStatus, owner, id).Scan(&status, &held); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		return err
 	}
-	return inStatus(id, status, from)
+	if err := inStatus(id, status, from); err != nil {
+		return err
+	}
+	if status == StatusRunning && t.lease != nil && !held {
+		_, other, until, err := t.runStatus(ctx, id)
+		if err != nil {
+			return err
+		}
+		return ErrRunLeased{RunID: id, Owner: other, ExpiresAt: until}
+	}
+	return nil
+}
+
+// runStatus reads a run's status and lease.
+func (t *txn) runStatus(ctx context.Context, id string) (status RunStatus, owner string, until time.Time, err error) {
+	var exp string
+	if err := t.tx.QueryRowContext(ctx, `SELECT status, lease_owner, lease_expires_at FROM runs WHERE id = ?`, id).Scan(&status, &owner, &exp); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", time.Time{}, ErrNotFound
+		}
+		return "", "", time.Time{}, err
+	}
+	until, err = parseTime(exp)
+	return status, owner, until, err
 }
 
 func inStatus(id string, status RunStatus, from []RunStatus) error {
@@ -816,14 +931,16 @@ func statusList(ss []RunStatus) string {
 
 // transition moves a run from one of from to r's status, reason, detail,
 // finish time, and result, and fails with ErrRunState when another writer
-// moved it first. It never writes step_count or the accounting columns,
+// moved it first. A move to RUNNING takes the writer's lease and any other
+// move releases it. It never writes step_count or the accounting columns,
 // which have their own increments.
 func (t *txn) transition(ctx context.Context, r Run, from ...RunStatus) error {
 	if err := t.requireStatus(ctx, r.ID, from...); err != nil {
 		return err
 	}
-	res, err := t.tx.ExecContext(ctx, `UPDATE runs SET status=?, reason=?, reason_detail=?, finished_at=?, result_json=? WHERE id=?`,
-		r.Status, r.Reason, r.ReasonDetail, formatTime(r.FinishedAt), marshalOpt(r.Result), r.ID)
+	owner, until := t.leaseFor(r.Status)
+	res, err := t.tx.ExecContext(ctx, `UPDATE runs SET status=?, reason=?, reason_detail=?, finished_at=?, result_json=?, lease_owner=?, lease_expires_at=? WHERE id=?`,
+		r.Status, r.Reason, r.ReasonDetail, formatTime(r.FinishedAt), marshalOpt(r.Result), owner, until, r.ID)
 	if err != nil {
 		return err
 	}
@@ -833,14 +950,22 @@ func (t *txn) transition(ctx context.Context, r Run, from ...RunStatus) error {
 	return nil
 }
 
-// claimStep advances step_count from index to index+1 on a RUNNING run.
-// A second loop on the same run, or a run cancelled meanwhile, loses.
+// claimStep advances step_count from index to index+1 on a RUNNING run
+// whose lease the writer holds. A second loop on the same run, or a run
+// cancelled meanwhile, loses.
 func (t *txn) claimStep(ctx context.Context, runID string, index int) error {
-	res, err := t.exec(ctx, sqlClaimStep, runID, StatusRunning, index)
+	var owner any = ""
+	if t.lease != nil {
+		owner = t.lease.arg
+	}
+	res, err := t.exec(ctx, sqlClaimStep, runID, StatusRunning, index, owner)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
+		if err := t.requireStatus(ctx, runID, StatusRunning); err != nil {
+			return err
+		}
 		r, err := t.loadRun(ctx, runID)
 		if err != nil {
 			return err

@@ -177,12 +177,13 @@ func TestContentHash_Golden(t *testing.T) {
 }
 
 func TestCheckJSON_RejectsWhatWouldHashLossily(t *testing.T) {
-	for _, ok := range []string{`{}`, `[]`, `1`, `"s"`, `{"a":{"a":1},"b":[{"a":1},{"a":2}]}`, `{"a":1,"b":{"a":2}}`, `[{"a":1},{"a":1}]`, `"\ud83d\ude42"`, `{"é":"日本"}`} {
+	for _, ok := range []string{`{}`, `[]`, `1`, `"s"`, `{"a":{"a":1},"b":[{"a":1},{"a":2}]}`, `{"a":1,"b":{"a":2}}`, `[{"a":1},{"a":1}]`, `"\ud83d\ude42"`, `{"é":"日本"}`, `"\\ud800"`, `"\uD83D\uDE42"`, `["\ud7ff","\ue000","\u00e9\ud83d\ude42"]`} {
 		if err := checkJSON(json.RawMessage(ok)); err != nil {
 			t.Errorf("%s: %v", ok, err)
 		}
 	}
-	for _, bad := range []string{`{"a":`, `not json`, `{"a":1} {"b":2}`, `{"a":1,"a":2}`, `{"x":{"a":1,"a":1}}`, `[{"k":1,"b":2,"k":3}]`, "\"\xff\"", "{\"\xc3\":1}", ``} {
+	for _, bad := range []string{`{"a":`, `not json`, `{"a":1} {"b":2}`, `{"a":1,"a":2}`, `{"x":{"a":1,"a":1}}`, `[{"k":1,"b":2,"k":3}]`, "\"\xff\"", "{\"\xc3\":1}", ``,
+		`"\ud800"`, `"\udc00"`, `"\uDFFF"`, `"\ud83d"`, `"\ude42\ud83d"`, `"\ud83d\u0041"`, `"\ud83d\ud83d\ude42"`, `{"\ud800":1}`, `["x\ud83dy"]`} {
 		if err := checkJSON(json.RawMessage(bad)); err == nil {
 			t.Errorf("%q accepted", bad)
 		}

@@ -135,6 +135,11 @@ exists, reference given), **Verified** (a named test exercises it).
 | Pre-1.0 compatibility promise: additive within a minor, release notes name what a minor bump changes, nested modules versioned independently and each naming its core version, forward-only migrations, recordings stable across core versions | Implemented | `README.md`, `docs/roadmap.md` |
 | The core module builds and tests on Go 1.26 and 1.27, with `GOTOOLCHAIN=local` so the older job cannot switch toolchains. Every nested module's `go` line is 1.26, and each requires the core release v0.2.1 | Implemented | `.github/workflows/ci.yml`, the comment above each nested `go` directive |
 | Public roadmap issue, pinned, mirroring the item list with a status per item | Implemented | [#3](https://github.com/joeylking/agent-runtime/issues/3) |
+| CI lint job: gofmt, staticcheck and govulncheck at pinned versions, and a core `go mod tidy -diff` check | Implemented | `.github/workflows/ci.yml` |
+| Release check builds each nested module against the versions it pins, with no workspace, on every tag and weekly | Implemented | `.github/workflows/release-check.yml` |
+| Dependabot: weekly, grouped, for actions and for each of the seven modules | Implemented | `.github/dependabot.yml` |
+| Changelog, with Unreleased becoming the release's section | Implemented | `CHANGELOG.md` |
+| Release procedure: tag after green CI and the release check; a pushed tag is never moved | Implemented | `CONTRIBUTING.md` |
 
 ## Core audit fixes
 
@@ -161,9 +166,27 @@ exists, reference given), **Verified** (a named test exercises it).
 | Driver `Approve`, `Reject`, `Cancel`, and expiry use the driver's clock; the package functions use the wall clock | Verified | `TestApproval_DriverClockDecidesExpiry` |
 | Operator paths fail with `ErrRunState` or `ErrNotPending` | Verified | `TestErrors_OperatorPathsAreTyped` |
 | The canonical JSON encoder is written out and byte-identical to what the stored hashes were computed with | Verified | `TestCanonicalJSON_MatchesEncodingJSON`, `TestContentHash_Golden` |
+| An escaped surrogate outside a pair, which decodes as U+FFFD, is refused where consumer JSON enters, like a repeated key | Verified | `hash.go` `checkSurrogates`, `TestCheckJSON_RejectsWhatWouldHashLossily`, `TestDriver_UnusableJSONDecisionsAreRecordedInvalid` |
+| Approval JSON omits an unset `expires_at` and `decided_at` instead of carrying year one | Verified | `TestApproval_JSONOmitsZeroTimes` |
+| A retry waits at least the provider's `RetryAfter` and at least the backoff; a wait beyond `MaxRetryAfter`, past the context's deadline, or reaching the elapsed or active time limit ends the run as `model_unavailable` without sleeping | Verified | `TestModel_RetryAfterIsHonoured`, `TestModel_RetryWaitThatCannotFitIsUnavailable` |
 | Replay keys keep numbers' literal text, so large integers do not collide; every existing recording keeps its key | Verified | `TestKey_LargeIntegersDoNotCollide`, `TestKey_Pinned` |
 | `render.Decide` caps the reason on every branch, fails on a context-window overflow, and names the tool calls it did not execute; the stop-reason vocabulary is exported | Verified | `TestDecide_NoToolCallReasonIsCapped`, `TestDecide_ContextWindowExceededFails`, `TestDecide_ExtraToolUsesAreNamed` |
 | The recent-results window counts rendered steps; `DefaultObservation` accepts a step without a decision; `Truncate` never exceeds n bytes | Verified | `TestMessages_RecentWindowCountsRenderedSteps`, `TestDefaultObservation_StepWithoutADecisionIsNudged`, `TestTruncate_NeverExceedsN` |
+
+## Run lease
+
+See ADR 5.
+
+| Capability | Status | Reference |
+|---|---|---|
+| A RUNNING run carries a lease, taken with the move to RUNNING and released with the pause or finish, stored by migration 5 | Verified | `lease.go`, `store.go` `transition`, `TestLease_ResumeOfALiveRunIsRefused` |
+| Resume of a run leased live by another process returns `ErrRunLeased` with the owner and expiry, reads no clock, and changes nothing | Verified | `TestLease_ResumeOfALiveRunIsRefused` |
+| After the owner dies and its lease expires, Resume takes the run over, records `lease.taken_over`, and reconciles the interrupted step once; the dead owner's late tool outcome is not recorded | Verified | `TestLease_ExpiredLeaseIsTakenOverAndReconciledOnce` |
+| A loop that loses its lease stops before its next tool call or model request and returns `ErrLeaseLost`; the step in flight is left for the next owner | Verified | `TestLease_LoopThatLosesItsLeaseStopsBeforeTheNextToolCall`, `TestLease_ExpiredLeaseStopsTheLoopBeforeItsNextSideEffect`, `TestLease_NoModelCallAfterTheLeaseIsLost` |
+| The heartbeat renews the lease through a tool call several TTLs long, and stops when the call returns or panics; a panicking call releases its lease | Verified | `TestLease_LongToolCallKeepsTheLease`, `TestLease_HeartbeatStopsOnReturnAndOnPanic` |
+| An operator's Cancel needs no lease and releases it | Verified | `TestLease_CancelNeedsNoLease`, `TestCancel_LiveLoopStopsAtItsNextWrite` |
+| A v0.2.1 database migrates with its runs intact; its RUNNING run has no lease and is resumed without a takeover event; `OpenExisting` refuses an older or newer schema; the released migrations are pinned | Verified | `TestStore_V021DatabaseMigratesWithItsRuns`, `TestOpenExisting_RefusesEitherOtherVersion`, `TestStore_ReleasedMigrationsAreUnchanged` |
+| The ordinary path's events and clock readings are unchanged | Verified | `TestDriver_CachedViewEqualsReloadedView`, `TestDriver_ClockReadingsAreStable` |
 
 ## Performance
 

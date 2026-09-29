@@ -82,6 +82,9 @@ type Model interface {
 // limit or a 5xx response.
 type TransientError struct {
 	Err error
+	// RetryAfter is how long the provider asked the caller to wait before
+	// trying again, or zero when it did not say.
+	RetryAfter time.Duration
 }
 
 func (e TransientError) Error() string { return "transient: " + e.Err.Error() }
@@ -187,13 +190,25 @@ type ModelConfig struct {
 	CallTimeout time.Duration // per attempt; default 2 minutes
 	MaxRetries  int           // transient retries per Generate; default 2
 	Backoff     time.Duration // base backoff; default 1 second
+	// MaxRetryAfter is the longest TransientError.RetryAfter honoured;
+	// default DefaultMaxRetryAfter. A provider that asks for longer ends
+	// the retries as model_unavailable rather than being retried early.
+	MaxRetryAfter time.Duration
 }
+
+// DefaultMaxRetryAfter is the longest wait a provider may ask for before a
+// retry when ModelConfig.MaxRetryAfter is zero.
+const DefaultMaxRetryAfter = time.Minute
 
 type caller struct {
 	d      *Driver
 	cfg    ModelConfig
 	runID  string
 	stepID string
+	// started is when the step began, by the driver's clock, and lease is
+	// the loop's hold on the run: no attempt is dispatched once it is lost.
+	started time.Time
+	lease   *lease
 
 	// mu serialises the limit check and the reservation, so concurrent
 	// Generate calls within one step cannot all pass the check before any
@@ -228,34 +243,71 @@ func (c *caller) Generate(ctx context.Context, req ModelRequest) (ModelResponse,
 	}
 	var last error
 	for attempt := 1; attempt <= retries+1; attempt++ {
+		if !c.lease.ok() {
+			return ModelResponse{}, c.lease.err()
+		}
 		// A retry is a new call against the limits.
 		est, estCost, err := c.reserve(ctx, req)
 		if err != nil {
 			return ModelResponse{}, err
 		}
-		resp, done, gerr := c.attempt(ctx, req, attempt, timeout)
+		resp, at, done, gerr := c.attempt(ctx, req, attempt, timeout)
 		c.release(est, estCost)
 		if done {
 			return resp, gerr
 		}
 		last = gerr
 		if attempt <= retries {
-			select {
-			case <-time.After(backoff * time.Duration(1<<(attempt-1))):
-			case <-ctx.Done():
-				return ModelResponse{}, ctx.Err()
+			wait, werr := c.retryWait(ctx, run, backoff*time.Duration(1<<(attempt-1)), gerr, at)
+			if werr != nil {
+				return ModelResponse{}, ErrModelUnavailable{Attempts: attempt, Last: werr}
+			}
+			if err := c.d.sleep(ctx, wait); err != nil {
+				return ModelResponse{}, err
 			}
 		}
 	}
 	return ModelResponse{}, ErrModelUnavailable{Attempts: retries + 1, Last: last}
 }
 
+// retryWait is how long to wait before the next attempt: the backoff, or
+// longer when the provider asked for it. The wait must fit: a request for
+// more than MaxRetryAfter, or a wait that would pass the context's
+// deadline or reach one of the run's time limits, fails instead of
+// sleeping. at is the driver's clock reading for the failed attempt's
+// completion, so the limits are judged without another reading.
+func (c *caller) retryWait(ctx context.Context, run Run, backoff time.Duration, last error, at time.Time) (time.Duration, error) {
+	wait := backoff
+	var tr TransientError
+	if errors.As(last, &tr) && tr.RetryAfter > 0 {
+		limit := c.cfg.MaxRetryAfter
+		if limit <= 0 {
+			limit = DefaultMaxRetryAfter
+		}
+		if tr.RetryAfter > limit {
+			return 0, fmt.Errorf("the provider asked to wait %s before a retry, more than the %s allowed: %w", tr.RetryAfter, limit, last)
+		}
+		wait = max(wait, tr.RetryAfter)
+	}
+	if dl, ok := ctx.Deadline(); ok && !c.d.wall().Add(wait).Before(dl) {
+		return 0, fmt.Errorf("a retry after %s would pass the context's deadline: %w", wait, last)
+	}
+	l := run.Limits
+	if l.MaxElapsedTime > 0 && at.Add(wait).Sub(run.CreatedAt) >= l.MaxElapsedTime {
+		return 0, fmt.Errorf("a retry after %s would reach the elapsed time limit %s: %w", wait, l.MaxElapsedTime, last)
+	}
+	if l.MaxActiveTime > 0 && run.ActiveTime+at.Add(wait).Sub(c.started) >= l.MaxActiveTime {
+		return 0, fmt.Errorf("a retry after %s would reach the active time limit %s: %w", wait, l.MaxActiveTime, last)
+	}
+	return wait, nil
+}
+
 // attempt dispatches one request and records its outcome. done reports
 // that Generate returns the response and error as they are; otherwise err is a
-// failure worth retrying. Once the request is dispatched its outcome is
-// recorded even if ctx is cancelled, because the provider may have served
-// and billed it.
-func (c *caller) attempt(ctx context.Context, req ModelRequest, attempt int, timeout time.Duration) (ModelResponse, bool, error) {
+// failure worth retrying, and at is the clock reading for its completion.
+// Once the request is dispatched its outcome is recorded even if ctx is
+// cancelled, because the provider may have served and billed it.
+func (c *caller) attempt(ctx context.Context, req ModelRequest, attempt int, timeout time.Duration) (_ ModelResponse, at time.Time, done bool, _ error) {
 	call := ModelCall{ID: c.d.newID(), RunID: c.runID, StepID: c.stepID, Attempt: attempt, Status: CallDispatched, Model: c.cfg.Model.Name(), DispatchedAt: c.d.now()}
 	if err := c.d.store.tx(ctx, c.d.observer, func(t *txn) error {
 		if err := t.insertModelCall(ctx, call); err != nil {
@@ -263,7 +315,7 @@ func (c *caller) attempt(ctx context.Context, req ModelRequest, attempt int, tim
 		}
 		return t.appendEvent(ctx, Event{RunID: c.runID, StepID: c.stepID, At: call.DispatchedAt, Type: EventModelDispatched, Payload: toJSON(map[string]any{"call_id": call.ID, "attempt": attempt, "model": call.Model})})
 	}); err != nil {
-		return ModelResponse{}, true, err
+		return ModelResponse{}, time.Time{}, true, err
 	}
 	actx, cancel := context.WithTimeout(ctx, timeout)
 	resp, gerr := c.cfg.Model.Generate(actx, req)
@@ -281,12 +333,12 @@ func (c *caller) attempt(ctx context.Context, req ModelRequest, attempt int, tim
 		call.Status, call.Usage = CallOK, resp.Usage
 		call.Cost = c.cfg.Prices.cost(call.Model, resp.Usage)
 		if err := c.record(rctx, call); err != nil {
-			return ModelResponse{}, true, err
+			return ModelResponse{}, call.CompletedAt, true, err
 		}
 		if cerr := ctx.Err(); cerr != nil {
-			return ModelResponse{}, true, cerr
+			return ModelResponse{}, call.CompletedAt, true, cerr
 		}
-		return resp, true, nil
+		return resp, call.CompletedAt, true, nil
 	}
 	call.Error = gerr.Error()
 	var served ServedError
@@ -317,12 +369,12 @@ func (c *caller) attempt(ctx context.Context, req ModelRequest, attempt int, tim
 		out = ErrModelUnavailable{Attempts: attempt, Last: gerr}
 	}
 	if err := c.record(rctx, call); err != nil {
-		return ModelResponse{}, true, err
+		return ModelResponse{}, call.CompletedAt, true, err
 	}
 	if retry {
-		return ModelResponse{}, false, gerr
+		return ModelResponse{}, call.CompletedAt, false, gerr
 	}
-	return ModelResponse{}, true, out
+	return ModelResponse{}, call.CompletedAt, true, out
 }
 
 // isConnectionLost reports a request that was sent and lost its connection

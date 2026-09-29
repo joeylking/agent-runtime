@@ -28,9 +28,10 @@ state; the events are the explanation. Nothing is reconstructed by replay.
 A step that ends the run is written in the run's transaction, so a crash
 cannot leave a finished terminal step under a running run. Run and step
 status transitions are compare-and-set inside that transaction: a loop
-writes only while its run is RUNNING, Resume moves a run out of WAITING
-once, and the loser of either race gets `ErrRunState`. An operator's
-Cancel therefore stops a live loop at its next write. What a tool did or a
+writes only while its run is RUNNING and it holds the run's lease, Resume
+moves a run out of WAITING once, and the loser of either race gets
+`ErrRunState`. An operator's Cancel therefore stops a live loop at its
+next write. What a tool did or a
 model call cost is recorded even when the caller's context is cancelled
 after it ran; the cancellation is returned afterwards.
 
@@ -45,8 +46,9 @@ reads the run row at every step. `docs/performance.md` has the numbers.
 
 JSON a consumer supplies is checked where it enters: decision arguments
 and results, tool content, and approval capabilities and presentations
-must be one well-formed value, valid UTF-8, with no repeated object key,
-because anything else would be stored or hashed lossily. What fails is
+must be one well-formed value, valid UTF-8, with no escaped surrogate
+outside a pair and no repeated object key, because anything else would be
+stored or hashed lossily. What fails is
 kept as a string and observed (`invalid_decision` for a decision,
 `tool_error` for content that arrived after the side effect), or fails the
 run as `internal_error` for a policy decision, and never panics. The
@@ -61,10 +63,13 @@ renders its own model context from the recorded steps, so the audit log
 and the agent's view are the same data. The `ModelCaller` is the agent's
 only handle to a model: it reserves a row per attempt before dispatch,
 records usage, latency, and cost, enforces call, token, and cost limits
-before every request, and retries transient failures. Concurrent requests
-within a step reserve their projection before dispatch, and a request with
-no output cap is refused under a token or cost limit because it cannot be
-projected. A `ServedError` from an adapter is charged at the usage the
+before every request, and retries transient failures. A retry waits at
+least as long as the provider's `RetryAfter` asks, up to
+`ModelConfig.MaxRetryAfter`, and fails as `model_unavailable` rather than
+sleep past the context's deadline or the run's time limits. Concurrent
+requests within a step reserve their projection before dispatch, and a
+request with no output cap is refused under a token or cost limit because
+it cannot be projected. A `ServedError` from an adapter is charged at the usage the
 provider reported and not retried. The agent has no handle to the policy
 or the store. The agent and the policy each receive copies: a change
 either makes to what it was handed reaches neither the driver nor the
@@ -95,10 +100,26 @@ but never resumed would otherwise have no way to be closed.
 
 ## Interruption
 
-A run found RUNNING with a step in flight is resumed by marking the step
-interrupted with an observation, calling the consumer's reconciliation,
-and acting on its outcome: continue the loop, complete the run with a
-recovered result, wait for approval, or fail as a conflict. Waiting puts
+A running run is leased to the call executing it: an owner id and an
+expiry on the run's row, taken in the transaction that moves the run to
+RUNNING, released in the one that pauses or finishes it, and renewed every
+third of `Config.LeaseTTL` by a heartbeat that does not wait for the loop,
+so a long tool or model call keeps it. Lease times come from the wall
+clock, never `Config.Now`. Every loop write to a RUNNING run requires the
+lease. A loop that loses it, because another owner took it or it expired
+unrenewed, stops before its next tool call or model request and returns
+`ErrLeaseLost`; a tool already running cannot be recalled, and its outcome
+is recorded only if its loop still holds the lease, otherwise the step is
+left for the next owner's reconciliation. Resume of a RUNNING run whose
+lease is live and another owner's returns `ErrRunLeased` and changes
+nothing. An operator's Cancel needs no lease. ADR 5 has the reasoning.
+
+A run found RUNNING with its lease expired, or with none, is taken over
+by Resume, which records `lease.taken_over` when another owner had held
+it, marks the step in flight interrupted with an observation, calls the
+consumer's reconciliation, and acts on its outcome: continue the loop,
+complete the run with a recovered result, wait for approval, or fail as a
+conflict. Waiting puts
 the interrupted tool call back through the ordinary pause on the
 `require_approval` decision the reconciliation supplies; without one the
 run fails as a conflict rather than wait on nothing. A side effect
@@ -108,7 +129,9 @@ own journals and the outside world.
 ## Persistence
 
 One SQLite file in WAL mode with runs, steps, model_calls, approvals,
-events, and a schema_migrations table. A consumer may keep its own tables
+events, and a schema_migrations table. Migrations are forward only and a
+released one is never edited; the fifth, the run lease, is the first since
+v0.1, and a database written by v0.2.1 migrates with its runs intact. A consumer may keep its own tables
 in the same file under its own migrations. Every transaction begins
 IMMEDIATE and waits on the busy timeout, migrations are applied in one
 such transaction so concurrent first opens are safe, and a database a

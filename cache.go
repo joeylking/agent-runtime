@@ -54,11 +54,13 @@ func (d *Driver) load(ctx context.Context, runID string) (*runCache, error) {
 	return c, nil
 }
 
-// write runs fn in a transaction and, once it has committed, applies the
-// rows it wrote to c, which may be nil outside a loop.
+// write runs fn in a transaction under the driver's lease terms and, once
+// it has committed, applies the rows it wrote to c, which may be nil
+// outside a loop.
 func (d *Driver) write(ctx context.Context, c *runCache, fn func(t *txn) error) error {
 	var done *txn
 	err := d.store.tx(ctx, d.observer, func(t *txn) error {
+		t.lease = &d.terms
 		if done = t; !d.reload {
 			t.cache = c
 		}

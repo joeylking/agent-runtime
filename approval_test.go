@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	agentrt "github.com/joeylking/agent-runtime"
 	"github.com/joeylking/agent-runtime/scripted"
@@ -218,5 +219,36 @@ func TestCancel_ApprovedButUnresumedRun(t *testing.T) {
 	events, _ := h.store.ListEvents(context.Background(), run.ID)
 	if events[len(events)-1].Type != agentrt.EventRunFinished {
 		t.Fatalf("last event = %s", events[len(events)-1].Type)
+	}
+}
+
+// A pending approval with no expiry carries neither time in JSON rather
+// than year one, and a decided approval with an expiry carries both; the
+// JSON reads back to the same approval.
+func TestApproval_JSONOmitsZeroTimes(t *testing.T) {
+	h := newHarness(t, ":memory:")
+	push, read := echoTool("push", agentrt.RemoteMutation), echoTool("read", agentrt.ReadOnly)
+	d, run, a := pausedRun(t, h, push, read)
+	b, err := json.Marshal(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "expires_at") || strings.Contains(string(b), "decided_at") || strings.Contains(string(b), "0001-01-01") {
+		t.Fatalf("pending approval JSON = %s", b)
+	}
+	if err := d.Approve(context.Background(), run.ID, a.ID, "joey", ""); err != nil {
+		t.Fatal(err)
+	}
+	decided, _ := h.store.GetApproval(context.Background(), run.ID, a.ID)
+	decided.ExpiresAt = decided.DecidedAt.Add(time.Hour)
+	if b, err = json.Marshal(decided); err != nil {
+		t.Fatal(err)
+	}
+	var back agentrt.Approval
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"expires_at"`) || !strings.Contains(string(b), `"decided_at"`) || !back.DecidedAt.Equal(decided.DecidedAt) || !back.ExpiresAt.Equal(decided.ExpiresAt) {
+		t.Fatalf("decided approval JSON = %s", b)
 	}
 }

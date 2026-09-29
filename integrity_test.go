@@ -159,19 +159,23 @@ func TestPolicy_UnknownOutcomeFailsLoopAndResume(t *testing.T) {
 func TestDriver_UnusableJSONDecisionsAreRecordedInvalid(t *testing.T) {
 	h := newHarness(t, ":memory:")
 	read := echoTool("read", agentrt.ReadOnly)
+	note := newTool("note", agentrt.ReadOnly, `{"type":"object"}`, func(context.Context, agentrt.ToolCall) (agentrt.ToolResult, error) {
+		return agentrt.ToolResult{Content: []byte(`{}`)}, nil
+	})
 	agent := &scripted.Agent{Decisions: []agentrt.Decision{
 		{Kind: agentrt.DecideToolCall, Tool: "read", Args: json.RawMessage(`{"n":`)},
 		{Kind: agentrt.DecideToolCall, Tool: "read", Args: json.RawMessage(`{"n":1,"n":2}`)},
 		{Kind: agentrt.DecideComplete, Result: json.RawMessage("\"\xff\"")},
+		{Kind: agentrt.DecideToolCall, Tool: "note", Args: json.RawMessage(`{"s":"\ud800"}`)},
 		scripted.Complete(`{}`),
 	}}
-	run, err := h.driver(agent, agentrt.DefaultPolicy(), read).Start(context.Background(), "g", limits(10, 5))
+	run, err := h.driver(agent, agentrt.DefaultPolicy(), read, note).Start(context.Background(), "g", limits(10, 5))
 	if err != nil {
 		t.Fatal(err)
 	}
 	requireStatus(t, run, agentrt.StatusCompleted, agentrt.ReasonGoalCompleted)
 	steps, _ := h.store.ListSteps(context.Background(), run.ID)
-	for i, st := range steps[:3] {
+	for i, st := range steps[:4] {
 		if st.Status != agentrt.StepFailed || st.Observation.Kind != agentrt.ObserveInvalidDecision {
 			t.Fatalf("step %d = %s %+v", i, st.Status, st.Observation)
 		}
@@ -186,7 +190,10 @@ func TestDriver_UnusableJSONDecisionsAreRecordedInvalid(t *testing.T) {
 	if !strings.Contains(string(steps[2].Decision.Result), "invalid_json_base64") {
 		t.Fatalf("recorded result = %s", steps[2].Decision.Result)
 	}
-	if len(read.calls) != 0 {
+	if !strings.Contains(steps[3].Observation.Summary, "unpaired surrogate") || !strings.Contains(string(steps[3].Decision.Args), "invalid_json") {
+		t.Fatalf("lone surrogate: %s, args %s", steps[3].Observation.Summary, steps[3].Decision.Args)
+	}
+	if len(read.calls) != 0 || len(note.calls) != 0 {
 		t.Fatal("an unusable request executed")
 	}
 }

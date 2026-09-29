@@ -3,10 +3,14 @@
 // policy evaluation, limits, persistence, and the audit event log. The agent
 // owns only the decision of what to do next.
 //
-// Milestone 0A implements one scripted run: decide, validate, evaluate policy,
-// execute, observe, persist, repeat, and stop on a step limit. Approvals,
-// resumption, model accounting, loop detection, and recovery are documented in
-// docs/status.md and are not part of this package yet.
+// A Driver runs the loop: decide, validate, evaluate policy, execute,
+// observe, persist, repeat, until the run completes, fails, or pauses for
+// a hash-bound approval that Approve and Resume continue. Model calls go
+// through an accounting caller that enforces the run's limits; repeated
+// failures and repeated identical outcomes stop the run; a run interrupted
+// mid-step is reconciled by the consumer on Resume, and a lease keeps two
+// processes from executing one run. docs/architecture.md describes the
+// design and docs/status.md what is verified.
 package agentrt
 
 import (
@@ -20,11 +24,11 @@ import (
 type RunStatus string
 
 const (
-	StatusCreated            RunStatus = "CREATED"
 	StatusRunning            RunStatus = "RUNNING"
 	StatusWaitingForApproval RunStatus = "WAITING_FOR_APPROVAL"
-	// StatusInterrupted marks a run found RUNNING with in-flight work by a
-	// process that did not start it; Resume reconciles and continues it.
+	// StatusInterrupted is not written by the runtime: a run interrupted
+	// mid-step stays RUNNING, and Resume finds it by its lease. Resume and
+	// Cancel accept a run in it as they accept a RUNNING one.
 	StatusInterrupted RunStatus = "INTERRUPTED"
 	StatusCompleted   RunStatus = "COMPLETED"
 	StatusFailed      RunStatus = "FAILED"
@@ -66,8 +70,8 @@ const (
 	ReasonInternalError        TerminalReason = "internal_error"
 )
 
-// Limits are the caps the driver enforces before each step. Only the limits
-// implemented in this milestone are present.
+// Limits are the caps the driver enforces before each step, and before each
+// model call for the model limits. A zero optional limit is unlimited.
 type Limits struct {
 	// MaxSteps is the maximum number of steps a run may start.
 	MaxSteps int `json:"max_steps"`
@@ -206,8 +210,8 @@ type Observation struct {
 	Kind    ObservationKind `json:"kind"`
 	Content json.RawMessage `json:"content,omitempty"`
 	Summary string          `json:"summary,omitempty"`
-	// ContentHash is the SHA-256 of the canonical JSON content. It is recorded
-	// now so that later no-progress detection can key on it.
+	// ContentHash is the SHA-256 of the canonical JSON content. Loop
+	// detection keys on it with the tool and its arguments.
 	ContentHash string `json:"content_hash,omitempty"`
 }
 
@@ -304,9 +308,9 @@ const (
 type PolicyDecision struct {
 	Outcome PolicyOutcome `json:"outcome"`
 	Reason  string        `json:"reason,omitempty"`
-	// Kind, Capability, and Presentation apply to require_approval. In this
-	// milestone the run pauses and records them; the approval record and
-	// resumption arrive with durable approvals.
+	// Kind, Capability, and Presentation apply to require_approval: the run
+	// pauses on an approval that records them, hash-bound to the request,
+	// and Resume executes the request once it is approved.
 	Kind         string          `json:"kind,omitempty"`
 	Capability   json.RawMessage `json:"capability,omitempty"`
 	Presentation json.RawMessage `json:"presentation,omitempty"`
@@ -352,8 +356,8 @@ type Approval struct {
 	Hash         string          `json:"hash"`
 	Status       ApprovalStatus  `json:"status"`
 	CreatedAt    time.Time       `json:"created_at"`
-	ExpiresAt    time.Time       `json:"expires_at,omitempty"`
-	DecidedAt    time.Time       `json:"decided_at,omitempty"`
+	ExpiresAt    time.Time       `json:"expires_at,omitzero"`
+	DecidedAt    time.Time       `json:"decided_at,omitzero"`
 	DecidedBy    string          `json:"decided_by,omitempty"`
 	Note         string          `json:"note,omitempty"`
 }
@@ -440,11 +444,14 @@ const (
 	EventLoopDetected      = "loop.detected"
 	EventApprovalDecided   = "approval.decided"
 	EventRunResumed        = "run.resumed"
-	EventRunInterrupted    = "run.interrupted"
 	EventStepInterrupted   = "step.interrupted"
-	EventModelDispatched   = "model.dispatched"
-	EventModelCompleted    = "model.completed"
-	EventModelFailed       = "model.failed"
+	// EventLeaseTakenOver records a Resume taking over a RUNNING run whose
+	// lease another owner let expire. Its payload names the previous owner
+	// and expiry, read from the wall clock, and the new owner.
+	EventLeaseTakenOver  = "lease.taken_over"
+	EventModelDispatched = "model.dispatched"
+	EventModelCompleted  = "model.completed"
+	EventModelFailed     = "model.failed"
 )
 
 // Observer receives every event after it has been committed.

@@ -158,15 +158,18 @@ func contentHash(raw json.RawMessage) string {
 // checkJSON is the boundary check for JSON a consumer hands the runtime:
 // decision arguments and results, tool content, and approval capabilities
 // and presentations. It requires exactly one well-formed value, valid
-// UTF-8 throughout, and no object with a repeated key. The last two are
-// accepted by encoding/json but decoded lossily, which would let two
-// different documents share a hash.
+// UTF-8 throughout, no escaped surrogate outside a pair, and no object
+// with a repeated key. The last three are accepted by encoding/json but
+// decoded lossily, which would let two different documents share a hash.
 func checkJSON(raw json.RawMessage) error {
 	if !utf8.Valid(raw) {
 		return errors.New("not valid UTF-8")
 	}
 	if !json.Valid(raw) {
 		return errors.New("not valid JSON")
+	}
+	if err := checkSurrogates(raw); err != nil {
+		return err
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	// A stack of the keys seen in each open object; nil marks an array.
@@ -210,6 +213,56 @@ func checkJSON(raw json.RawMessage) error {
 		// After a value inside an object the next string is a key.
 		expectKey = stack[len(stack)-1] != nil
 	}
+}
+
+// checkSurrogates rejects a \u escape of a UTF-16 surrogate that is not a
+// high surrogate followed at once by an escaped low one. encoding/json
+// decodes such an escape as U+FFFD, so "\ud800" and "\ufffd" would hash
+// alike. raw is valid JSON, so a backslash is inside a string and starts
+// an escape.
+func checkSurrogates(raw []byte) error {
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		if raw[i+1] != 'u' {
+			i++
+			continue
+		}
+		r := hex4(raw[i+2 : i+6])
+		switch {
+		case r >= 0xd800 && r < 0xdc00:
+			if i+12 > len(raw) || raw[i+6] != '\\' || raw[i+7] != 'u' {
+				return fmt.Errorf("unpaired surrogate %s", raw[i:i+6])
+			}
+			if lo := hex4(raw[i+8 : i+12]); lo < 0xdc00 || lo >= 0xe000 {
+				return fmt.Errorf("unpaired surrogate %s", raw[i:i+6])
+			}
+			i += 11
+		case r >= 0xdc00 && r < 0xe000:
+			return fmt.Errorf("unpaired surrogate %s", raw[i:i+6])
+		default:
+			i += 5
+		}
+	}
+	return nil
+}
+
+// hex4 decodes four hex digits that json.Valid has vouched for.
+func hex4(b []byte) rune {
+	var r rune
+	for _, c := range b {
+		switch {
+		case c >= '0' && c <= '9':
+			c -= '0'
+		case c >= 'a' && c <= 'f':
+			c -= 'a' - 10
+		default:
+			c -= 'A' - 10
+		}
+		r = r<<4 | rune(c)
+	}
+	return r
 }
 
 // newID returns a random 128-bit hex identifier.
