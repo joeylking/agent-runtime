@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	agentrt "github.com/joeylking/agent-runtime"
 	"github.com/joeylking/agent-runtime/providers"
@@ -64,6 +66,68 @@ func TestHost_DefaultsAndPrefixesTheScheme(t *testing.T) {
 	}
 	if got := ollama.Host("https://box:443"); got != "https://box:443" {
 		t.Fatalf("configured host = %s", got)
+	}
+}
+
+func TestNew_RefusesAHostThatIsNotAnHTTPServer(t *testing.T) {
+	for _, host := range []string{"ftp://x", "file:///etc/passwd", "http://", "http://u:p@box:1", "http://box:1/?q=1"} {
+		if _, err := ollama.New(ollama.Config{Model: "x", Host: host}); err == nil {
+			t.Errorf("host %q was accepted", host)
+		}
+		if got := ollama.Host(host); got != "" {
+			t.Errorf("Host(%q) = %q, want empty for a host New refuses", host, got)
+		}
+	}
+}
+
+func TestGenerate_UnusableReplyIsChargedWhatItReported(t *testing.T) {
+	for _, body := range []string{
+		`{"error":"context length exceeded","prompt_eval_count":7,"eval_count":2}`,
+		`{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"t","arguments":7}}]},"prompt_eval_count":7,"eval_count":2}`,
+	} {
+		m := server(t, func(w http.ResponseWriter, _ map[string]any) { io.WriteString(w, body) })
+		_, err := m.Generate(context.Background(), agentrt.ModelRequest{})
+		var served agentrt.ServedError
+		if !errors.As(err, &served) || served.Usage.InputTokens != 7 || served.Usage.OutputTokens != 2 {
+			t.Fatalf("%s: err = %#v, want a served error carrying the usage", body, err)
+		}
+	}
+}
+
+func TestGenerate_BodyOverTheLimitIsRefusedByName(t *testing.T) {
+	m := server(t, func(w http.ResponseWriter, _ map[string]any) {
+		io.WriteString(w, `{"message":{"role":"assistant","content":"`+strings.Repeat("a", providers.MaxBodyBytes)+`"}}`)
+	})
+	_, err := m.Generate(context.Background(), agentrt.ModelRequest{})
+	var tr agentrt.TransientError
+	if !errors.Is(err, providers.ErrBodyTooLarge) || errors.As(err, &tr) {
+		t.Fatalf("err = %v, want a permanent too-large error", err)
+	}
+}
+
+func TestGenerate_UnresolvableHostAndCancellationAreNotRetried(t *testing.T) {
+	var tr agentrt.TransientError
+	m := newModel(t, ollama.Config{Model: "x", Host: "http://no-such-host.invalid"})
+	if _, err := m.Generate(context.Background(), agentrt.ModelRequest{}); err == nil || errors.As(err, &tr) {
+		t.Fatalf("unresolvable host = %v, want permanent", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	down := newModel(t, ollama.Config{Model: "x", Host: "127.0.0.1:1"})
+	if _, err := down.Generate(ctx, agentrt.ModelRequest{}); !errors.Is(err, context.Canceled) || errors.As(err, &tr) {
+		t.Fatalf("cancellation = %v, want context.Canceled bare", err)
+	}
+}
+
+func TestGenerate_RetryAfterIsCarried(t *testing.T) {
+	m := server(t, func(w http.ResponseWriter, _ map[string]any) {
+		w.Header().Set("Retry-After", "3")
+		http.Error(w, "busy", http.StatusTooManyRequests)
+	})
+	_, err := m.Generate(context.Background(), agentrt.ModelRequest{})
+	var se providers.StatusError
+	if !errors.As(err, &se) || se.RetryAfter != 3*time.Second {
+		t.Fatalf("err = %#v", err)
 	}
 }
 

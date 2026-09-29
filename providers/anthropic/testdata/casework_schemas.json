@@ -1,0 +1,50 @@
+[
+ {
+  "name": "ReadConversation",
+  "schema": "{\"type\":\"object\",\"additionalProperties\":false}"
+ },
+ {
+  "name": "GetAccountContext",
+  "schema": "{\"type\":\"object\",\"additionalProperties\":false}"
+ },
+ {
+  "name": "GetOrganization",
+  "schema": "{\"type\":\"object\",\"additionalProperties\":false}"
+ },
+ {
+  "name": "GetEntitlements",
+  "schema": "{\"type\":\"object\",\"additionalProperties\":false}"
+ },
+ {
+  "name": "GetSubscription",
+  "schema": "{\"type\":\"object\",\"additionalProperties\":false}"
+ },
+ {
+  "name": "GetProcessingHistory",
+  "schema": "{\"type\":\"object\",\"properties\":{\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":50}},\"additionalProperties\":false}"
+ },
+ {
+  "name": "LookupPolicy",
+  "schema": "{\"type\":\"object\",\"properties\":{\"price_id\":{\"type\":\"string\",\"maxLength\":200}},\"additionalProperties\":false}"
+ },
+ {
+  "name": "ComputeReconciliation",
+  "schema": "{\"type\":\"object\",\"additionalProperties\":false}"
+ },
+ {
+  "name": "ApplyReconciliation",
+  "schema": "{\"type\":\"object\",\"properties\":{\"proposal_id\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":200}},\"required\":[\"proposal_id\"],\"additionalProperties\":false}"
+ },
+ {
+  "name": "VerifyCapability",
+  "schema": "{\"type\":\"object\",\"properties\":{\"capability\":{\"type\":\"string\",\"enum\":[\"export\"]}},\"required\":[\"capability\"],\"additionalProperties\":false}"
+ },
+ {
+  "name": "DraftMessage",
+  "schema": "{\"type\":\"object\",\"properties\":{\"audience\":{\"type\":\"string\",\"enum\":[\"customer\",\"private\"]},\"content\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":4000}},\"required\":[\"audience\",\"content\"],\"additionalProperties\":false}"
+ },
+ {
+  "name": "Conclude",
+  "schema": "{\"type\":\"object\",\"properties\":{\n\"outcome\":{\"type\":\"string\",\"enum\":[\"corrected\",\"explained_no_action\",\"needs_clarification\",\"escalate\",\"blocked\"]},\n\"summary\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":2000},\n\"findings\":{\"type\":\"array\",\"maxItems\":20,\"items\":{\"type\":\"object\",\"properties\":{\"claim\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":500},\"kind\":{\"type\":\"string\",\"enum\":[\"observed\",\"inferred\",\"missing\"]},\"evidence_refs\":{\"type\":\"array\",\"maxItems\":10,\"items\":{\"type\":\"string\",\"maxLength\":100}}},\"required\":[\"claim\",\"kind\",\"evidence_refs\"],\"additionalProperties\":false}},\n\"next_step\":{\"type\":\"string\",\"maxLength\":1000},\n\"draft_id\":{\"type\":\"string\",\"maxLength\":100}\n},\"required\":[\"outcome\",\"summary\",\"findings\",\"next_step\"],\"additionalProperties\":false}"
+ }
+]

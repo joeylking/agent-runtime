@@ -65,7 +65,7 @@ func TestParseDollars_AcceptedForms(t *testing.T) {
 			t.Fatalf("ParseDollars(%q) = %d, %v, want %d", tc.in, got, err, tc.want)
 		}
 	}
-	for _, in := range []string{"", "-1", "$-0.5", "free", "1,50", "NaN", "Inf"} {
+	for _, in := range []string{"", "-1", "$-0.5", "free", "1,50", "NaN", "Inf", "1e13", "9223372036854.775807", "1e300"} {
 		if got, err := providers.ParseDollars(in); err == nil {
 			t.Fatalf("ParseDollars(%q) = %d, want an error", in, got)
 		}

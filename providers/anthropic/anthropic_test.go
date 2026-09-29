@@ -1,15 +1,21 @@
 package anthropic_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	sdk "github.com/anthropics/anthropic-sdk-go"
 
 	agentrt "github.com/joeylking/agent-runtime"
 	"github.com/joeylking/agent-runtime/providers"
@@ -82,14 +88,14 @@ func TestNew_RequiresAModelAndNamesItself(t *testing.T) {
 	if _, err := anthropic.New(anthropic.Config{}); err == nil {
 		t.Fatal("an empty model id was accepted")
 	}
-	m, err := anthropic.New(anthropic.Config{Model: "claude-opus-5"})
+	m, err := anthropic.New(anthropic.Config{Model: "claude-opus-5", APIKey: "test-key"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Name() != "anthropic:claude-opus-5" || m.RawAssistantBlock() != anthropic.DefaultRawAssistantBlock {
+	if m.Name() != "anthropic:claude-opus-5" || anthropic.Name("claude-opus-5") != m.Name() || m.RawAssistantBlock() != anthropic.DefaultRawAssistantBlock {
 		t.Fatalf("name = %s, raw block = %s", m.Name(), m.RawAssistantBlock())
 	}
-	m, err = anthropic.New(anthropic.Config{Model: "claude-opus-5", Name: "claude-opus-5", RawAssistantBlock: "casework.raw_assistant"})
+	m, err = anthropic.New(anthropic.Config{Model: "claude-opus-5", Name: "claude-opus-5", RawAssistantBlock: "casework.raw_assistant", APIKey: "test-key"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +322,7 @@ func TestStrictSubset_RemovesRejectedKeywords(t *testing.T) {
 
 func TestPrices_KeyedByTheDefaultName(t *testing.T) {
 	prices := anthropic.Prices()
-	m, err := anthropic.New(anthropic.Config{Model: "claude-opus-5"})
+	m, err := anthropic.New(anthropic.Config{Model: "claude-opus-5", APIKey: "test-key"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,9 +332,303 @@ func TestPrices_KeyedByTheDefaultName(t *testing.T) {
 	if _, err := providers.PriceFor(prices, "claude-opus-5"); err == nil {
 		t.Fatal("the bare model id must not be priced")
 	}
+	for _, model := range []string{"claude-fable-5-1", "claude-mythos-5-1", "claude-fable-5", "claude-mythos-5", "claude-opus-5-5", "claude-opus-5",
+		"claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"} {
+		if _, err := providers.PriceFor(prices, anthropic.Name(model)); err != nil {
+			t.Errorf("current model %s: %v", model, err)
+		}
+	}
 	for name, p := range prices {
 		if p.InputPerMTok <= 0 || p.OutputPerMTok <= 0 || p.CachedInputPerMTok <= 0 {
 			t.Errorf("%s: incomplete price %+v", name, p)
 		}
+	}
+}
+
+// roundTrip answers every request in-process, so a test can see where a
+// request with no BaseURL would have gone without reaching it.
+type roundTrip struct {
+	mu   sync.Mutex
+	reqs []*http.Request
+}
+
+func (rt *roundTrip) RoundTrip(r *http.Request) (*http.Response, error) {
+	rt.mu.Lock()
+	rt.reqs = append(rt.reqs, r)
+	rt.mu.Unlock()
+	return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}},
+		Body: io.NopCloser(strings.NewReader(toolUseMessage)), Request: r}, nil
+}
+
+func TestNew_ReadsOnlyTheKeyFromTheEnvironment(t *testing.T) {
+	env := &fake{responses: []response{{200, toolUseMessage}}}
+	srv := httptest.NewServer(env)
+	t.Cleanup(srv.Close)
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "token-from-env")
+	t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Leak: yes")
+	t.Setenv("ANTHROPIC_PROFILE", "nonexistent")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	if _, err := anthropic.New(anthropic.Config{Model: "claude-opus-5"}); err == nil || !strings.Contains(err.Error(), "no API key") {
+		t.Fatalf("no key anywhere = %v, want New to refuse", err)
+	}
+	t.Setenv("ANTHROPIC_API_KEY", "key-from-env")
+	rt := &roundTrip{}
+	m, err := anthropic.New(anthropic.Config{Model: "claude-opus-5", HTTPClient: &http.Client{Transport: rt}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Generate(context.Background(), userRequest()); err != nil {
+		t.Fatal(err)
+	}
+	r := rt.reqs[0]
+	if r.URL.Host != "api.anthropic.com" || r.Header.Get("X-Api-Key") != "key-from-env" || r.Header.Get("Authorization") != "" || r.Header.Get("X-Leak") != "" {
+		t.Fatalf("request went to %s with key %q, authorization %q, custom header %q", r.URL, r.Header.Get("X-Api-Key"), r.Header.Get("Authorization"), r.Header.Get("X-Leak"))
+	}
+	if len(env.requests) != 0 {
+		t.Fatal("ANTHROPIC_BASE_URL was honoured")
+	}
+	// An explicit key wins over the environment's.
+	m, _ = anthropic.New(anthropic.Config{Model: "claude-opus-5", APIKey: "explicit", HTTPClient: &http.Client{Transport: rt}})
+	m.Generate(context.Background(), userRequest())
+	if got := rt.reqs[1].Header.Get("X-Api-Key"); got != "explicit" {
+		t.Fatalf("key sent = %q", got)
+	}
+}
+
+func TestNew_RefusesAnUnpricedModelUnlessNamed(t *testing.T) {
+	if _, err := anthropic.New(anthropic.Config{Model: "claude-unknown-9", APIKey: "k"}); !errors.Is(err, providers.ErrNoPrice) {
+		t.Fatalf("err = %v, want ErrNoPrice", err)
+	}
+	if _, err := anthropic.New(anthropic.Config{Model: "claude-unknown-9", Name: "mine", APIKey: "k"}); err != nil {
+		t.Fatalf("a named model prices itself: %v", err)
+	}
+}
+
+func TestMaxTokens_TooLargeWithoutStreamingIsPermanentAndNeverSent(t *testing.T) {
+	if _, err := anthropic.New(anthropic.Config{Model: "claude-opus-5", APIKey: "k", MaxTokens: 32000}); err == nil {
+		t.Fatal("a cap the SDK will not send was accepted")
+	}
+	f := &fake{responses: []response{{200, toolUseMessage}}}
+	m := newModel(t, f, anthropic.Config{})
+	req := userRequest()
+	req.MaxOutputTokens = 32000
+	_, err := m.Generate(context.Background(), req)
+	var tr agentrt.TransientError
+	if err == nil || errors.As(err, &tr) || len(f.requests) != 0 {
+		t.Fatalf("err = %v, requests = %d, want a permanent error and nothing sent", err, len(f.requests))
+	}
+}
+
+func TestGenerate_ErrorsCarryNeitherTheRequestNorTheKey(t *testing.T) {
+	for _, tc := range []struct {
+		status    int
+		transient bool
+	}{{401, false}, {400, false}, {409, true}, {529, true}} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			w.Header().Set("Retry-After", "2")
+			w.WriteHeader(tc.status)
+			io.WriteString(w, "<html>bad gateway</html>")
+		}))
+		m, err := anthropic.New(anthropic.Config{Model: "claude-opus-5", BaseURL: srv.URL, APIKey: "sk-ant-SECRET"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = m.Generate(context.Background(), userRequest())
+		srv.Close()
+		var tr agentrt.TransientError
+		var se providers.StatusError
+		var sdkErr *sdk.Error
+		if !errors.As(err, &se) || se.Status != tc.status || se.Body != "<html>bad gateway</html>" || se.RetryAfter != 2*time.Second || errors.As(err, &sdkErr) {
+			t.Fatalf("%d: err = %#v, want a StatusError and no SDK error", tc.status, err)
+		}
+		if errors.As(err, &tr) != tc.transient {
+			t.Fatalf("%d: transient = %v", tc.status, !tc.transient)
+		}
+		for _, format := range []string{"%v", "%+v", "%#v"} {
+			if out := fmt.Sprintf(format, err); strings.Contains(out, "SECRET") {
+				t.Fatalf("%d: %s printed the key: %s", tc.status, format, out)
+			}
+		}
+	}
+}
+
+func TestConfigAndModel_PrintWithoutTheKey(t *testing.T) {
+	cfg := anthropic.Config{Model: "claude-opus-5", APIKey: "sk-ant-SECRET"}
+	m, err := anthropic.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []string{"%v", "%+v", "%#v", "%s"} {
+		for _, v := range []any{cfg, *m, m} {
+			if out := fmt.Sprintf(format, v); strings.Contains(out, "SECRET") {
+				t.Fatalf("%s printed the key: %s", format, out)
+			}
+		}
+	}
+}
+
+func TestGenerate_ResponseBodyIsBounded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"content":[{"type":"text","text":"`+strings.Repeat("a", providers.MaxBodyBytes)+`"}]}`)
+	}))
+	t.Cleanup(srv.Close)
+	m, _ := anthropic.New(anthropic.Config{Model: "claude-opus-5", BaseURL: srv.URL, APIKey: "k"})
+	_, err := m.Generate(context.Background(), userRequest())
+	var tr agentrt.TransientError
+	if !errors.Is(err, providers.ErrBodyTooLarge) || errors.As(err, &tr) {
+		t.Fatalf("err = %v, want a permanent too-large error", err)
+	}
+}
+
+func TestGenerate_UndecodableReplyIsAServedError(t *testing.T) {
+	for _, body := range []string{`<html>ok</html>`, `{"id":"m","usage":{"input_tokens":10`} {
+		f := &fake{responses: []response{{200, body}}}
+		m := newModel(t, f, anthropic.Config{})
+		_, err := m.Generate(context.Background(), userRequest())
+		var served agentrt.ServedError
+		var tr agentrt.TransientError
+		if !errors.As(err, &served) || errors.As(err, &tr) {
+			t.Fatalf("%s: err = %#v, want a served error", body, err)
+		}
+	}
+}
+
+func TestGenerate_FoldsOneHourCacheWritesAtTwice(t *testing.T) {
+	cached := `{"id":"m","type":"message","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],
+"usage":{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":501,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":401,"ephemeral_1h_input_tokens":100}}}`
+	f := &fake{responses: []response{{200, cached}}}
+	resp, err := newModel(t, f, anthropic.Config{}).Generate(context.Background(), userRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 100 uncached + ceil(1.25 * 401) = 502 + 2 * 100 = 200.
+	if want := 100 + 502 + 200; resp.Usage.InputTokens != want {
+		t.Fatalf("input = %d, want %d", resp.Usage.InputTokens, want)
+	}
+}
+
+func TestGenerate_ReplayedToolInputKeepsItsNumbers(t *testing.T) {
+	f := &fake{responses: []response{{200, toolUseMessage}}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		f.paths = append(f.paths, string(b))
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, toolUseMessage)
+	}))
+	t.Cleanup(srv.Close)
+	m, _ := anthropic.New(anthropic.Config{Model: "claude-opus-5", BaseURL: srv.URL, APIKey: "k"})
+	raw := `{"id":"m","type":"message","role":"assistant","model":"x","content":[{"type":"tool_use","id":"b","name":"t","input":{"n":9007199254740995}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`
+	_, err := m.Generate(context.Background(), agentrt.ModelRequest{Messages: []agentrt.Message{
+		{Role: "user", Content: []agentrt.ContentBlock{{Type: "text", Text: "hi"}}},
+		{Role: "assistant", Content: []agentrt.ContentBlock{{Type: "tool_use", ToolUseID: "a", Name: "t", Input: json.RawMessage(`{"n":9007199254740993}`)}}},
+		{Role: "user", Content: []agentrt.ContentBlock{{Type: "tool_result", ToolUseID: "a", Content: "ok"}}},
+		{Role: "assistant", Content: []agentrt.ContentBlock{{Type: m.RawAssistantBlock(), Text: raw}}},
+		{Role: "user", Content: []agentrt.ContentBlock{{Type: "tool_result", ToolUseID: "b", Content: "ok"}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"9007199254740993", "9007199254740995"} {
+		if !strings.Contains(f.paths[0], `"n":`+n) {
+			t.Fatalf("sent %s, want %s intact", f.paths[0], n)
+		}
+	}
+}
+
+func TestStrictSubset_PropertyNamesAreNotKeywords(t *testing.T) {
+	in := map[string]any{}
+	json.Unmarshal([]byte(`{"type":"object","properties":{"pattern":{"type":"string","pattern":"^a"},"maximum":{"type":"integer","maximum":3},"path":{"type":"string"},
+		"opt":{"type":["object","null"],"properties":{"a":{"type":"string"}}},"mode":{"enum":[{"pattern":"kept"}],"default":{"maximum":1}}},
+		"required":["pattern","path"],"$defs":{"x":{"type":"string","maxLength":3}}}`), &in)
+	out, _ := json.Marshal(anthropic.StrictSubset(in))
+	want := `{"$defs":{"x":{"type":"string"}},"additionalProperties":false,"properties":{"maximum":{"type":"integer"},"mode":{"default":{"maximum":1},"enum":[{"pattern":"kept"}]},` +
+		`"opt":{"additionalProperties":false,"properties":{"a":{"type":"string"}},"type":["object","null"]},"path":{"type":"string"},"pattern":{"type":"string"}},"required":["pattern","path"],"type":"object"}`
+	if string(out) != want {
+		t.Fatalf("strict subset =\n%s\nwant\n%s", out, want)
+	}
+}
+
+func TestStrict_CarriesTopLevelKeywordsSoARefResolves(t *testing.T) {
+	f := &fake{responses: []response{{200, toolUseMessage}}}
+	m := newModel(t, f, anthropic.Config{Strict: true})
+	tool := agentrt.ToolSpec{Name: "t", Description: "d", InputSchema: json.RawMessage(`{"type":"object","properties":{"a":{"$ref":"#/$defs/x"}},"$defs":{"x":{"type":"string","pattern":"^a"}},"description":"top","additionalProperties":true}`)}
+	if _, err := m.Generate(context.Background(), userRequest(tool)); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := json.Marshal(f.requests[0]["tools"].([]any)[0].(map[string]any)["input_schema"])
+	want := `{"$defs":{"x":{"type":"string"}},"additionalProperties":false,"description":"top","properties":{"a":{"$ref":"#/$defs/x"}},"type":"object"}`
+	if string(got) != want {
+		t.Fatalf("sent %s, want %s", got, want)
+	}
+}
+
+func TestStrict_RefusesWhatItCannotExpress(t *testing.T) {
+	for _, schema := range []string{
+		`{"type":"object","properties":{"a":{"oneOf":[{"type":"string"},{"type":"integer"}]}}}`,
+		`{"type":"object","properties":{"a":{"type":"object","additionalProperties":{"type":"string"}}}}`,
+		`{"type":"object","properties":{"n":{"$ref":"#/$defs/node"}},"$defs":{"node":{"type":"object","properties":{"next":{"$ref":"#/$defs/node"}}}}}`,
+		`{"type":"object","properties":{"self":{"$ref":"#"}}}`,
+		`{"type":"object","properties":{"a":{"$ref":"#/$defs/a"}},"$defs":{"a":{"items":{"$ref":"#/$defs/b"}},"b":{"anyOf":[{"$ref":"#/$defs/a"}]}}}`,
+	} {
+		f := &fake{responses: []response{{200, toolUseMessage}}}
+		m := newModel(t, f, anthropic.Config{Strict: true})
+		_, err := m.Generate(context.Background(), userRequest(agentrt.ToolSpec{Name: "t", InputSchema: json.RawMessage(schema)}))
+		if err == nil || len(f.requests) != 0 {
+			t.Errorf("%s: err = %v, requests = %d, want refused before sending", schema, err, len(f.requests))
+		}
+		// Without Strict the schema goes as it is.
+		f = &fake{responses: []response{{200, toolUseMessage}}}
+		if _, err := newModel(t, f, anthropic.Config{}).Generate(context.Background(), userRequest(agentrt.ToolSpec{Name: "t", InputSchema: json.RawMessage(schema)})); err != nil {
+			t.Errorf("%s without strict: %v", schema, err)
+		}
+	}
+}
+
+// TestStrict_CaseworkSchemasAreByteIdentical is the proof that casework's
+// strict tool definitions did not move: testdata holds every tool schema in
+// casework/internal/tools and the tools array the adapter sent for them
+// before the structural rewrite of StrictSubset.
+func TestStrict_CaseworkSchemasAreByteIdentical(t *testing.T) {
+	raw, err := os.ReadFile("testdata/casework_schemas.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	golden, err := os.ReadFile("testdata/casework_strict.golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var list []struct{ Name, Schema string }
+	if err := json.Unmarshal(raw, &list); err != nil || len(list) != 12 {
+		t.Fatalf("%d schemas, %v", len(list), err)
+	}
+	var specs []agentrt.ToolSpec
+	for _, s := range list {
+		specs = append(specs, agentrt.ToolSpec{Name: s.Name, Description: "d", InputSchema: json.RawMessage(s.Schema)})
+	}
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, toolUseMessage)
+	}))
+	t.Cleanup(srv.Close)
+	m, err := anthropic.New(anthropic.Config{Model: "claude-opus-5", Name: "claude-opus-5", RawAssistantBlock: "casework.raw_assistant", Strict: true, Effort: "medium", APIKey: "k", BaseURL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Generate(context.Background(), userRequest(specs...)); err != nil {
+		t.Fatal(err)
+	}
+	var sent struct {
+		Tools json.RawMessage `json:"tools"`
+	}
+	json.Unmarshal(body, &sent)
+	if !bytes.Equal(sent.Tools, golden) {
+		t.Fatalf("strict tools changed:\n%s\nwant\n%s", sent.Tools, golden)
 	}
 }

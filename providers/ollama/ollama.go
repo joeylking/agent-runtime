@@ -6,7 +6,13 @@
 //
 // The adapter does not stream and does not retry. The runtime's accounting
 // caller owns retries, so every attempt is recorded; a timeout is returned
-// bare so that caller charges it as ambiguous.
+// bare so that caller charges it as ambiguous. A reply the server served but
+// that cannot be used, because it does not decode or carries an error field,
+// is an agentrt.ServedError with whatever usage the reply reported.
+//
+// Ollama's chat API has no switch for parallel tool calls, so a reply may
+// carry several. Every one is returned; the runtime executes the first and
+// records that the others were dropped.
 package ollama
 
 import (
@@ -16,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -42,15 +49,18 @@ type Config struct {
 	// "ollama:<model>"; an override exists for a consumer whose
 	// recordings or price table already use another name.
 	Name string
-	// Host is the server, with or without a scheme. Empty means
-	// OLLAMA_HOST, then DefaultHost.
+	// Host is the server, with or without an http or https scheme. Empty
+	// means OLLAMA_HOST, then DefaultHost. New refuses any other scheme.
 	Host string
 	// Think leaves the model's thinking mode on. It is off by default
 	// because tool-calling models are steadier without it.
 	Think bool
 	// NumCtx is the requested context window. Zero means DefaultNumCtx.
 	NumCtx int
-	// HTTPClient overrides the client used for requests.
+	// HTTPClient overrides the client used for requests. The adapter uses a
+	// copy whose transport refuses a body over providers.MaxBodyBytes. Nil
+	// means a client with providers.DefaultTimeout, a backstop to the
+	// caller's context.
 	HTTPClient *http.Client
 }
 
@@ -62,20 +72,22 @@ type Model struct {
 	client *http.Client
 }
 
-// New builds the adapter. It refuses an empty model id.
+// New builds the adapter. It refuses an empty model id and a host that is
+// not an http or https server.
 func New(cfg Config) (*Model, error) {
 	if cfg.Model == "" {
 		return nil, errors.New("ollama: model is required")
 	}
-	m := &Model{cfg: cfg, name: cfg.Name, host: Host(cfg.Host), client: cfg.HTTPClient}
+	host, err := resolveHost(cfg.Host)
+	if err != nil {
+		return nil, err
+	}
+	m := &Model{cfg: cfg, name: cfg.Name, host: host, client: providers.Client(cfg.HTTPClient)}
 	if m.name == "" {
 		m.name = Name(cfg.Model)
 	}
 	if m.cfg.NumCtx <= 0 {
 		m.cfg.NumCtx = DefaultNumCtx
-	}
-	if m.client == nil {
-		m.client = &http.Client{}
 	}
 	return m, nil
 }
@@ -83,18 +95,37 @@ func New(cfg Config) (*Model, error) {
 // Host resolves a configured host: the argument, then OLLAMA_HOST, then
 // DefaultHost, with http:// prefixed when no scheme is given. It is
 // exported because a consumer that probes the server before a run needs
-// the same answer the adapter will use.
+// the same answer the adapter will use. A host New would refuse, such as
+// one with another scheme, resolves to the empty string.
 func Host(host string) string {
+	h, err := resolveHost(host)
+	if err != nil {
+		return ""
+	}
+	return h
+}
+
+func resolveHost(host string) (string, error) {
 	if host == "" {
 		host = os.Getenv("OLLAMA_HOST")
 	}
 	if host == "" {
 		host = DefaultHost
 	}
-	if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+	if !strings.Contains(host, "://") {
 		host = "http://" + host
 	}
-	return strings.TrimRight(host, "/")
+	u, err := url.Parse(host)
+	if err != nil {
+		return "", fmt.Errorf("ollama: host %q: %w", host, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("ollama: host %q: the scheme must be http or https", host)
+	}
+	if u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("ollama: host %q is not a server address", host)
+	}
+	return strings.TrimRight(host, "/"), nil
 }
 
 // Name is what an adapter for model reports when Config.Name is unset, so
@@ -149,6 +180,16 @@ type chatRequest struct {
 	Options  map[string]any `json:"options,omitempty"`
 }
 
+// maxEcho bounds how much server text an error message repeats.
+const maxEcho = 512
+
+// usage is the part of a reply decoded before the rest, so that it survives
+// a reply that does not otherwise decode.
+type usage struct {
+	PromptEvalCount int `json:"prompt_eval_count"`
+	EvalCount       int `json:"eval_count"`
+}
+
 type chatResponse struct {
 	Message         message `json:"message"`
 	DoneReason      string  `json:"done_reason"`
@@ -189,31 +230,40 @@ func (m *Model) Generate(ctx context.Context, req agentrt.ModelRequest) (agentrt
 	if err != nil {
 		return agentrt.ModelResponse{}, providers.ClassifyTransport(err)
 	}
-	defer resp.Body.Close()
+	defer providers.DrainClose(resp.Body)
 	raw, err := providers.ReadBody(resp.Body)
 	if err != nil {
 		return agentrt.ModelResponse{}, err
 	}
-	if err := providers.ClassifyStatus("ollama", resp.StatusCode, raw); err != nil {
+	if err := providers.ClassifyResponse("ollama", resp, raw); err != nil {
 		return agentrt.ModelResponse{}, err
 	}
+	// The usage is read on its own first, so a reply that is served but
+	// unusable is still charged what it reported.
+	var counts usage
+	json.Unmarshal(raw, &counts)
+	used := agentrt.Usage{InputTokens: counts.PromptEvalCount, OutputTokens: counts.EvalCount}
 	var out chatResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return agentrt.ModelResponse{}, fmt.Errorf("ollama: decode: %w", err)
+		return agentrt.ModelResponse{}, agentrt.ServedError{Usage: used, Err: fmt.Errorf("ollama: decode: %w", err)}
 	}
 	// A 200 carrying an error field is the server refusing the request,
 	// for example a context length it cannot serve.
 	if out.Error != "" {
-		return agentrt.ModelResponse{}, fmt.Errorf("ollama: %s", out.Error)
+		return agentrt.ModelResponse{}, agentrt.ServedError{Usage: used, Err: fmt.Errorf("ollama: %s", providers.Truncate(out.Error, maxEcho))}
 	}
-	mr := agentrt.ModelResponse{Text: out.Message.Content, Raw: raw,
-		Usage: agentrt.Usage{InputTokens: out.PromptEvalCount, OutputTokens: out.EvalCount}}
+	mr := agentrt.ModelResponse{Text: out.Message.Content, Raw: raw, Usage: used}
 	for i, tc := range out.Message.ToolCalls {
+		args := orEmptyObject(tc.Function.Arguments)
+		if args[0] != '{' {
+			return agentrt.ModelResponse{}, agentrt.ServedError{Usage: used, Err: fmt.Errorf("ollama: tool call %s: arguments are not a JSON object: %s",
+				providers.Truncate(tc.Function.Name, maxEcho), providers.Truncate(string(args), maxEcho))}
+		}
 		id := tc.ID
 		if id == "" {
 			id = providers.SynthesizeToolUseID(i)
 		}
-		mr.ToolUses = append(mr.ToolUses, agentrt.ToolUse{ID: id, Name: tc.Function.Name, Args: orEmptyObject(tc.Function.Arguments)})
+		mr.ToolUses = append(mr.ToolUses, agentrt.ToolUse{ID: id, Name: tc.Function.Name, Args: args})
 	}
 	// A reply cut off by num_predict may carry a half-written call. Drop
 	// the calls, keep the usage: the request was served and charged, and
@@ -271,7 +321,8 @@ func convert(msg agentrt.Message) []message {
 }
 
 func orEmptyObject(raw json.RawMessage) json.RawMessage {
-	if len(bytes.TrimSpace(raw)) == 0 {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || string(raw) == "null" {
 		return json.RawMessage("{}")
 	}
 	return raw

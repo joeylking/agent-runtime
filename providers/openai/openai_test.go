@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	agentrt "github.com/joeylking/agent-runtime"
@@ -233,6 +235,94 @@ func TestGenerate_NoKeySendsNoAuthorization(t *testing.T) {
 	}
 	if auth != "" {
 		t.Fatalf("a local server was sent %q", auth)
+	}
+}
+
+func TestNew_EnvironmentKeyGoesOnlyToOpenAI(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "sk-from-env")
+	var auth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = append(auth, r.Header.Get("Authorization"))
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{}}`))
+	}))
+	t.Cleanup(srv.Close)
+	m := newModel(t, openai.Config{Model: "x", BaseURL: srv.URL + "/v1"})
+	if _, err := m.Generate(context.Background(), agentrt.ModelRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	// An explicit key still goes to the configured server, which is loopback.
+	m = newModel(t, openai.Config{Model: "x", BaseURL: srv.URL + "/v1", APIKey: "sk-explicit"})
+	if _, err := m.Generate(context.Background(), agentrt.ModelRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if auth[0] != "" || auth[1] != "Bearer sk-explicit" {
+		t.Fatalf("authorization sent = %q, want none from the environment", auth)
+	}
+	if strings.Contains(fmt.Sprint(newModel(t, openai.Config{Model: "x"})), "sk-from-env") {
+		t.Fatal("the default endpoint's model printed the environment key")
+	}
+}
+
+func TestNew_RefusesAKeyOverPlainHTTPToARemoteHost(t *testing.T) {
+	for _, base := range []string{"http://api.example.com/v1", "http://10.0.0.5:8080/v1"} {
+		if _, err := openai.New(openai.Config{Model: "x", BaseURL: base, APIKey: "sk-x"}); err == nil {
+			t.Errorf("%s: a key over http was accepted", base)
+		}
+		if _, err := openai.New(openai.Config{Model: "x", BaseURL: base}); err != nil {
+			t.Errorf("%s without a key: %v", base, err)
+		}
+	}
+	for _, base := range []string{"http://127.0.0.1:11434/v1", "http://localhost:8080/v1", "http://[::1]:1/v1", "https://api.example.com/v1"} {
+		if _, err := openai.New(openai.Config{Model: "x", BaseURL: base, APIKey: "sk-x"}); err != nil {
+			t.Errorf("%s: %v", base, err)
+		}
+	}
+	if _, err := openai.New(openai.Config{Model: "x", BaseURL: "ftp://x/v1"}); err == nil {
+		t.Error("an ftp base URL was accepted")
+	}
+}
+
+func TestConfigAndModel_PrintWithoutTheKey(t *testing.T) {
+	cfg := openai.Config{Model: "x", APIKey: "sk-SECRET"}
+	m, err := openai.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []string{"%v", "%+v", "%#v", "%s"} {
+		for _, v := range []any{cfg, *m, m} {
+			if out := fmt.Sprintf(format, v); strings.Contains(out, "sk-SECRET") {
+				t.Fatalf("%s printed the key: %s", format, out)
+			}
+		}
+	}
+}
+
+func TestGenerate_UnusableReplyIsChargedWhatItReported(t *testing.T) {
+	const counted = `"usage":{"prompt_tokens":5000,"completion_tokens":300}`
+	for _, body := range []string{
+		`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"t","arguments":"{\"a\": 1"}}]},"finish_reason":"tool_calls"}],` + counted + `}`,
+		`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"t","arguments":"[1]"}}]},"finish_reason":"tool_calls"}],` + counted + `}`,
+		`{"choices":[],` + counted + `}`,
+		`{"error":{"type":"server_error","message":"bad"},` + counted + `}`,
+		`{"choices":7,` + counted + `}`,
+	} {
+		m := server(t, func(w http.ResponseWriter, _ map[string]any, _ *http.Request) { io.WriteString(w, body) })
+		_, err := m.Generate(context.Background(), agentrt.ModelRequest{})
+		var served agentrt.ServedError
+		if !errors.As(err, &served) || served.Usage.InputTokens != 5000 || served.Usage.OutputTokens != 300 {
+			t.Fatalf("%s: err = %#v, want a served error carrying the usage", body, err)
+		}
+	}
+}
+
+func TestGenerate_EchoedArgumentsAreBounded(t *testing.T) {
+	long := strings.Repeat("x", 100_000)
+	m := server(t, func(w http.ResponseWriter, _ map[string]any, _ *http.Request) {
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"t","arguments":"`+long+`"}}]},"finish_reason":"tool_calls"}],"usage":{}}`)
+	})
+	_, err := m.Generate(context.Background(), agentrt.ModelRequest{})
+	if err == nil || len(err.Error()) > 2048 {
+		t.Fatalf("error is %d bytes", len(fmt.Sprint(err)))
 	}
 }
 

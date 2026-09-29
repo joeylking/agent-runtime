@@ -52,12 +52,18 @@ func Merge(tables ...agentrt.PriceTable) agentrt.PriceTable {
 }
 
 // ParseDollars converts a budget written as "5", "4.41", or "$0.50" into
-// micros, rounding to the nearest micro. Negative amounts are refused.
+// micros, rounding to the nearest micro. Negative amounts, and amounts too
+// large for Micros, are refused.
 func ParseDollars(s string) (agentrt.Micros, error) {
 	t := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "$"))
 	f, err := strconv.ParseFloat(t, 64)
 	if err != nil || f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
 		return 0, fmt.Errorf("providers: invalid dollar amount %q", s)
 	}
-	return agentrt.Micros(f*1e6 + 0.5), nil
+	m := f*1e6 + 0.5
+	// 2^63 is the first float64 that does not fit in an int64.
+	if m >= math.Exp2(63) {
+		return 0, fmt.Errorf("providers: dollar amount %q is too large", s)
+	}
+	return agentrt.Micros(m), nil
 }
