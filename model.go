@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
+	"io"
+	"net"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -83,6 +86,19 @@ type TransientError struct {
 
 func (e TransientError) Error() string { return "transient: " + e.Err.Error() }
 func (e TransientError) Unwrap() error { return e.Err }
+
+// ServedError is returned by a Model when the provider served the request,
+// and so billed it, but the response could not be used: it would not
+// decode, or carried a tool call whose arguments are not JSON. Usage is what
+// the provider reported, and the accounting caller charges it; without this
+// an unusable reply would cost nothing on the books.
+type ServedError struct {
+	Usage Usage
+	Err   error
+}
+
+func (e ServedError) Error() string { return e.Err.Error() }
+func (e ServedError) Unwrap() error { return e.Err }
 
 // Micros is money in millionths of a currency unit.
 type Micros int64
@@ -178,6 +194,15 @@ type caller struct {
 	cfg    ModelConfig
 	runID  string
 	stepID string
+
+	// mu serialises the limit check and the reservation, so concurrent
+	// Generate calls within one step cannot all pass the check before any
+	// of them is recorded. The reservation holds each in-flight call's
+	// projection until its outcome is added to the run totals.
+	mu            sync.Mutex
+	reservedCalls int
+	reserved      Usage
+	reservedCost  Micros
 }
 
 // Generate implements ModelCaller.
@@ -188,9 +213,6 @@ func (c *caller) Generate(ctx context.Context, req ModelRequest) (ModelResponse,
 	}
 	if run.Limits.MaxOutputTokensPerCall > 0 && (req.MaxOutputTokens <= 0 || req.MaxOutputTokens > run.Limits.MaxOutputTokensPerCall) {
 		req.MaxOutputTokens = run.Limits.MaxOutputTokensPerCall
-	}
-	if err := c.checkLimits(run, req); err != nil {
-		return ModelResponse{}, err
 	}
 	timeout := c.cfg.CallTimeout
 	if timeout <= 0 {
@@ -207,58 +229,16 @@ func (c *caller) Generate(ctx context.Context, req ModelRequest) (ModelResponse,
 	var last error
 	for attempt := 1; attempt <= retries+1; attempt++ {
 		// A retry is a new call against the limits.
-		if attempt > 1 {
-			run, err = c.d.store.GetRun(ctx, c.runID)
-			if err != nil {
-				return ModelResponse{}, err
-			}
-			if err := c.checkLimits(run, req); err != nil {
-				return ModelResponse{}, err
-			}
-		}
-		call := ModelCall{ID: c.d.newID(), RunID: c.runID, StepID: c.stepID, Attempt: attempt, Status: CallDispatched, Model: c.cfg.Model.Name(), DispatchedAt: c.d.now()}
-		if err := c.d.store.tx(ctx, c.d.observer, func(t *txn) error {
-			if err := t.insertModelCall(ctx, call); err != nil {
-				return err
-			}
-			return t.appendEvent(ctx, Event{RunID: c.runID, StepID: c.stepID, At: call.DispatchedAt, Type: EventModelDispatched, Payload: mustJSON(map[string]any{"call_id": call.ID, "attempt": attempt, "model": call.Model})})
-		}); err != nil {
+		est, estCost, err := c.reserve(ctx, req)
+		if err != nil {
 			return ModelResponse{}, err
 		}
-		actx, cancel := context.WithTimeout(ctx, timeout)
-		resp, gerr := c.cfg.Model.Generate(actx, req)
-		cancel()
-		call.CompletedAt = c.d.now()
-		call.Latency = call.CompletedAt.Sub(call.DispatchedAt)
-		if gerr == nil {
-			call.Status, call.Usage = CallOK, resp.Usage
-			call.Cost = c.cfg.Prices.cost(call.Model, resp.Usage)
-			if err := c.record(ctx, call, run); err != nil {
-				return ModelResponse{}, err
-			}
-			return resp, nil
+		resp, done, gerr := c.attempt(ctx, req, attempt, timeout)
+		c.release(est, estCost)
+		if done {
+			return resp, gerr
 		}
 		last = gerr
-		call.Error = gerr.Error()
-		var tr TransientError
-		switch {
-		case errors.Is(gerr, context.DeadlineExceeded) || errors.Is(actx.Err(), context.DeadlineExceeded) || isConnectionLost(gerr):
-			// Sent, no answer: charge the conservative estimate.
-			call.Status = CallAmbiguous
-			call.Usage = Usage{InputTokens: EstimateInputTokens(req), OutputTokens: req.MaxOutputTokens}
-			call.Cost = c.cfg.Prices.cost(call.Model, call.Usage)
-		case errors.As(gerr, &tr):
-			call.Status = CallError
-		default:
-			call.Status = CallError
-			if err := c.record(ctx, call, run); err != nil {
-				return ModelResponse{}, err
-			}
-			return ModelResponse{}, ErrModelUnavailable{Attempts: attempt, Last: gerr}
-		}
-		if err := c.record(ctx, call, run); err != nil {
-			return ModelResponse{}, err
-		}
 		if attempt <= retries {
 			select {
 			case <-time.After(backoff * time.Duration(1<<(attempt-1))):
@@ -270,19 +250,143 @@ func (c *caller) Generate(ctx context.Context, req ModelRequest) (ModelResponse,
 	return ModelResponse{}, ErrModelUnavailable{Attempts: retries + 1, Last: last}
 }
 
+// attempt dispatches one request and records its outcome. done reports
+// that Generate returns the response and error as they are; otherwise err is a
+// failure worth retrying. Once the request is dispatched its outcome is
+// recorded even if ctx is cancelled, because the provider may have served
+// and billed it.
+func (c *caller) attempt(ctx context.Context, req ModelRequest, attempt int, timeout time.Duration) (ModelResponse, bool, error) {
+	call := ModelCall{ID: c.d.newID(), RunID: c.runID, StepID: c.stepID, Attempt: attempt, Status: CallDispatched, Model: c.cfg.Model.Name(), DispatchedAt: c.d.now()}
+	if err := c.d.store.tx(ctx, c.d.observer, func(t *txn) error {
+		if err := t.insertModelCall(ctx, call); err != nil {
+			return err
+		}
+		return t.appendEvent(ctx, Event{RunID: c.runID, StepID: c.stepID, At: call.DispatchedAt, Type: EventModelDispatched, Payload: toJSON(map[string]any{"call_id": call.ID, "attempt": attempt, "model": call.Model})})
+	}); err != nil {
+		return ModelResponse{}, true, err
+	}
+	actx, cancel := context.WithTimeout(ctx, timeout)
+	resp, gerr := c.cfg.Model.Generate(actx, req)
+	cancel()
+	rctx, rcancel := afterEffect(ctx)
+	defer rcancel()
+	call.CompletedAt = c.d.now()
+	call.Latency = call.CompletedAt.Sub(call.DispatchedAt)
+	ambiguous := func() {
+		call.Status = CallAmbiguous
+		call.Usage = Usage{InputTokens: EstimateInputTokens(req), OutputTokens: req.MaxOutputTokens}
+		call.Cost = c.cfg.Prices.cost(call.Model, call.Usage)
+	}
+	if gerr == nil {
+		call.Status, call.Usage = CallOK, resp.Usage
+		call.Cost = c.cfg.Prices.cost(call.Model, resp.Usage)
+		if err := c.record(rctx, call); err != nil {
+			return ModelResponse{}, true, err
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return ModelResponse{}, true, cerr
+		}
+		return resp, true, nil
+	}
+	call.Error = gerr.Error()
+	var served ServedError
+	var tr TransientError
+	retry := false
+	var out error
+	switch {
+	case errors.As(gerr, &served):
+		// Served and billed, but unusable: charge what the provider
+		// reported. Asking again would be billed again for the same
+		// reply, so it is not retried.
+		call.Status, call.Usage = CallError, served.Usage
+		call.Cost = c.cfg.Prices.cost(call.Model, served.Usage)
+		out = ErrModelUnavailable{Attempts: attempt, Last: gerr}
+	case ctx.Err() != nil:
+		// The caller gave up with the request in flight.
+		ambiguous()
+		out = ctx.Err()
+	case errors.Is(gerr, context.DeadlineExceeded) || errors.Is(actx.Err(), context.DeadlineExceeded) || isConnectionLost(gerr):
+		// Sent, no answer: charge the conservative estimate.
+		ambiguous()
+		retry = true
+	case errors.As(gerr, &tr):
+		call.Status = CallError
+		retry = true
+	default:
+		call.Status = CallError
+		out = ErrModelUnavailable{Attempts: attempt, Last: gerr}
+	}
+	if err := c.record(rctx, call); err != nil {
+		return ModelResponse{}, true, err
+	}
+	if retry {
+		return ModelResponse{}, false, gerr
+	}
+	return ModelResponse{}, true, out
+}
+
+// isConnectionLost reports a request that was sent and lost its connection
+// before an answer: the provider may have served it.
 func isConnectionLost(err error) bool {
-	s := err.Error()
-	return strings.Contains(s, "connection reset") || strings.Contains(s, "broken pipe") || strings.Contains(s, "unexpected EOF") || strings.Contains(s, "EOF")
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var op *net.OpError
+	return errors.As(err, &op) && (op.Op == "read" || op.Op == "write")
+}
+
+// reserve checks the limits against the recorded totals plus every call of
+// this step still in flight, then holds this call's projection until
+// release.
+func (c *caller) reserve(ctx context.Context, req ModelRequest) (Usage, Micros, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	run, err := c.d.store.GetRun(ctx, c.runID)
+	if err != nil {
+		return Usage{}, 0, err
+	}
+	run.ModelCalls += c.reservedCalls
+	run.Usage = run.Usage.add(c.reserved)
+	run.EstimatedCost += c.reservedCost
+	if err := c.checkLimits(run, req); err != nil {
+		return Usage{}, 0, err
+	}
+	est := Usage{InputTokens: EstimateInputTokens(req), OutputTokens: req.MaxOutputTokens}
+	cost := c.cfg.Prices.cost(c.cfg.Model.Name(), est)
+	c.reservedCalls++
+	c.reserved = c.reserved.add(est)
+	c.reservedCost += cost
+	return est, cost, nil
+}
+
+// release drops a reservation once its call is recorded in the totals.
+func (c *caller) release(est Usage, cost Micros) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reservedCalls--
+	c.reserved = c.reserved.add(Usage{InputTokens: -est.InputTokens, OutputTokens: -est.OutputTokens, CachedInputTokens: -est.CachedInputTokens})
+	c.reservedCost -= cost
 }
 
 // checkLimits enforces the call, token, and cost limits before dispatch.
 // Token and cost limits are checked against the totals so far plus a
 // conservative estimate for this call, so an overrun is prevented rather
-// than merely detected.
+// than merely detected. The estimate counts the request's output cap, so
+// under either limit a request with no cap is refused: its output, and so
+// its cost, cannot be bounded.
 func (c *caller) checkLimits(run Run, req ModelRequest) error {
 	l := run.Limits
 	if l.MaxModelCalls > 0 && run.ModelCalls >= l.MaxModelCalls {
 		return ErrLimit{Reason: ReasonLimitModelCalls, Detail: fmt.Sprintf("%d model calls made, limit %d", run.ModelCalls, l.MaxModelCalls)}
+	}
+	if req.MaxOutputTokens <= 0 {
+		const uncapped = "the request sets no output cap, so it cannot be projected; set MaxOutputTokens or Limits.MaxOutputTokensPerCall"
+		if l.MaxTotalTokens > 0 {
+			return ErrLimit{Reason: ReasonLimitTokens, Detail: uncapped}
+		}
+		if _, priced := c.cfg.Prices[c.cfg.Model.Name()]; l.MaxEstimatedCost > 0 && priced {
+			return ErrLimit{Reason: ReasonLimitCost, Detail: uncapped}
+		}
 	}
 	est := Usage{InputTokens: EstimateInputTokens(req), OutputTokens: req.MaxOutputTokens}
 	if l.MaxTotalTokens > 0 {
@@ -309,19 +413,19 @@ func EstimateInputTokens(req ModelRequest) int {
 }
 
 // record persists the attempt's outcome and adds it to the run totals.
-func (c *caller) record(ctx context.Context, call ModelCall, run Run) error {
+func (c *caller) record(ctx context.Context, call ModelCall) error {
 	return c.d.store.tx(ctx, c.d.observer, func(t *txn) error {
 		if err := t.updateModelCall(ctx, call); err != nil {
 			return err
 		}
-		if err := t.addRunUsage(ctx, run.ID, call.Usage, call.Cost); err != nil {
+		if err := t.addRunUsage(ctx, c.runID, call.Usage, call.Cost); err != nil {
 			return err
 		}
 		typ := EventModelCompleted
 		if call.Status != CallOK {
 			typ = EventModelFailed
 		}
-		return t.appendEvent(ctx, Event{RunID: c.runID, StepID: c.stepID, At: call.CompletedAt, Type: typ, Payload: mustJSON(map[string]any{
+		return t.appendEvent(ctx, Event{RunID: c.runID, StepID: c.stepID, At: call.CompletedAt, Type: typ, Payload: toJSON(map[string]any{
 			"call_id": call.ID, "attempt": call.Attempt, "status": call.Status, "model": call.Model, "usage": call.Usage, "cost_micros": call.Cost, "latency_ms": call.Latency.Milliseconds(), "error": call.Error,
 		})})
 	})

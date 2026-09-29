@@ -144,19 +144,29 @@ func (o Options) toolUseID(st agentrt.Step) string {
 	return fmt.Sprintf("step_%d", st.Index)
 }
 
-// Messages renders the conversation for one decision. Steps with no
-// recorded decision, which is the step being decided and any step
-// interrupted before it decided, are skipped.
+// Messages renders the conversation for one decision from in.Steps, which
+// the driver fills with the steps before the one being decided. A step
+// with no recorded decision, which is one interrupted before it decided
+// (or the step being decided, if a caller includes it), is skipped and
+// does not count toward the recent-results window.
 func Messages(in agentrt.StepInput, opts Options) []agentrt.Message {
 	if opts.Opening == nil {
 		panic("render: Options.Opening is required")
 	}
 	msgs := []agentrt.Message{{Role: "user", Content: []agentrt.ContentBlock{{Type: "text", Text: opts.Opening(in)}}}}
-	n := len(in.Steps)
-	for i, st := range in.Steps {
+	n := 0
+	for _, st := range in.Steps {
+		if st.Decision != nil {
+			n++
+		}
+	}
+	i := 0
+	for _, st := range in.Steps {
 		if st.Decision == nil {
 			continue
 		}
+		full := i >= n-opts.recent()
+		i++
 		id := opts.toolUseID(st)
 		blocks := synthesize(st, id)
 		if opts.Assistant != nil {
@@ -164,7 +174,6 @@ func Messages(in agentrt.StepInput, opts Options) []agentrt.Message {
 				blocks = custom
 			}
 		}
-		full := i >= n-opts.recent()
 		block := DefaultObservation(st, id, full, opts.maxContent())
 		if opts.Observation != nil {
 			if custom := opts.Observation(st, id, full); custom.Type != "" {
@@ -203,7 +212,7 @@ func synthesize(st agentrt.Step, toolUseID string) []agentrt.ContentBlock {
 // summary; an interrupted observation carries InterruptedText. An
 // Observation hook may call it for the steps it does not format itself.
 func DefaultObservation(st agentrt.Step, toolUseID string, full bool, maxBytes int) agentrt.ContentBlock {
-	if st.Decision.Kind != agentrt.DecideToolCall || st.Decision.Tool == "" || st.Observation == nil {
+	if st.Decision == nil || st.Decision.Kind != agentrt.DecideToolCall || st.Decision.Tool == "" || st.Observation == nil {
 		return agentrt.ContentBlock{Type: "text", Text: nudge(st)}
 	}
 	o := st.Observation
@@ -220,7 +229,11 @@ func DefaultObservation(st agentrt.Step, toolUseID string, full bool, maxBytes i
 // nudge tells the model what was wrong with a reply that asked for nothing
 // executable, keyed on the recorded decision kind.
 func nudge(st agentrt.Step) string {
-	switch st.Decision.Kind {
+	var kind agentrt.DecisionKind
+	if st.Decision != nil {
+		kind = st.Decision.Kind
+	}
+	switch kind {
 	case agentrt.KindNoToolCall:
 		return "Your reply contained no executable tool call. Respond with exactly one tool call."
 	case agentrt.KindTruncated:
@@ -233,38 +246,75 @@ func nudge(st agentrt.Step) string {
 	return msg + ". Respond with exactly one valid tool call."
 }
 
+// The stop-reason vocabulary provider adapters map onto, and Decide reads.
+const (
+	StopEndTurn   = "end_turn"
+	StopToolUse   = "tool_use"
+	StopMaxTokens = "max_tokens"
+	StopRefusal   = "refusal"
+	// StopContextWindowExceeded means the request no longer fits the
+	// model's context window.
+	StopContextWindowExceeded = "model_context_window_exceeded"
+)
+
 // Decide maps a model response onto a decision. A refusal fails the run,
-// because a model that declined will decline again. A reply cut off by the
-// output cap and a reply with no tool use become the deliberately invalid
-// kinds agentrt.KindTruncated and agentrt.KindNoToolCall: the driver
-// records an invalid_decision observation and Messages nudges on the next
-// step, which costs one step against the limits and never executes a
-// partial tool call.
+// because a model that declined will decline again; so does a request
+// over the context window, which only grows. A reply cut off by the
+// output cap, even one carrying a complete tool use, and a reply with no
+// tool use become the deliberately invalid kinds agentrt.KindTruncated and
+// agentrt.KindNoToolCall: the driver records an invalid_decision
+// observation and Messages nudges on the next step, which costs one step
+// against the limits and never executes a partial tool call. The reason
+// recorded from the model's text is capped at ReasonBytes. Only the first
+// tool use executes; when there are more, the reason says how many were
+// not executed and names them.
 func Decide(resp agentrt.ModelResponse) agentrt.Decision {
 	switch resp.StopReason {
-	case "refusal":
+	case StopRefusal:
 		return agentrt.Decision{Kind: agentrt.DecideFail, Message: "the model declined to continue (refusal)"}
-	case "max_tokens":
+	case StopContextWindowExceeded:
+		return agentrt.Decision{Kind: agentrt.DecideFail, Message: "the conversation no longer fits the model's context window (" + StopContextWindowExceeded + ")"}
+	case StopMaxTokens:
 		return agentrt.Decision{Kind: agentrt.KindTruncated, Reason: "the reply hit the output token cap; the tool call was not executed"}
 	}
-	text := strings.TrimSpace(resp.Text)
+	text := Truncate(strings.TrimSpace(resp.Text), ReasonBytes)
 	if len(resp.ToolUses) == 0 {
 		return agentrt.Decision{Kind: agentrt.KindNoToolCall, Reason: text}
 	}
 	tu := resp.ToolUses[0]
-	return agentrt.Decision{Kind: agentrt.DecideToolCall, Tool: tu.Name, Args: orEmptyObject(tu.Args), Reason: Truncate(text, ReasonBytes)}
+	if rest := resp.ToolUses[1:]; len(rest) > 0 {
+		names := make([]string, len(rest))
+		for i, r := range rest {
+			names[i] = r.Name
+		}
+		note := fmt.Sprintf("[%d further tool call(s) not executed: %s]", len(rest), strings.Join(names, ", "))
+		if text != "" {
+			note = " " + note
+		}
+		text += note
+	}
+	return agentrt.Decision{Kind: agentrt.DecideToolCall, Tool: tu.Name, Args: orEmptyObject(tu.Args), Reason: text}
 }
 
-// Truncate shortens s to at most n bytes without splitting a character
-// and marks the cut.
+// Truncate shortens s to at most n bytes, the "…" that marks the cut
+// included, without splitting a character. When n is too small for the
+// mark the cut is unmarked; a negative n is zero.
 func Truncate(s string, n int) string {
+	if n < 0 {
+		n = 0
+	}
 	if len(s) <= n {
 		return s
 	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
+	mark := "…"
+	cut := n - len(mark)
+	if cut < 0 {
+		cut, mark = n, ""
 	}
-	return s[:n] + "…"
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + mark
 }
 
 func orEmptyObject(raw json.RawMessage) json.RawMessage {

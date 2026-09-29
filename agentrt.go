@@ -13,7 +13,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 )
 
@@ -84,7 +83,10 @@ type Limits struct {
 	// ones. Zero means unlimited.
 	MaxModelCalls int `json:"max_model_calls,omitempty"`
 	// MaxOutputTokensPerCall caps each request's output. Zero leaves the
-	// agent's value.
+	// agent's value. A token or cost limit projects each call's output at
+	// its cap, so under either limit a request must carry a cap, from this
+	// field or its own MaxOutputTokens; one with neither is refused before
+	// dispatch as limit_tokens or limit_cost, because it cannot be bounded.
 	MaxOutputTokensPerCall int `json:"max_output_tokens_per_call,omitempty"`
 	// MaxTotalTokens and MaxEstimatedCost are estimated limits: they are
 	// checked before each call against totals plus a conservative estimate
@@ -389,7 +391,12 @@ const (
 	// ReconcileCompleted means the interrupted operation had already
 	// succeeded; the run completes with Result and no further decision.
 	ReconcileCompleted ReconcileOutcome = "completed"
-	// ReconcileWaiting means the run must wait for an approval again.
+	// ReconcileWaiting means the interrupted request must wait for an
+	// approval again. Reconciliation.Pause carries the require_approval
+	// decision to pause on; the interrupted step returns to
+	// awaiting_approval with a new hash-bound approval, and Resume executes
+	// it once approved. Without Pause, or with no interrupted tool call to
+	// pause, the run fails as reconcile_conflict.
 	ReconcileWaiting ReconcileOutcome = "waiting"
 	// ReconcileConflict means external state contradicts the record; the
 	// run fails with reconcile_conflict and Detail.
@@ -397,10 +404,14 @@ const (
 )
 
 // Reconciliation is the structured result of a consumer's reconciliation.
+// An Outcome outside the four above fails the run as internal_error.
 type Reconciliation struct {
 	Outcome ReconcileOutcome
 	Result  json.RawMessage
 	Detail  string
+	// Pause applies to ReconcileWaiting: the require_approval decision the
+	// interrupted request pauses on, as a policy would return it.
+	Pause *PolicyDecision
 }
 
 // Event is one row of the append-only audit log.
@@ -439,10 +450,14 @@ const (
 // Observer receives every event after it has been committed.
 type Observer func(Event)
 
-func mustJSON(v any) json.RawMessage {
+// toJSON marshals a value the runtime builds itself for an event payload or
+// a stored column. Consumer JSON is checked by checkJSON where it enters,
+// so a failure here is a runtime bug; it is recorded as an error object
+// rather than panicking with a transaction open.
+func toJSON(v any) json.RawMessage {
 	b, err := json.Marshal(v)
 	if err != nil {
-		panic(fmt.Sprintf("agentrt: marshal: %v", err))
+		b, _ = json.Marshal(map[string]string{"marshal_error": err.Error()})
 	}
 	return b
 }

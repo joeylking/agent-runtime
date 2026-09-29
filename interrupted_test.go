@@ -2,6 +2,7 @@ package agentrt
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -120,7 +121,13 @@ func TestResume_ReconcileOutcomes(t *testing.T) {
 	}{
 		"completed": {Reconciliation{Outcome: ReconcileCompleted, Result: []byte(`{"pr":1}`), Detail: "already published"}, StatusCompleted, ReasonGoalCompleted},
 		"conflict":  {Reconciliation{Outcome: ReconcileConflict, Detail: "remote ref differs"}, StatusFailed, ReasonReconcileConflict},
-		"waiting":   {Reconciliation{Outcome: ReconcileWaiting}, StatusWaitingForApproval, ""},
+		"waiting":   {Reconciliation{Outcome: ReconcileWaiting, Pause: &PolicyDecision{Outcome: RequireApproval, Kind: "republish", Capability: []byte(`{"tool":"publish"}`)}}, StatusWaitingForApproval, ""},
+		// Waiting on nothing would leave a run only Cancel can close.
+		"waiting without a decision": {Reconciliation{Outcome: ReconcileWaiting, Detail: "remote unknown"}, StatusFailed, ReasonReconcileConflict},
+		"waiting on an allow":        {Reconciliation{Outcome: ReconcileWaiting, Pause: &PolicyDecision{Outcome: Allow}}, StatusFailed, ReasonInternalError},
+		"unknown outcome":            {Reconciliation{Outcome: "retry"}, StatusFailed, ReasonInternalError},
+		"empty outcome":              {Reconciliation{}, StatusFailed, ReasonInternalError},
+		"unusable result":            {Reconciliation{Outcome: ReconcileCompleted, Result: []byte(`{"pr":`)}, StatusFailed, ReasonInternalError},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -141,12 +148,72 @@ func TestResume_ReconcileOutcomes(t *testing.T) {
 			if got.Status != tc.status || got.Reason != tc.reason {
 				t.Fatalf("run = %s/%s, want %s/%s", got.Status, got.Reason, tc.status, tc.reason)
 			}
-			if tc.rec.Outcome == ReconcileCompleted && string(got.Result) != `{"pr":1}` {
+			if tc.status == StatusCompleted && string(got.Result) != `{"pr":1}` {
 				t.Fatalf("result = %s", got.Result)
 			}
 			if publish.calls != 0 {
 				t.Fatal("interrupted remote step was re-executed")
 			}
 		})
+	}
+}
+
+// ReconcileWaiting pauses the interrupted request on the consumer's
+// decision through the ordinary pause, with its events, so Approve and
+// Resume then execute it like any other approved request.
+func TestResume_ReconcileWaitingPausesTheInterruptedRequest(t *testing.T) {
+	store, _ := OpenStore(":memory:")
+	defer store.Close()
+	interruptedRun(t, store)
+	ctx := context.Background()
+	publish := &stubTool{spec: ToolSpec{Name: "publish", Description: "p", InputSchema: []byte(`{"type":"object"}`), SideEffect: RemoteMutation, Timeout: time.Second}}
+	agent := &listAgent{decisions: []Decision{{}, {Kind: DecideComplete, Result: []byte(`{}`)}}}
+	pause := PolicyDecision{Outcome: RequireApproval, Reason: "outcome unknown", Kind: "republish", Capability: []byte(`{"tool":"publish"}`), Presentation: []byte(`{"why":"the first attempt was interrupted"}`)}
+	d, err := NewDriver(Config{Store: store, Agent: agent, Policy: DefaultPolicy(), Tools: []Tool{publish},
+		Reconcile: func(context.Context, RunView) (Reconciliation, error) {
+			return Reconciliation{Outcome: ReconcileWaiting, Pause: &pause}, nil
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.Resume(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusWaitingForApproval {
+		t.Fatalf("status = %s/%s %s", got.Status, got.Reason, got.ReasonDetail)
+	}
+	approvals, _ := store.ListApprovals(ctx, "r1")
+	if len(approvals) != 1 || approvals[0].StepID != "s0" || approvals[0].Kind != "republish" || approvals[0].Status != ApprovalPending {
+		t.Fatalf("approvals = %+v", approvals)
+	}
+	steps, _ := store.ListSteps(ctx, "r1")
+	if steps[0].Status != StepAwaitingApproval || steps[0].Policy == nil || steps[0].Policy.Kind != "republish" {
+		t.Fatalf("step = %+v", steps[0])
+	}
+	events, _ := store.ListEvents(ctx, "r1")
+	var types []string
+	for _, e := range events {
+		types = append(types, e.Type)
+	}
+	if want := []string{EventStepInterrupted, EventStepPolicy, EventApprovalRequested}; fmt.Sprint(types) != fmt.Sprint(want) {
+		t.Fatalf("events = %v, want %v", types, want)
+	}
+	if publish.calls != 0 {
+		t.Fatal("executed before approval")
+	}
+	// DefaultPolicy asks for a different approval for this remote
+	// mutation, so the consumer's policy must agree for the grant to run.
+	d2, _ := NewDriver(Config{Store: store, Agent: agent, Tools: []Tool{publish},
+		Policy: PolicyFunc(func(context.Context, ToolRequest, RunView) (PolicyDecision, error) { return pause, nil })})
+	if err := d2.Approve(ctx, "r1", approvals[0].ID, "joey", ""); err != nil {
+		t.Fatal(err)
+	}
+	got, err = d2.Resume(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusCompleted || publish.calls != 1 {
+		t.Fatalf("run = %s/%s calls = %d", got.Status, got.Reason, publish.calls)
 	}
 }

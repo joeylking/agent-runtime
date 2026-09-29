@@ -130,7 +130,7 @@ func TestApproval_ExpiryCancelsRun(t *testing.T) {
 			c.advance(11 * time.Minute)
 			var err error
 			if via == "approve" {
-				// Approve uses wall-clock time; the TTL is long past.
+				// The driver's clock is past the TTL.
 				err = d.Approve(context.Background(), run.ID, approvals[0].ID, "joey", "")
 				if err == nil {
 					t.Fatal("expired approval accepted")

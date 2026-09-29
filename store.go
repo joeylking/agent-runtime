@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 // Store persists runs, steps, and events in SQLite. It is the single
@@ -25,20 +27,52 @@ type Store struct {
 // ErrNotFound is returned when a run does not exist.
 var ErrNotFound = errors.New("agentrt: not found")
 
+// ErrRunState means a run, or one of its steps, is not in the state the
+// operation requires: a second Resume lost the race to the first, a live
+// loop found the run cancelled under it, or an operator acted on a run
+// that is not waiting. Status transitions are compare-and-set inside the
+// transaction that makes them, so exactly one caller wins.
+var ErrRunState = errors.New("agentrt: run is not in the required state")
+
+// ErrNotPending means an approval has already been decided or expired.
+var ErrNotPending = errors.New("agentrt: approval is not pending")
+
+// ErrSchemaVersion means a database's schema is not the one this build of
+// the runtime writes. OpenExisting returns it rather than migrating, and
+// OpenStore returns it for a database a newer build has migrated.
+var ErrSchemaVersion = errors.New("agentrt: database schema version does not match this build")
+
+// dsn builds a modernc.org/sqlite URI for a file path. The driver splits
+// the DSN at its first '?', and SQLite decodes %HH in the path and ends it
+// at '#', so those three characters are escaped. Every transaction begins
+// IMMEDIATE: it takes the write lock up front and waits on busy_timeout,
+// rather than failing when a read-then-write transaction cannot upgrade.
+func dsn(path string, q url.Values) string {
+	escaped := strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23").Replace(path)
+	prefix := "file:"
+	if strings.HasPrefix(escaped, "/") {
+		prefix = "file://" // an empty authority, so a path starting "//" stays a path
+	}
+	return prefix + escaped + "?" + q.Encode()
+}
+
 // OpenStore opens or creates the database at path and applies migrations.
+// Concurrent first opens are safe: the version is read and the migrations
+// applied inside one IMMEDIATE transaction. A database migrated by a newer
+// build is refused with ErrSchemaVersion.
 func OpenStore(path string) (*Store, error) {
-	var dsn string
+	var name string
 	if path == ":memory:" {
-		dsn = "file::memory:?_pragma=foreign_keys(1)"
+		name = "file::memory:?_pragma=foreign_keys(1)&_txlock=immediate"
 	} else {
 		q := url.Values{}
 		q.Add("_pragma", "busy_timeout(5000)")
-		q.Add("_pragma", "journal_mode(WAL)")
 		q.Add("_pragma", "foreign_keys(1)")
 		q.Add("_pragma", "synchronous(NORMAL)")
-		dsn = "file:" + path + "?" + q.Encode()
+		q.Set("_txlock", "immediate")
+		name = dsn(path, q)
 	}
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", name)
 	if err != nil {
 		return nil, fmt.Errorf("agentrt: open store: %w", err)
 	}
@@ -47,6 +81,12 @@ func OpenStore(path string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(0)
 	s := &Store{db: db}
+	if path != ":memory:" {
+		if err := s.useWAL(context.Background()); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	if err := s.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -54,11 +94,98 @@ func OpenStore(path string) (*Store, error) {
 	return s, nil
 }
 
+// useWAL switches the file to WAL mode, which then persists in the file.
+// The switch needs an exclusive lock and SQLite returns SQLITE_BUSY for it
+// without waiting on the busy timeout, so a concurrent first open retries
+// it for as long as the timeout would have waited.
+func (s *Store) useWAL(ctx context.Context) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var mode string
+		err := s.db.QueryRowContext(ctx, `PRAGMA journal_mode=WAL`).Scan(&mode)
+		if err == nil {
+			if !strings.EqualFold(mode, "wal") {
+				return fmt.Errorf("agentrt: open store: journal mode is %s, not wal", mode)
+			}
+			return nil
+		}
+		var se *sqlite.Error
+		if !errors.As(err, &se) || se.Code()&0xff != sqliteBusy || time.Now().After(deadline) {
+			return fmt.Errorf("agentrt: open store: journal mode: %w", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+const sqliteBusy = 5
+
+// OpenExisting opens the database at path without creating or migrating it,
+// which is what an operator's tool wants: a mistyped path is an error, not
+// a new empty database, and a newer binary does not change the schema under
+// the consumer that owns the file. readOnly opens it for reading only; a
+// read-only store never writes to the file.
+func OpenExisting(path string, readOnly bool) (*Store, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("agentrt: open store: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("agentrt: open store: %s is not a regular file", path)
+	}
+	q := url.Values{}
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "foreign_keys(1)")
+	if readOnly {
+		q.Set("mode", "ro")
+	} else {
+		q.Set("mode", "rw")
+		q.Set("_txlock", "immediate")
+	}
+	s, err := openExisting(path, q)
+	var se *sqlite.Error
+	if readOnly && errors.As(err, &se) && se.Code() == sqliteReadonlyDirectory {
+		// A WAL database with no -shm file in a directory this process
+		// cannot write. No writer can be live either, because it would
+		// have had to create the WAL files there, so the file is read as
+		// immutable, which needs no shared-memory file.
+		q.Set("immutable", "1")
+		s, err = openExisting(path, q)
+	}
+	return s, err
+}
+
+const sqliteReadonlyDirectory = 1544 // SQLITE_READONLY_DIRECTORY
+
+func openExisting(path string, q url.Values) (*Store, error) {
+	db, err := sql.Open("sqlite", dsn(path, q))
+	if err != nil {
+		return nil, fmt.Errorf("agentrt: open store: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetConnMaxLifetime(0)
+	var current int
+	if err := db.QueryRowContext(context.Background(), `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&current); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("agentrt: open store: %s is not an agent-runtime database: %w", path, err)
+	}
+	if current != len(migrations) {
+		db.Close()
+		return nil, fmt.Errorf("%w: %s is at version %d, this build writes %d", ErrSchemaVersion, path, current, len(migrations))
+	}
+	return &Store{db: db}, nil
+}
+
 // Close releases the database.
 func (s *Store) Close() error { return s.db.Close() }
 
 // DB exposes the underlying database for consumers that keep their own
 // tables in the same file and for tests. The runtime's tables are its own.
+//
+// The handle shares the store's single connection. A transaction a
+// consumer opens on it holds that connection until it commits or rolls
+// back, so it must not call Store methods or the driver meanwhile. Write
+// transactions begin IMMEDIATE and wait on the busy timeout for another
+// process's writer rather than failing when they upgrade from a read.
 func (s *Store) DB() *sql.DB { return s.db }
 
 var migrations = []string{
@@ -139,30 +266,39 @@ var migrations = []string{
 	ALTER TABLE approvals ADD COLUMN expires_at TEXT NOT NULL DEFAULT '';`,
 }
 
-func (s *Store) migrate(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+func (s *Store) migrate(ctx context.Context) (err error) {
+	// One IMMEDIATE transaction reads the version and applies what is
+	// missing, so a second process opening the same new file waits and
+	// then finds the work done.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("agentrt: migrate: begin: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
 		return fmt.Errorf("agentrt: migrate: %w", err)
 	}
 	var current int
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&current); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&current); err != nil {
 		return fmt.Errorf("agentrt: migrate: %w", err)
 	}
+	if current > len(migrations) {
+		return fmt.Errorf("%w: the database is at version %d, this build knows %d", ErrSchemaVersion, current, len(migrations))
+	}
 	for i := current; i < len(migrations); i++ {
-		tx, err := s.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
 		if _, err := tx.ExecContext(ctx, migrations[i]); err != nil {
-			tx.Rollback()
 			return fmt.Errorf("agentrt: migration %d: %w", i+1, err)
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`, i+1, formatTime(time.Now())); err != nil {
-			tx.Rollback()
-			return err
+			return fmt.Errorf("agentrt: migration %d: %w", i+1, err)
 		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("agentrt: migrate: %w", err)
 	}
 	return nil
 }
@@ -204,7 +340,7 @@ func marshalOpt(v any) string {
 		}
 		return string(x)
 	}
-	return string(mustJSON(v))
+	return string(toJSON(v))
 }
 
 // CreateRun inserts a new run. The caller is responsible for the run.created
@@ -219,9 +355,10 @@ func (s *Store) GetRun(ctx context.Context, id string) (Run, error) {
 	return scanRun(row)
 }
 
-// ListRuns returns every run, newest first.
+// ListRuns returns every run, newest first. Order is insertion order:
+// stored timestamps drop trailing zeros and do not sort as text.
 func (s *Store) ListRuns(ctx context.Context) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros, active_ms FROM runs ORDER BY created_at DESC, id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros, active_ms FROM runs ORDER BY rowid DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -315,7 +452,7 @@ func (s *Store) ListSteps(ctx context.Context, runID string) ([]Step, error) {
 
 // ListModelCalls returns a run's model call attempts in dispatch order.
 func (s *Store) ListModelCalls(ctx context.Context, runID string) ([]ModelCall, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, step_id, attempt, status, model, input_tokens, output_tokens, cached_input_tokens, cost_micros, latency_ms, error, dispatched_at, completed_at FROM model_calls WHERE run_id = ? ORDER BY dispatched_at, id`, runID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, step_id, attempt, status, model, input_tokens, output_tokens, cached_input_tokens, cost_micros, latency_ms, error, dispatched_at, completed_at FROM model_calls WHERE run_id = ? ORDER BY rowid`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -342,7 +479,7 @@ func (s *Store) ListModelCalls(ctx context.Context, runID string) ([]ModelCall, 
 
 // ListApprovals returns a run's approvals in creation order.
 func (s *Store) ListApprovals(ctx context.Context, runID string) ([]Approval, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, step_id, kind, capability_json, presentation_json, request_json, hash, status, created_at, decided_at, decided_by, note, expires_at FROM approvals WHERE run_id = ? ORDER BY created_at, id`, runID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, step_id, kind, capability_json, presentation_json, request_json, hash, status, created_at, decided_at, decided_by, note, expires_at FROM approvals WHERE run_id = ? ORDER BY rowid`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -421,11 +558,21 @@ func (s *Store) tx(ctx context.Context, obs Observer, fn func(t *txn) error) err
 	if err != nil {
 		return err
 	}
+	done := false
+	defer func() {
+		// A panic inside fn must not leave the single connection inside an
+		// open transaction; roll back and let the panic continue.
+		if !done {
+			tx.Rollback()
+		}
+	}()
 	t := &txn{tx: tx}
 	if err := fn(t); err != nil {
+		done = true
 		tx.Rollback()
 		return err
 	}
+	done = true
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -439,18 +586,71 @@ func (s *Store) tx(ctx context.Context, obs Observer, fn func(t *txn) error) err
 
 func (t *txn) insertRun(ctx context.Context, r Run) error {
 	_, err := t.tx.ExecContext(ctx, `INSERT INTO runs (id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.Goal, r.Status, r.Reason, r.ReasonDetail, string(mustJSON(r.Limits)), r.StepCount, formatTime(r.CreatedAt), formatTime(r.StartedAt), formatTime(r.FinishedAt), marshalOpt(r.Result), r.ModelCalls, r.Usage.InputTokens, r.Usage.OutputTokens, r.Usage.CachedInputTokens, int64(r.EstimatedCost))
+		r.ID, r.Goal, r.Status, r.Reason, r.ReasonDetail, string(toJSON(r.Limits)), r.StepCount, formatTime(r.CreatedAt), formatTime(r.StartedAt), formatTime(r.FinishedAt), marshalOpt(r.Result), r.ModelCalls, r.Usage.InputTokens, r.Usage.OutputTokens, r.Usage.CachedInputTokens, int64(r.EstimatedCost))
 	return err
 }
 
-func (t *txn) updateRun(ctx context.Context, r Run) error {
-	res, err := t.tx.ExecContext(ctx, `UPDATE runs SET status=?, reason=?, reason_detail=?, step_count=?, started_at=?, finished_at=?, result_json=?, active_ms=? WHERE id=?`,
-		r.Status, r.Reason, r.ReasonDetail, r.StepCount, formatTime(r.StartedAt), formatTime(r.FinishedAt), marshalOpt(r.Result), r.ActiveTime.Milliseconds(), r.ID)
+// loadRun reads a run inside the transaction, so what it returns is what
+// the transaction's writes apply to, accounting totals included.
+func (t *txn) loadRun(ctx context.Context, id string) (Run, error) {
+	row := t.tx.QueryRowContext(ctx, `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros, active_ms FROM runs WHERE id = ?`, id)
+	return scanRun(row)
+}
+
+// requireRun fails with ErrRunState unless the run is in one of from.
+func (t *txn) requireRun(ctx context.Context, id string, from ...RunStatus) (Run, error) {
+	r, err := t.loadRun(ctx, id)
+	if err != nil {
+		return Run{}, err
+	}
+	for _, f := range from {
+		if r.Status == f {
+			return r, nil
+		}
+	}
+	return r, fmt.Errorf("%w: run %s is %s, not %s", ErrRunState, id, r.Status, statusList(from))
+}
+
+func statusList(ss []RunStatus) string {
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = string(s)
+	}
+	return strings.Join(out, " or ")
+}
+
+// transition moves a run from one of from to r's status, reason, detail,
+// finish time, and result, and fails with ErrRunState when another writer
+// moved it first. It never writes step_count or the accounting columns,
+// which have their own increments.
+func (t *txn) transition(ctx context.Context, r Run, from ...RunStatus) error {
+	if _, err := t.requireRun(ctx, r.ID, from...); err != nil {
+		return err
+	}
+	res, err := t.tx.ExecContext(ctx, `UPDATE runs SET status=?, reason=?, reason_detail=?, finished_at=?, result_json=? WHERE id=?`,
+		r.Status, r.Reason, r.ReasonDetail, formatTime(r.FinishedAt), marshalOpt(r.Result), r.ID)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("agentrt: update run %s: %w", r.ID, ErrNotFound)
+	}
+	return nil
+}
+
+// claimStep advances step_count from index to index+1 on a RUNNING run.
+// A second loop on the same run, or a run cancelled meanwhile, loses.
+func (t *txn) claimStep(ctx context.Context, runID string, index int) error {
+	res, err := t.tx.ExecContext(ctx, `UPDATE runs SET step_count = step_count + 1 WHERE id=? AND status=? AND step_count=?`, runID, StatusRunning, index)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		r, err := t.loadRun(ctx, runID)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: run %s is %s at step %d, cannot start step %d", ErrRunState, runID, r.Status, r.StepCount, index)
 	}
 	return nil
 }
@@ -461,16 +661,38 @@ func (t *txn) insertStep(ctx context.Context, st Step) error {
 	return err
 }
 
-func (t *txn) updateStep(ctx context.Context, st Step) error {
-	res, err := t.tx.ExecContext(ctx, `UPDATE steps SET status=?, decision_json=?, policy_json=?, observation_json=?, observation_hash=?, started_at=?, finished_at=? WHERE id=?`,
-		st.Status, marshalOpt(st.Decision), marshalOpt(st.Policy), marshalOpt(st.Observation), obsHash(st.Observation), formatTime(st.StartedAt), formatTime(st.FinishedAt), st.ID)
+// updateStep writes a step whose stored status is one of from, and fails
+// with ErrRunState when it is not: another writer, such as Cancel, moved
+// the step first.
+func (t *txn) updateStep(ctx context.Context, st Step, from ...StepStatus) error {
+	res, err := t.tx.ExecContext(ctx, `UPDATE steps SET status=?, decision_json=?, policy_json=?, observation_json=?, observation_hash=?, started_at=?, finished_at=? WHERE id=?`+stepGuard(len(from)),
+		append([]any{st.Status, marshalOpt(st.Decision), marshalOpt(st.Policy), marshalOpt(st.Observation), obsHash(st.Observation), formatTime(st.StartedAt), formatTime(st.FinishedAt), st.ID}, stepArgs(from)...)...)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
-		return fmt.Errorf("agentrt: update step %s: %w", st.ID, ErrNotFound)
+		var status string
+		if err := t.tx.QueryRowContext(ctx, `SELECT status FROM steps WHERE id=?`, st.ID).Scan(&status); err != nil {
+			return fmt.Errorf("agentrt: update step %s: %w", st.ID, ErrNotFound)
+		}
+		return fmt.Errorf("%w: step %s is %s", ErrRunState, st.ID, status)
 	}
 	return nil
+}
+
+func stepGuard(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return " AND status IN (?" + strings.Repeat(",?", n-1) + ")"
+}
+
+func stepArgs(from []StepStatus) []any {
+	out := make([]any, len(from))
+	for i, s := range from {
+		out[i] = s
+	}
+	return out
 }
 
 func (t *txn) insertModelCall(ctx context.Context, c ModelCall) error {
@@ -519,7 +741,7 @@ func (t *txn) decideApproval(ctx context.Context, a Approval) error {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
-		return fmt.Errorf("agentrt: approval %s is not pending: %w", a.ID, ErrNotFound)
+		return fmt.Errorf("%w: approval %s", ErrNotPending, a.ID)
 	}
 	return nil
 }

@@ -58,14 +58,19 @@ func (s *Scripted) Generate(_ context.Context, req agentrt.ModelRequest) (agentr
 }
 
 // Key is the replay key of a request: the SHA-256 of its canonical JSON
-// with the model name.
+// with the model name. Numbers keep their literal text, so two requests
+// that differ only in an integer beyond float64 precision have different
+// keys; for every number float64 represents exactly, which is every
+// number in the recordings written before this, the key is unchanged.
 func Key(model string, req agentrt.ModelRequest) (string, error) {
 	b, err := json.Marshal(req)
 	if err != nil {
 		return "", err
 	}
 	var v any
-	if err := json.Unmarshal(b, &v); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
 		return "", err
 	}
 	c, err := json.Marshal(map[string]any{"model": model, "request": v})

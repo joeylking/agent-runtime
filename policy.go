@@ -38,7 +38,7 @@ func (p SideEffectPolicy) Evaluate(_ context.Context, req ToolRequest, _ RunView
 	d := PolicyDecision{Outcome: outcome, Reason: fmt.Sprintf("side effect %s is %s by policy", req.Spec.SideEffect, outcome)}
 	if outcome == RequireApproval {
 		d.Kind = string(req.Spec.SideEffect)
-		d.Capability = mustJSON(map[string]any{"tool": req.Spec.Name, "args": json.RawMessage(orEmptyObject(req.Args))})
+		d.Capability = toJSON(map[string]any{"tool": req.Spec.Name, "args": json.RawMessage(orEmptyObject(req.Args))})
 		d.Presentation = d.Capability
 	}
 	return d, nil

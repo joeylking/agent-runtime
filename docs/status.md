@@ -85,8 +85,8 @@ exists, reference given), **Verified** (a named test exercises it).
 | A raw assistant turn is replayed from the provider's own message, so signed thinking blocks survive a continuation; the block type is configurable | Verified | `TestGenerate_RawAssistantTurnReplaysThinkingBlocks`, `TestGenerate_RawBlockTypeIsTheConfiguredOne` |
 | A synthesized turn sends an empty tool input as `{}`, drops empty text, and never sends an empty message | Verified | `TestGenerate_SynthesizedTurnWithoutRaw` |
 | A refused or truncated Claude turn keeps its usage and loses its tool uses | Verified | `TestGenerate_RefusalAndMaxTokensKeepUsageDropToolUse` |
-| Cache reads are reported as cached input; cache writes, which have no counter, are folded into input at the 1.25 multiple they are billed at | Verified | `TestGenerate_FoldsCacheUsage` |
-| Dated Claude price table keyed by the default prefixed name; local models recorded as free under theirs | Verified | `TestPrices_KeyedByTheDefaultName`, `TestFree_PricesThePrefixedName` in both local adapters |
+| Cache reads are reported as cached input; cache writes, which have no counter, are folded into input at the multiple they are billed at: 1.25 for five-minute writes and 2 for one-hour writes | Verified | `TestGenerate_FoldsCacheUsage`, `TestGenerate_FoldsOneHourCacheWritesAtTwice` |
+| Dated Claude price table keyed by the default prefixed name; local models recorded as free under theirs | Verified | `TestPrices_KeyedByTheDefaultName`, `TestFree_PricesTheReportedName` in both local adapters |
 | No test reaches a provider: the Anthropic adapter runs against an `httptest` fake, and the two live tests skip unless a local server answers and are excluded from CI by the `live` tag | Verified | `providers/anthropic/anthropic_test.go`, `TestLive_ToolUseRoundTrip` in `providers/ollama` and `providers/openai` |
 | A consumer reaches a live run with no code beyond an agent, its tools, and a policy, and an approval stops the run before a change | Implemented | `examples/live` |
 
@@ -133,8 +133,37 @@ exists, reference given), **Verified** (a named test exercises it).
 | The exactly-one pending-approval rule | Verified | `ExamplePendingApproval` |
 | A pinned MCP tool with no operator rule left unregistered, over in-memory transports with no server | Verified | `ExampleLoad` |
 | Pre-1.0 compatibility promise: additive within a minor, release notes name what a minor bump changes, nested modules versioned independently and each naming its core version, forward-only migrations, recordings stable across core versions | Implemented | `README.md`, `docs/roadmap.md` |
-| The core module builds and tests on Go 1.26 and 1.27, with `GOTOOLCHAIN=local` so the older job cannot switch toolchains. The nested modules stay on 1.27 until they re-pin: the core release they require, v0.2.0, declares 1.27, and `go mod tidy` raises their `go` line to match | Implemented | `.github/workflows/ci.yml`, the comment above each nested `go` directive |
+| The core module builds and tests on Go 1.26 and 1.27, with `GOTOOLCHAIN=local` so the older job cannot switch toolchains. Every nested module's `go` line is 1.26, and each requires the core release v0.2.1 | Implemented | `.github/workflows/ci.yml`, the comment above each nested `go` directive |
 | Public roadmap issue, pinned, mirroring the item list with a status per item | Implemented | [#3](https://github.com/joeylking/agent-runtime/issues/3) |
+
+## Core audit fixes
+
+| Capability | Status | Reference |
+|---|---|---|
+| Run and step status transitions are compare-and-set inside their transaction; of two concurrent resumes one executes the approved request and the other gets `ErrRunState` | Verified | `store.go` `transition`, `TestResume_ConcurrentResumeExecutesOnce` |
+| An operator cancel is not overwritten by a live loop: its next write fails and it returns the cancelled run | Verified | `TestCancel_LiveLoopStopsAtItsNextWrite` |
+| One policy-outcome dispatch for the loop and resume; an unknown or empty outcome fails the run as `internal_error` in both | Verified | `driver.go` `apply`, `TestPolicy_UnknownOutcomeFailsLoopAndResume` |
+| Resume evaluates policy while the run is still WAITING and commits the resume, the resume-time `step.policy`, and the tool start together | Verified | `TestResume_CrashAfterResumeKeepsTheApprovedRequest` |
+| A step and the run it ends commit in one transaction: complete, fail, terminal tool, tool abort, policy abort, limits, loop detection | Verified | `driver.go` `settle`, `TestDriver_TerminalToolCommitsWithTheRun` |
+| Every path reads the clock as often and in the order it always has, because a deterministic consumer keys its own records on that sequence | Verified | `TestDriver_ClockReadingsAreStable` |
+| A panic inside a transaction rolls it back and propagates | Verified | `TestStore_PanicInTransactionRollsBack` |
+| Consumer JSON is checked where it enters: arguments or a result that are not usable JSON (malformed, invalid UTF-8, a repeated key) become an `invalid_decision` with the bytes kept as a string; tool content becomes a `tool_error` keeping the bytes; an unusable capability or presentation fails the run as `internal_error` without executing | Verified | `hash.go` `checkJSON`, `TestCheckJSON_RejectsWhatWouldHashLossily`, `TestDriver_UnusableJSONDecisionsAreRecordedInvalid`, `TestDriver_UnusableToolContentIsToolError`, `TestDriver_UnusablePolicyJSONFailsWithoutExecuting` |
+| Active time is maintained only by increments and survives the finish | Verified | `TestLimits_ActiveTimeSurvivesTheFinish` |
+| A tool's outcome and a dispatched model call are recorded even when the caller's context is cancelled, and the cancellation is then returned; a tool that fails because of the cancellation is observed as interrupted | Verified | `TestDriver_CancelledContextAfterToolKeepsTheObservation`, `TestModel_CancelledContextStillRecordsTheCall` |
+| `ReconcileWaiting` pauses the interrupted tool call on `Reconciliation.Pause` through the ordinary pause; without one, or with nothing to pause, the run fails as `reconcile_conflict`; an unknown outcome or unusable result fails it as `internal_error` | Verified | `TestResume_ReconcileWaitingPausesTheInterruptedRequest`, `TestResume_ReconcileOutcomes` |
+| Migrations are read and applied in one IMMEDIATE transaction, the WAL switch is retried, and a database from a newer build is refused with `ErrSchemaVersion` | Verified | `TestStore_ConcurrentFirstOpen`, `TestStore_NewerSchemaRefused` |
+| Lists and the choice of granted approval follow insertion order, not timestamp text | Verified | `TestStore_ListsInInsertionOrder`, `TestResume_GrantedApprovalIsTheLatestInserted` |
+| A path containing `?`, `#`, or `%` opens the file it names; transactions begin IMMEDIATE, so a consumer's read-then-write transaction on `DB()` waits for another writer | Verified | `TestStore_PathWithURICharacters`, `TestStore_ReadThenWriteTransactionWaitsForTheWriter` |
+| `OpenExisting` never creates a file; a read-only store reads a WAL database with a live writer and in a read-only directory without changing the file | Verified | `TestOpenExisting_ReadOnlyNeverWrites` |
+| A `ServedError` is charged at the provider's usage, recorded as an error, and not retried; connection loss is matched by error, not by text | Verified | `TestModel_ServedErrorIsChargedAndNotRetried`, `TestIsConnectionLost_MatchesErrorsNotText` |
+| Concurrent calls in one step reserve against the limits before dispatch | Verified | `TestModel_ConcurrentCallsReserveAgainstTheLimits` |
+| Under a token or cost limit a request with no output cap is refused before dispatch | Verified | `TestModel_UncappedRequestRefusedUnderAProjectedLimit` |
+| Driver `Approve`, `Reject`, `Cancel`, and expiry use the driver's clock; the package functions use the wall clock | Verified | `TestApproval_DriverClockDecidesExpiry` |
+| Operator paths fail with `ErrRunState` or `ErrNotPending` | Verified | `TestErrors_OperatorPathsAreTyped` |
+| The canonical JSON encoder is written out and byte-identical to what the stored hashes were computed with | Verified | `TestCanonicalJSON_MatchesEncodingJSON`, `TestContentHash_Golden` |
+| Replay keys keep numbers' literal text, so large integers do not collide; every existing recording keeps its key | Verified | `TestKey_LargeIntegersDoNotCollide`, `TestKey_Pinned` |
+| `render.Decide` caps the reason on every branch, fails on a context-window overflow, and names the tool calls it did not execute; the stop-reason vocabulary is exported | Verified | `TestDecide_NoToolCallReasonIsCapped`, `TestDecide_ContextWindowExceededFails`, `TestDecide_ExtraToolUsesAreNamed` |
+| The recent-results window counts rendered steps; `DefaultObservation` accepts a step without a decision; `Truncate` never exceeds n bytes | Verified | `TestMessages_RecentWindowCountsRenderedSteps`, `TestDefaultObservation_StepWithoutADecisionIsNudged`, `TestTruncate_NeverExceedsN` |
 
 ## Not implemented
 
