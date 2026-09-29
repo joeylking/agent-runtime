@@ -2,35 +2,162 @@
 
 [![ci](https://github.com/joeylking/agent-runtime/actions/workflows/ci.yml/badge.svg)](https://github.com/joeylking/agent-runtime/actions/workflows/ci.yml)
 
-A small Go runtime for executing tool-using agents under deterministic control.
+agent-runtime is a Go library for running AI agents that take real actions.
+The rules about what an agent may do are enforced by ordinary code, outside
+the AI model, where the model cannot change them.
 
-The model loop is not the point. Any SDK gives you that. This runtime exists for
-the controls around the loop:
+This page starts with the problem and the approach in plain language, for
+any reader. The commands and the API follow, for people who want to build
+on it.
 
-- the agent asks, the runtime decides: every tool request is schema-validated and
-  policy-evaluated before it executes, and the agent has no influence over policy;
-- explicit, persisted state: runs, steps, and an append-only event log in SQLite;
-- hard limits enforced by the driver, not by asking the model to be careful;
-- deterministic testability: the whole loop runs against a scripted agent.
+## The problem
 
-The first consumer is [repo-steward](https://github.com/joeylking/repo-steward), which supplies every
-requirement for the public API. Abstractions are added when it demonstrates the
-need, not before.
+An AI language model produces text. An agent is a program that lets a model
+do more than that. The program gives the model a list of actions it may
+request, called tools, such as reading a file, running a command, or
+sending a message. The model asks for one, the program carries it out and
+shows the model the result, and this repeats until the task is done.
+
+That loop is short to write, and every AI vendor's software kit includes
+one. The hard part begins when the actions are real:
+
+- A model's choice is a prediction. It is usually sensible and sometimes
+  wrong, and the same input can produce a different choice the next time.
+- A model cannot reliably tell instructions from content. Text inside a
+  file or a web page it reads can redirect it. This is called prompt
+  injection.
+- A model can repeat itself, run for hours, and spend money on every
+  request.
+- Afterwards someone has to be able to say what the agent did and who
+  allowed it.
+
+The common defence is to write the rules into the model's instructions:
+never delete files, ask before sending anything. That is a request. The
+model follows it most of the time, and nothing stops it the rest of the
+time.
+
+## The approach
+
+agent-runtime moves the rules out of the model's instructions and into
+code. The model asks and the runtime decides. The model cannot change the
+rules. It is told only the outcome of a request and the reason the policy
+gives, and the agent has no access to the code that applies the rules.
+
+For every action the model requests, the runtime does the same things in
+the same order:
+
+1. **Record the request** exactly as the model made it.
+2. **Check its form** against the tool's declared inputs. A malformed
+   request never runs. The model is told what was wrong.
+3. **Ask the policy**, which is code supplied by the person building the
+   agent. The answer is one of four: allow it, deny it, end the run, or
+   pause until a person approves.
+4. **Run it** if it was allowed, under a time limit, and record the result.
+
+Around that sequence the runtime provides the controls that a real
+deployment needs:
+
+| Control | What it means |
+|---|---|
+| Approvals tied to the exact request | When a run pauses for approval, the person is shown one specific request, and the approval is valid for that request only. It is stored with a fingerprint, called a hash, of the request. If anything differs when the run continues, the approval does not apply. The operator's decision is tied to the same fingerprint, so what was displayed is what gets approved. |
+| Approvals that outlast the process | A paused run is a row in a database. The program can exit, the person can decide the next day, and the run continues from where it stopped. |
+| Limits checked before the fact | Steps, failures in a row, identical requests that keep giving the same result, elapsed time, model calls, tokens, and spend can each be capped. A cap is checked before the next action or request starts, and reaching one ends the run with that reason recorded. |
+| A complete record | Every step, decision, and result is written to a database in the same operation as the change it describes, so the record cannot fall out of step with what happened. |
+| No action repeats on its own | If the program dies in the middle of an action, the runtime records the step as interrupted when the run is resumed. An action that changes something is not run again unless the consumer's own check of the outside world says so or an operator approves it, and the approval states that the first attempt may have taken effect. |
+| One process per run | A run in progress is leased to the process running it. Another process that tries to continue it is refused until the first finishes or its lease expires. |
+| A database only its owner can use | The database file is created so that only its owner can read or write it. One that other users can write is refused, because anyone who can write it could forge an approval. These checks are skipped on Windows. |
+| Repeatable tests | The whole loop runs against a scripted agent or recorded model replies, so tests give the same result every time and never call a paid service. |
+
+## An example
+
+The demo in `examples/mcp` gives a local model access to a folder of files.
+The operator's rules file says which tools are reads and which is a write.
+The example's policy allows reads and sends every write to an operator.
+
+The model reads what it needs, and each read is checked, run, and recorded.
+When it asks to write a file, the run stops. The operator sees the file
+path, the number of lines, and a preview of the content, and approves with
+one command. The run continues and the write happens. The record then shows
+the reads that were allowed, the write that waited, who approved it, and
+the write that ran after the approval.
+
+## Who uses it
+
+- [repo-steward](https://github.com/joeylking/repo-steward) upgrades a
+  dependency of a Go project, repairs what the upgrade broke, and prepares
+  a pull request that a person approves.
+- casework, which is private, investigates a customer support case about
+  access to a paid feature and proposes one fix that an operator approves.
+
+Both supplied the requirements. A feature is added here when one of them
+shows the need for it, and not before.
+
+## What it is not
+
+agent-runtime runs one agent at a time and is a library, not a service. It
+does not coordinate several agents, schedule work, manage prompts, or give
+a model memory. The model loop is not the point either, since any vendor's
+kit has one. This library exists for the controls around the loop.
+
+## Terms used on this page
+
+| Term | Meaning |
+|---|---|
+| Model | The AI language model that chooses the next action. |
+| Agent | The program that asks the model for a decision at each step. |
+| Tool | One action the agent can request. Each tool declares the inputs it accepts and the kind of effect it has: read only, a local change, a remote change, or destructive. |
+| Policy | The rules, written as code, that decide whether a requested action runs. |
+| Run | One execution of an agent toward a goal, from start to a final state. |
+| Step | One decision by the agent and what came of it. |
+| Approval | A person's decision to allow one specific request. |
+| Operator | The person who runs the agent and grants or refuses approvals. |
+| Consumer | A program built on this library, which supplies the agent, the tools, and the policy. |
 
 ## Status
 
-v0.2: the runtime that [repo-steward](https://github.com/joeylking/repo-steward)
-and [casework](https://github.com/joeylking/casework) run on, with the
-packages both rebuilt now shipped here and an MCP adapter that puts any
-server's tools behind the policy ([docs/roadmap.md](docs/roadmap.md) items 1
-and 2). The nested modules are tagged separately with a directory prefix:
-`providers/ollama/v0.1.0`, `providers/anthropic/v0.1.0`,
-`providers/openai/v0.1.0`, `mcp/v0.1.0`. [docs/architecture.md](docs/architecture.md) describes the loop,
-approvals, interruption, and persistence; [docs/status.md](docs/status.md)
-lists every control with the test that verifies it; [docs/decisions](docs/decisions)
-records why it is built this way. The [wiki](https://github.com/joeylking/agent-runtime/wiki)
-covers the same material at length for people using, extending, or evaluating
-the runtime. The API is pre-1.0 and changes when its consumer needs it to.
+The current release is v0.2.1. Both consumers run on v0.2.0, the release
+before it. v0.2.1 includes the packages that both of them had written
+separately, an adapter that puts the tools of any MCP server behind the
+policy, and the groundwork for outside contributors. These are items 1, 2,
+and 8 of the [roadmap](docs/roadmap.md). Items 3 to 6 are not started. Item
+7, writing up the ideas, is ongoing.
+
+This page describes the code in the repository, which is ahead of the
+release. `go get` installs v0.2.1 and the v0.1.1 adapters. Those do not yet
+have the lease on a run, the database only its owner can use, the pause
+after an interrupted action, the approval tied to what was displayed, or the
+adapters' refusal of redirects and of keys over plain http.
+[CHANGELOG.md](CHANGELOG.md) lists every change under Unreleased and begins
+with what an upgrade requires. The three that matter most:
+
+- Stop every older process and every older `agentrt` binary that has the
+  database open before the new version first opens it.
+- Run `chmod 600` on a database that group or others can write. The new
+  version refuses it until then.
+- A consumer that sets no `Config.Reconcile` will see a run pause for an
+  operator when an action was interrupted by a crash.
+
+The next release removes exported symbols, so it will be v0.3.0 and not a
+v0.2 patch.
+
+The provider adapters and the MCP adapter are separate modules inside this
+repository, tagged with a directory prefix: `providers/ollama/v0.1.1`,
+`providers/anthropic/v0.1.1`, `providers/openai/v0.1.1`, and `mcp/v0.1.1`.
+Each requires core v0.2.1.
+
+The API is pre-1.0 and changes when a consumer needs it to.
+
+Where to read more:
+
+- [docs/architecture.md](docs/architecture.md): the loop, approvals,
+  interruption, and persistence.
+- [docs/status.md](docs/status.md): every control with the test that
+  verifies it.
+- [docs/decisions](docs/decisions): why it is built this way.
+- [CHANGELOG.md](CHANGELOG.md): what each release changed and what a
+  consumer has to do about it.
+- [Wiki](https://github.com/joeylking/agent-runtime/wiki): the same material
+  at length, for people using, extending, or evaluating the runtime.
 
 ### Compatibility
 
@@ -42,13 +169,20 @@ Pre-1.0, so the promise is narrow and written down rather than implied:
   which symbols and what to do instead;
 - the nested modules version independently, with their own directory-prefixed
   tags, and each names the core version it requires in its `go.mod`, so
-  upgrading one does not move the others;
+  upgrading one does not move the other nested modules, though it raises the
+  core to the version it requires;
 - the SQLite schema only migrates forward. A newer core opens a database
   written by an older one and applies what is missing; there are no down
-  migrations, so a database is not handed back to an older core;
-- recordings stay valid across core versions. The replay key is the model name
-  and the canonical JSON of the request (`replay.Key`), so a release that
-  changed that shape would invalidate every recording and would say so.
+  migrations, so a database is not handed back to an older core. Processes
+  and operator binaries of an older version are stopped before a newer core
+  first opens a database. The operator command never migrates: it refuses a
+  database whose schema is not its own build's and says which side is newer;
+- the replay key is the model name and the canonical JSON of the request
+  (`replay.Key`), and its shape has not changed. A recording made through
+  `render` stops matching when a release changes what `render` produces for
+  a step in it, and the release notes say when that happens. The unreleased
+  code does this for a reply with more than one tool use and for a reply
+  with no tool use that is longer than 500 bytes.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) is how a change gets in, and
 [SECURITY.md](SECURITY.md) is what the runtime does and does not defend against.
@@ -59,32 +193,36 @@ Every module requires Go 1.26 or later, so the current release and the one
 before it both build them, and CI runs both.
 
 The demo the project leads with is `examples/mcp`: a local model driving the
-stock MCP filesystem server, where reads are allowed and a write stops the run
-until an operator approves that exact call. It needs Node, for
-`npx @modelcontextprotocol/server-filesystem`, an [Ollama](https://ollama.com)
-server holding `qwen3:30b-a3b`, and a workspace, because the example and the
-MCP adapter are nested modules:
+MCP filesystem server, where reads are allowed and a write stops the run
+until an operator approves that exact call. It needs Node, to run the server
+pinned by version and integrity hash in `examples/mcp/package-lock.json`, an
+[Ollama](https://ollama.com) server holding `qwen3:30b-a3b`, and a workspace,
+because the example and the MCP adapter are nested modules:
 
 ```sh
 go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./examples/live ./examples/mcp
+(cd examples/mcp && npm ci --ignore-scripts)   # once: the pinned server, no install scripts
 go run ./examples/mcp pin      # hash the server's tools, print the hints it claims
 go run ./examples/mcp run      # load the operator's rules, run to the first write
-go run ./cmd/agentrt -db <path> approve <run>
+go run ./cmd/agentrt -db <path> approve <run>   # prints the request, then asks
 go run ./examples/mcp run -resume <run>
 go run ./cmd/agentrt -db <path> events <run>
 ```
+
+`approve` prints the waiting request and asks for confirmation when it is run
+at a terminal. In a script it needs `-approval <id>` or `-yes`.
 
 `pin` prints one line per tool with the annotations the server asserts, which
 classify nothing and are only there for the operator to disagree with.
 [`examples/mcp/rules.json`](examples/mcp/rules.json) is the operator's answer:
 four read tools, `write_file` as a local mutation with the server's own
-destructive hint overruled in writing, and the other nine tools the filesystem
+destructive hint overruled in writing, and every other tool the filesystem
 server offers left out, so `run` reports them unclassified and the model never
 sees them. The run then pauses at `write_file` with the path, the line count,
 and a preview of the content, and prints the two commands above with the run id
-and the database filled in. The trail ends with the read that was allowed, the
-write that waited, the operator who granted it, and the call that executed
-after the grant.
+and the database filled in. The trail shows the reads that were allowed, the
+write that waited, the operator who granted it, the write that executed after
+the grant, and the `finish` call that completed the run.
 
 The no-network path is `examples/scripted`, which needs neither a model nor
 Node:
@@ -111,6 +249,22 @@ driver, _ := agentrt.NewDriver(agentrt.Config{
 run, _ := driver.Start(ctx, "goal", agentrt.DefaultLimits())
 ```
 
+A consumer opens a store, which is one SQLite file, builds a driver from
+its agent, policy, and tools, and starts a run toward a goal.
+
+`DefaultPolicy` decides by the kind of effect a tool declares. Tools that
+only read and tools that change local state are allowed. A tool that
+changes something remote pauses for approval. A destructive tool is denied,
+and so is a tool whose kind the policy does not know.
+
+`DefaultLimits` ends a run at 50 steps, at 3 failures in a row, or when the
+same request has produced the same result 3 times in a row. The caps on
+model calls, tokens, spend, and time are off until the consumer sets them.
+
+A spend cap only works for a model in the price table. A model missing from
+the table is counted as free. Model calls are not retried unless
+`ModelConfig.MaxRetries` is set.
+
 ## What a consumer no longer has to write
 
 Both existing consumers rebuilt the same provider plumbing, renderer, trace,
@@ -118,7 +272,9 @@ and operator surface. These packages are in the core module and add no
 dependency beyond the standard library:
 
 - `providers`: transport and HTTP classification for a provider adapter (a
-  timeout returned bare, retryable statuses transient), a bounded body read,
+  timeout or a reply cut off mid-read returned bare, retryable statuses
+  transient with the provider's `Retry-After`), an HTTP client that follows
+  no redirect, a bounded body read, a check that usage numbers are counts,
   tool-use id synthesis, a price lookup that refuses an unpriced paid model,
   and dollar parsing for budgets.
 - `render`: a run's recorded steps to model messages, with synthesized
@@ -127,26 +283,50 @@ dependency beyond the standard library:
   `render.Decide`, which maps a response to a decision and turns a truncated
   or tool-less reply into a deliberately invalid decision the runtime records
   and the next render nudges.
-- `trace`: aligned and JSON Lines observers.
-- `view`: run, step, and approval read models, and the rule for choosing the
-  approval an operator means.
+- `trace`: aligned and JSON Lines observers, and `Sanitize`, which escapes
+  text that could alter what a terminal displays.
+- `view`: run, step, and approval read models, read in bounded pages, and the
+  rule for choosing the approval an operator means.
 
 ```sh
 go run ./cmd/agentrt -db runs.db runs
 go run ./cmd/agentrt -db runs.db show <run>       # steps and the waiting approval
-go run ./cmd/agentrt -db runs.db events <run>     # the audit log, -json for JSONL
-go run ./cmd/agentrt -db runs.db approve <run> -by joey -note "ok"
+go run ./cmd/agentrt -db runs.db events <run>     # the audit log
+go run ./cmd/agentrt -db runs.db -json events <run>   # the same as JSON Lines
+go run ./cmd/agentrt -db runs.db approve <run> -approval <id> -by joey -note "ok"
+go run ./cmd/agentrt -db runs.db reject <run> -approval <id> -note "not this file"
+go run ./cmd/agentrt -db runs.db cancel <run>
 ```
 
-`cmd/agentrt` reads `-db` or `AGENTRT_DB`, prints aligned text or `-json`, and
-exits 0, 1, or 2. It has no `resume`: resuming executes the approved request
-and continues the loop, which needs the consumer's agent, tools, and policy.
+`cmd/agentrt` reads `-db` or `AGENTRT_DB`, prints aligned text or JSON, and
+exits 0, 1, or 2. `-db` and `-json` go before the subcommand. `approve`,
+`reject`, and `cancel` take their own flags before or after the run id.
+`show` and `events` take them after the run id.
 
-A run ends `COMPLETED`, `FAILED` with a terminal reason, or pauses in
-`WAITING_FOR_APPROVAL` on a hash-bound approval that `Approve` and `Resume`
-continue. A `Model` given to the driver is wrapped in an accounting caller
+- It opens an existing database only. It never creates one and never
+  migrates one.
+- `runs`, `show`, and `events` open the database read-only and page their
+  output with `-limit` and `-offset`.
+- In text output, `approve` and `reject` print the waiting request first.
+  They need
+  `-approval <id>`, `-yes`, or a yes typed at a terminal, and the decision
+  applies only if the stored request is still the one that was printed.
+- `-by` is a label recorded as given, not a login. Whoever can write the
+  database can approve.
+- Text output escapes control characters and characters that change how text
+  is displayed, because goals, tool names, and results come from the model
+  and from servers.
+- It has no `resume`: resuming executes the approved request and continues
+  the loop, which needs the consumer's agent, tools, and policy.
+
+A run ends `COMPLETED`, `FAILED` with a terminal reason, or `CANCELLED` when
+an approval is rejected or expires or an operator cancels the run. It pauses
+in `WAITING_FOR_APPROVAL` on a hash-bound approval that `Approve` and `Resume`
+continue. A run in progress is leased to its driver, and `Resume` from another
+process is refused with `ErrRunLeased` until the lease expires. A model configured on the driver is wrapped in an accounting caller
 that agents receive in `StepInput`: it records every attempt, enforces call,
-token, and cost limits before dispatch, and retries transient failures. The
+token, and cost limits before dispatch, and retries transient failures up to
+`ModelConfig.MaxRetries` times. The
 `replay` package provides scripted, recording, and replaying models so tests
 never call a provider.
 
@@ -169,17 +349,37 @@ go get github.com/joeylking/agent-runtime/providers/ollama
 ```
 
 All three implement `agentrt.Model` the same way: a `Config` carrying the
-model id, `New(Config) (*Model, error)`, no streaming, no retries because the
-accounting caller retries and records every attempt, the provider's raw bytes
-on every response, and a stop reason mapped to `tool_use`, `end_turn`,
-`max_tokens`, or `refusal`. A reply that was cut off or refused comes back
+model id, `New(Config) (*Model, error)`, no streaming, no retries of its own
+because retrying is the accounting caller's job and it records every attempt, the provider's raw bytes
+on every response, and a stop reason normalized to `tool_use`, `end_turn`,
+`max_tokens`, or `refusal` where the provider reports one of those, with any
+other value passed through as the provider gave it. A reply that was cut off or refused comes back
 with no tool uses, so a partial call can never execute, and with its usage,
 so the attempt is still charged.
 
+No adapter follows a redirect, because a redirect would carry the key to a
+host the consumer did not choose. A key travels over plain http only to a
+loopback address.
+
+- The Anthropic adapter reads `ANTHROPIC_API_KEY` and nothing else from the
+  environment. It refuses to build without a key. It also refuses a model
+  its price table does not list, unless `Config.Name` is set and the
+  consumer prices that name.
+- The OpenAI adapter reads `OPENAI_API_KEY` only for the default endpoint.
+- The Ollama adapter reads `OLLAMA_HOST` when no host is configured, and
+  nothing else.
+
+Usage that is not a plausible count is refused. The attempt is charged at
+the conservative estimate, the reply is not used, and the run ends as
+`model_unavailable`. Printing or encoding a `Config` or a `Model` redacts the
+key, except a `Config` kept in an unexported field of your own struct and
+printed with `%v`.
+
 `Name()` is `<provider>:<model>` unless the config overrides it, so one price
 table and one recording directory can hold several providers.
-`anthropic.Prices()` prices the paid models; `ollama.Free(...)` and
-`openai.Free(...)` record local ones as free, which is what
+`anthropic.Prices()` prices the paid models; `ollama.Free(m)` and
+`openai.Free(m)` take the built adapters and record their models as free,
+which is what
 `providers.PriceFor` needs to tell a free model from an unpriced one.
 
 No test calls a provider: the Anthropic adapter is exercised against an
@@ -210,7 +410,15 @@ which is the premise of the design:
   tool unless the rule allows the mismatch, which the report records;
 - an operator may override a description, deny a parameter, and fix a
   parameter's value; a denied or fixed parameter is removed from the schema
-  the model sees;
+  the model sees, and a call that supplies one fails;
+- a schema that refers to anything outside itself is refused, so a server
+  cannot make the runtime read a file or fetch a URL;
+- a server started as a child process gets a minimal environment plus the
+  variables the operator names. On Unix it runs in its own process group
+  and is stopped with its descendants on close. It still runs as the
+  operator and can read the operator's files;
+- connecting, initializing, and listing tools are bounded by
+  `ConnectTimeout`, and an HTTP server's redirects are not followed;
 - the model sees `<server>_<tool>` unless the rule renames it, so two servers
   cannot collide;
 - `isError` becomes a tool error the agent must work around, content is
@@ -224,7 +432,7 @@ defer report.Connection.Close()
 
 [ADR 4](docs/decisions/0004-operator-classified-tools.md) records why the class
 is the operator's and why a hint may only refuse. `examples/mcp` is the whole
-thing running: the quick start above is its four commands.
+thing running: the quick start above is its commands.
 
 ## A live run that stops for an operator
 

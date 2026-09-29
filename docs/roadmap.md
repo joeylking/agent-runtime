@@ -120,8 +120,8 @@ HTTP, list its tools, and expose each as an `agentrt.Tool`.
   `isError` becoming an observation failure, and a size cap.
 
 **Out of scope.** Resources, prompts, sampling, elicitation, and the
-server side of MCP. Servers that require `input_required` round trips
-are refused at registration.
+server side of MCP. A server that asks for more input
+during a call has that call refused.
 
 **Done when** `examples/mcp` runs a local model against a stock MCP
 filesystem server with writes requiring approval; the load report shows
@@ -208,6 +208,7 @@ and previous Go release.
 
 Items 1 and 2 shipped in v0.2.0 (core) with the nested modules at
 v0.1.0, and both consumers deleted their copies with their recorded
-replays passing unchanged. Item 8 comes next because it needs no new
-code. Items 3 through 6 follow as consumer evidence arrives; 7 is
+replays passing unchanged. Item 8 shipped in v0.2.1 (core) with the
+nested modules at v0.1.1; it came next because it needed no new code.
+Items 3 through 6 follow as consumer evidence arrives; 7 is
 continuous.

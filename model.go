@@ -256,7 +256,7 @@ type ModelConfig struct {
 	Model       Model
 	Prices      PriceTable
 	CallTimeout time.Duration // per attempt; default 2 minutes
-	MaxRetries  int           // transient retries per Generate; default 2
+	MaxRetries  int           // transient retries per Generate; zero means none
 	Backoff     time.Duration // base backoff; default 1 second
 	// MaxRetryAfter is the longest TransientError.RetryAfter honoured;
 	// default DefaultMaxRetryAfter. A provider that asks for longer ends
