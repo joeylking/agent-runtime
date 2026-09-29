@@ -1,10 +1,12 @@
 package view_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -212,6 +214,123 @@ func TestReject_WrapsApprovalAlreadyDecided(t *testing.T) {
 	// directly through the wrapper, on the id of the approval just decided.
 	if err := view.Reject(ctx, store, nil, runID, a.ID, "joey", "too late"); !errors.Is(err, view.ErrApprovalDecided) {
 		t.Fatalf("err = %v, want ErrApprovalDecided", err)
+	}
+}
+
+// TestApproveShown_RefusesAChangedApproval: a decision bound to a hash
+// that no longer matches the stored approval -- a race between reading the
+// approval and deciding it, or a row a second writer changed -- must not be
+// applied.
+func TestApproveShown_RefusesAChangedApproval(t *testing.T) {
+	store, runID := pausedRun(t)
+	ctx := context.Background()
+	a, err := view.PendingApproval(ctx, store, runID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := view.ApproveShown(ctx, store, nil, runID, a.ID, a.Hash+"-tampered", "joey", ""); !errors.Is(err, agentrt.ErrApprovalChanged) {
+		t.Fatalf("err = %v, want ErrApprovalChanged", err)
+	}
+	// Refused: still pending, decided by nobody.
+	still, err := store.GetApproval(ctx, runID, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if still.Status != agentrt.ApprovalPending {
+		t.Fatalf("a refused ApproveShown must not decide anything: %+v", still)
+	}
+}
+
+// TestApproveShown_AcceptsTheHashActuallyStored: the mirror of the test
+// above, showing the hash binding is not simply broken -- the correct hash
+// is accepted.
+func TestApproveShown_AcceptsTheHashActuallyStored(t *testing.T) {
+	store, runID := pausedRun(t)
+	ctx := context.Background()
+	a, err := view.PendingApproval(ctx, store, runID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := view.ApproveShown(ctx, store, nil, runID, a.ID, a.Hash, "joey", ""); err != nil {
+		t.Fatalf("ApproveShown with the actual hash: %v", err)
+	}
+	decided, err := store.GetApproval(ctx, runID, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decided.Status != agentrt.ApprovalApproved {
+		t.Fatalf("decided = %+v", decided)
+	}
+}
+
+// TestRejectShown_RefusesAChangedApproval is TestApproveShown_Refuses...
+// for RejectShown.
+func TestRejectShown_RefusesAChangedApproval(t *testing.T) {
+	store, runID := pausedRun(t)
+	ctx := context.Background()
+	a, err := view.PendingApproval(ctx, store, runID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := view.RejectShown(ctx, store, nil, runID, a.ID, "wrong-hash", "joey", ""); !errors.Is(err, agentrt.ErrApprovalChanged) {
+		t.Fatalf("err = %v, want ErrApprovalChanged", err)
+	}
+	still, err := store.GetApproval(ctx, runID, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if still.Status != agentrt.ApprovalPending {
+		t.Fatalf("a refused RejectShown must not decide anything: %+v", still)
+	}
+}
+
+// TestBoundValue_TruncatesOnlyOversizedStrings: everything at or under the
+// limit, at any nesting depth, survives unchanged; only a string over the
+// limit is replaced, and it keeps its head and tail.
+func TestBoundValue_TruncatesOnlyOversizedStrings(t *testing.T) {
+	small := map[string]any{"a": "short", "n": 42.0, "nested": map[string]any{"b": "also short"}}
+	got := view.BoundValue(small)
+	if !reflect.DeepEqual(got, small) {
+		t.Fatalf("small value changed: %+v -> %+v", small, got)
+	}
+
+	big := strings.Repeat("x", view.MaxFieldBytes+500)
+	v := map[string]any{"blob": big, "list": []any{big}}
+	bounded := view.BoundValue(v).(map[string]any)
+	got1, ok := bounded["blob"].(string)
+	if !ok || len(got1) >= len(big) || !strings.HasPrefix(got1, "xxxx") || !strings.HasSuffix(got1, "xxxx") {
+		t.Fatalf("blob not truncated with head/tail kept: %q", got1)
+	}
+	if !strings.Contains(got1, "bytes omitted") {
+		t.Fatalf("no omitted-count marker: %q", got1)
+	}
+	list := bounded["list"].([]any)
+	if s, ok := list[0].(string); !ok || len(s) >= len(big) {
+		t.Fatalf("string nested in a slice was not truncated: %+v", list)
+	}
+}
+
+// TestBoundApproval_BoundsTheThreeJSONFields: JSON output for an approval
+// is as bounded as the text an operator reads from the same value.
+func TestBoundApproval_BoundsTheThreeJSONFields(t *testing.T) {
+	big := strings.Repeat("y", view.MaxFieldBytes+10)
+	raw, err := json.Marshal(map[string]string{"v": big})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentrt.Approval{Capability: raw, Presentation: raw, Request: agentrt.ToolRequest{Args: raw}}
+	bounded := view.BoundApproval(a)
+	for name, field := range map[string]json.RawMessage{
+		"Capability":   bounded.Capability,
+		"Presentation": bounded.Presentation,
+		"Request.Args": bounded.Request.Args,
+	} {
+		if bytes.Contains(field, []byte(big)) {
+			t.Fatalf("%s was not bounded: %s", name, field)
+		}
+		if !bytes.Contains(field, []byte("bytes omitted")) {
+			t.Fatalf("%s has no omitted-count marker: %s", name, field)
+		}
 	}
 }
 
