@@ -49,19 +49,20 @@ type StepSummary struct {
 	Summary     string                  `json:"summary,omitempty"`
 }
 
-// Runs summarizes every run, newest first.
+// Runs summarizes every run, newest first, in two queries: the runs, and
+// the pending approvals of every waiting run.
 func Runs(ctx context.Context, store *agentrt.Store) ([]RunSummary, error) {
 	runs, err := store.ListRuns(ctx)
 	if err != nil {
 		return nil, err
 	}
+	pending, err := store.PendingApprovalIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]RunSummary, 0, len(runs))
 	for _, r := range runs {
-		s, err := summarize(ctx, store, r)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, s)
+		out = append(out, summarize(r, pending[r.ID]))
 	}
 	return out, nil
 }
@@ -72,26 +73,63 @@ func Summary(ctx context.Context, store *agentrt.Store, runID string) (RunSummar
 	if err != nil {
 		return RunSummary{}, err
 	}
-	return summarize(ctx, store, run)
+	if run.Status != agentrt.StatusWaitingForApproval {
+		return summarize(run, nil), nil
+	}
+	approvals, err := store.ListApprovals(ctx, runID)
+	if err != nil {
+		return RunSummary{}, err
+	}
+	return summarize(run, pendingIDs(approvals)), nil
 }
 
-func summarize(ctx context.Context, store *agentrt.Store, run agentrt.Run) (RunSummary, error) {
+// RunDetail is one run with its steps and every approval: what a command
+// that shows a run prints.
+type RunDetail struct {
+	Run       RunSummary
+	Steps     []StepSummary
+	Approvals []agentrt.Approval
+}
+
+// Detail reads a run, its steps, and its approvals, each once.
+func Detail(ctx context.Context, store *agentrt.Store, runID string) (RunDetail, error) {
+	run, err := store.GetRun(ctx, runID)
+	if err != nil {
+		return RunDetail{}, err
+	}
+	steps, err := Steps(ctx, store, runID)
+	if err != nil {
+		return RunDetail{}, err
+	}
+	approvals, err := store.ListApprovals(ctx, runID)
+	if err != nil {
+		return RunDetail{}, err
+	}
+	return RunDetail{Run: summarize(run, pendingIDs(approvals)), Steps: steps, Approvals: approvals}, nil
+}
+
+// summarize names the pending approval only for a waiting run with exactly
+// one, the only case in which there is one to name.
+func summarize(run agentrt.Run, pending []string) RunSummary {
 	s := RunSummary{
 		ID: run.ID, Goal: run.Goal, Status: run.Status, Reason: run.Reason, ReasonDetail: run.ReasonDetail,
 		Steps: run.StepCount, CreatedAt: run.CreatedAt, FinishedAt: run.FinishedAt,
 		ModelCalls: run.ModelCalls, Usage: run.Usage, EstimatedCost: run.EstimatedCost,
 	}
-	if run.Status != agentrt.StatusWaitingForApproval {
-		return s, nil
+	if run.Status == agentrt.StatusWaitingForApproval && len(pending) == 1 {
+		s.PendingApprovalID = pending[0]
 	}
-	pending, err := pendingApprovals(ctx, store, run.ID)
-	if err != nil {
-		return RunSummary{}, err
+	return s
+}
+
+func pendingIDs(approvals []agentrt.Approval) []string {
+	var ids []string
+	for _, a := range approvals {
+		if a.Status == agentrt.ApprovalPending {
+			ids = append(ids, a.ID)
+		}
 	}
-	if len(pending) == 1 {
-		s.PendingApprovalID = pending[0].ID
-	}
-	return s, nil
+	return ids
 }
 
 // Steps summarizes a run's steps in index order.

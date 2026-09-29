@@ -22,6 +22,10 @@ import (
 // process restarts.
 type Store struct {
 	db *sql.DB
+	// stmts holds the loop's statements, prepared when a writer opens the
+	// store: preparing is much of a short statement's cost in SQLite. It is
+	// not written after open. A statement not in it is prepared per call.
+	stmts map[string]*sql.Stmt
 }
 
 // ErrNotFound is returned when a run does not exist.
@@ -91,7 +95,41 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := s.prepare(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return s, nil
+}
+
+// The statements the loop runs at every step.
+const (
+	sqlSelectRun     = `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros, active_ms FROM runs WHERE id = ?`
+	sqlRunStatus     = `SELECT status FROM runs WHERE id = ?`
+	sqlClaimStep     = `UPDATE runs SET step_count = step_count + 1 WHERE id=? AND status=? AND step_count=?`
+	sqlInsertStep    = `INSERT INTO steps (id, run_id, idx, status, decision_json, policy_json, observation_json, observation_hash, started_at, finished_at) VALUES (?,?,?,?,?,?,?,?,?,?)`
+	sqlUpdateStep    = `UPDATE steps SET status=?, decision_json=?, policy_json=?, observation_json=?, observation_hash=?, started_at=?, finished_at=? WHERE id=?`
+	sqlAddActiveTime = `UPDATE runs SET active_ms = active_ms + ? WHERE id=?`
+	sqlAppendEvent   = `INSERT INTO events (run_id, step_id, at, type, payload_json) VALUES (?,?,?,?,?) RETURNING seq`
+)
+
+func (s *Store) prepare(ctx context.Context) error {
+	s.stmts = map[string]*sql.Stmt{}
+	for _, q := range []string{sqlSelectRun, sqlRunStatus, sqlClaimStep, sqlInsertStep, sqlUpdateStep + stepGuard(1), sqlAddActiveTime, sqlAppendEvent} {
+		st, err := s.db.PrepareContext(ctx, q)
+		if err != nil {
+			s.closeStmts()
+			return fmt.Errorf("agentrt: open store: prepare: %w", err)
+		}
+		s.stmts[q] = st
+	}
+	return nil
+}
+
+func (s *Store) closeStmts() {
+	for _, st := range s.stmts {
+		st.Close()
+	}
 }
 
 // useWAL switches the file to WAL mode, which then persists in the file.
@@ -176,7 +214,10 @@ func openExisting(path string, q url.Values) (*Store, error) {
 }
 
 // Close releases the database.
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	s.closeStmts()
+	return s.db.Close()
+}
 
 // DB exposes the underlying database for consumers that keep their own
 // tables in the same file and for tests. The runtime's tables are its own.
@@ -351,8 +392,10 @@ func (s *Store) CreateRun(ctx context.Context, r Run) error {
 
 // GetRun loads a run by id.
 func (s *Store) GetRun(ctx context.Context, id string) (Run, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros, active_ms FROM runs WHERE id = ?`, id)
-	return scanRun(row)
+	if st := s.stmts[sqlSelectRun]; st != nil {
+		return scanRun(st.QueryRowContext(ctx, id))
+	}
+	return scanRun(s.db.QueryRowContext(ctx, sqlSelectRun, id))
 }
 
 // ListRuns returns every run, newest first. Order is insertion order:
@@ -409,45 +452,120 @@ func scanRun(sc scanner) (Run, error) {
 
 // ListSteps returns the steps of a run in index order.
 func (s *Store) ListSteps(ctx context.Context, runID string) ([]Step, error) {
+	rows, err := s.listStepRows(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	var out []Step
+	for i := range rows {
+		st, err := rows[i].decode(nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, nil
+}
+
+func (s *Store) listStepRows(ctx context.Context, runID string) ([]stepRow, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, idx, status, decision_json, policy_json, observation_json, started_at, finished_at FROM steps WHERE run_id = ? ORDER BY idx`, runID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Step
+	var out []stepRow
 	for rows.Next() {
-		var st Step
-		var decision, policy, observation, started, finished string
-		if err := rows.Scan(&st.ID, &st.RunID, &st.Index, &st.Status, &decision, &policy, &observation, &started, &finished); err != nil {
+		var r stepRow
+		if err := rows.Scan(&r.id, &r.runID, &r.index, &r.status, &r.decision, &r.policy, &r.observation, &r.started, &r.finished); err != nil {
 			return nil, err
 		}
-		if decision != "" {
-			st.Decision = new(Decision)
-			if err := json.Unmarshal([]byte(decision), st.Decision); err != nil {
-				return nil, err
-			}
-		}
-		if policy != "" {
-			st.Policy = new(PolicyDecision)
-			if err := json.Unmarshal([]byte(policy), st.Policy); err != nil {
-				return nil, err
-			}
-		}
-		if observation != "" {
-			st.Observation = new(Observation)
-			if err := json.Unmarshal([]byte(observation), st.Observation); err != nil {
-				return nil, err
-			}
-		}
-		if st.StartedAt, err = parseTime(started); err != nil {
-			return nil, err
-		}
-		if st.FinishedAt, err = parseTime(finished); err != nil {
-			return nil, err
-		}
-		out = append(out, st)
+		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// stepRow is a step as stored: the columns written and read back.
+type stepRow struct {
+	id, runID                                              string
+	index                                                  int
+	status                                                 StepStatus
+	decision, policy, observation, hash, started, finished string
+	// src are the values the JSON columns were encoded from. The driver
+	// never writes through a step's pointers, it assigns new ones, so a
+	// later write of the same step reuses the text of any it kept.
+	src struct {
+		decision    *Decision
+		policy      *PolicyDecision
+		observation *Observation
+	}
+}
+
+// encodeStep is st as stored. prev, the row last written for the same step,
+// lends the text of the values st still points to.
+func encodeStep(st Step, prev *stepRow) stepRow {
+	r := stepRow{id: st.ID, runID: st.RunID, index: st.Index, status: st.Status, hash: obsHash(st.Observation), started: formatTime(st.StartedAt), finished: formatTime(st.FinishedAt)}
+	r.src.decision, r.src.policy, r.src.observation = st.Decision, st.Policy, st.Observation
+	if prev == nil || prev.id != st.ID {
+		prev = &stepRow{}
+	}
+	if st.Decision != nil && st.Decision == prev.src.decision {
+		r.decision = prev.decision
+	} else {
+		r.decision = marshalOpt(st.Decision)
+	}
+	if st.Policy != nil && st.Policy == prev.src.policy {
+		r.policy = prev.policy
+	} else {
+		r.policy = marshalOpt(st.Policy)
+	}
+	if st.Observation != nil && st.Observation == prev.src.observation {
+		r.observation = prev.observation
+	} else {
+		r.observation = marshalOpt(st.Observation)
+	}
+	return r
+}
+
+// decode is the step as ListSteps reads it. prev and prevStep, the row and
+// step last decoded for the same step, lend the values whose text has not
+// changed; the caller must never write through them.
+func (r *stepRow) decode(prev *stepRow, prevStep *Step) (Step, error) {
+	st := Step{ID: r.id, RunID: r.runID, Index: r.index, Status: r.status}
+	if prev == nil || prevStep == nil || prev.id != r.id {
+		prev, prevStep = &stepRow{}, &Step{}
+	}
+	var err error
+	if r.decision != "" {
+		if st.Decision = prevStep.Decision; r.decision != prev.decision || st.Decision == nil {
+			st.Decision = new(Decision)
+			if err := json.Unmarshal([]byte(r.decision), st.Decision); err != nil {
+				return Step{}, err
+			}
+		}
+	}
+	if r.policy != "" {
+		if st.Policy = prevStep.Policy; r.policy != prev.policy || st.Policy == nil {
+			st.Policy = new(PolicyDecision)
+			if err := json.Unmarshal([]byte(r.policy), st.Policy); err != nil {
+				return Step{}, err
+			}
+		}
+	}
+	if r.observation != "" {
+		if st.Observation = prevStep.Observation; r.observation != prev.observation || st.Observation == nil {
+			st.Observation = new(Observation)
+			if err := json.Unmarshal([]byte(r.observation), st.Observation); err != nil {
+				return Step{}, err
+			}
+		}
+	}
+	if st.StartedAt, err = parseTime(r.started); err != nil {
+		return Step{}, err
+	}
+	if st.FinishedAt, err = parseTime(r.finished); err != nil {
+		return Step{}, err
+	}
+	return st, nil
 }
 
 // ListModelCalls returns a run's model call attempts in dispatch order.
@@ -477,31 +595,19 @@ func (s *Store) ListModelCalls(ctx context.Context, runID string) ([]ModelCall, 
 	return out, rows.Err()
 }
 
+const approvalColumns = `id, run_id, step_id, kind, capability_json, presentation_json, request_json, hash, status, created_at, decided_at, decided_by, note, expires_at`
+
 // ListApprovals returns a run's approvals in creation order.
 func (s *Store) ListApprovals(ctx context.Context, runID string) ([]Approval, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, step_id, kind, capability_json, presentation_json, request_json, hash, status, created_at, decided_at, decided_by, note, expires_at FROM approvals WHERE run_id = ? ORDER BY rowid`, runID)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+approvalColumns+` FROM approvals WHERE run_id = ? ORDER BY rowid`, runID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Approval
 	for rows.Next() {
-		var a Approval
-		var capability, presentation, request, created, decided, expires string
-		if err := rows.Scan(&a.ID, &a.RunID, &a.StepID, &a.Kind, &capability, &presentation, &request, &a.Hash, &a.Status, &created, &decided, &a.DecidedBy, &a.Note, &expires); err != nil {
-			return nil, err
-		}
-		if a.ExpiresAt, err = parseTime(expires); err != nil {
-			return nil, err
-		}
-		a.Capability, a.Presentation = json.RawMessage(capability), json.RawMessage(presentation)
-		if err := json.Unmarshal([]byte(request), &a.Request); err != nil {
-			return nil, err
-		}
-		if a.CreatedAt, err = parseTime(created); err != nil {
-			return nil, err
-		}
-		if a.DecidedAt, err = parseTime(decided); err != nil {
+		a, err := scanApproval(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, a)
@@ -509,18 +615,68 @@ func (s *Store) ListApprovals(ctx context.Context, runID string) ([]Approval, er
 	return out, rows.Err()
 }
 
-// GetApproval loads one approval.
+// GetApproval loads one approval of a run.
 func (s *Store) GetApproval(ctx context.Context, runID, id string) (Approval, error) {
-	all, err := s.ListApprovals(ctx, runID)
+	a, err := scanApproval(s.db.QueryRowContext(ctx, `SELECT `+approvalColumns+` FROM approvals WHERE id = ? AND run_id = ?`, id, runID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Approval{}, ErrNotFound
+	}
+	return a, err
+}
+
+// PendingApprovalIDs maps each run waiting for approval to the ids of its
+// pending approvals, in creation order, in one query. It is what a listing
+// of many runs needs without reading every approval's request.
+func (s *Store) PendingApprovalIDs(ctx context.Context) (map[string][]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT a.run_id, a.id FROM approvals a JOIN runs r ON r.id = a.run_id WHERE a.status = ? AND r.status = ? ORDER BY a.rowid`, ApprovalPending, StatusWaitingForApproval)
 	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var runID, id string
+		if err := rows.Scan(&runID, &id); err != nil {
+			return nil, err
+		}
+		out[runID] = append(out[runID], id)
+	}
+	return out, rows.Err()
+}
+
+// approvalRow is an approval as stored.
+type approvalRow struct {
+	id, runID, stepID, kind, capability, presentation, request, hash string
+	status                                                           ApprovalStatus
+	created, decided, decidedBy, note, expires                       string
+}
+
+func scanApproval(sc scanner) (Approval, error) {
+	var r approvalRow
+	if err := sc.Scan(&r.id, &r.runID, &r.stepID, &r.kind, &r.capability, &r.presentation, &r.request, &r.hash, &r.status, &r.created, &r.decided, &r.decidedBy, &r.note, &r.expires); err != nil {
 		return Approval{}, err
 	}
-	for _, a := range all {
-		if a.ID == id {
-			return a, nil
-		}
+	return r.decode()
+}
+
+// decode is the approval as ListApprovals reads it.
+func (r *approvalRow) decode() (Approval, error) {
+	a := Approval{ID: r.id, RunID: r.runID, StepID: r.stepID, Kind: r.kind, Hash: r.hash, Status: r.status, DecidedBy: r.decidedBy, Note: r.note}
+	var err error
+	if a.ExpiresAt, err = parseTime(r.expires); err != nil {
+		return Approval{}, err
 	}
-	return Approval{}, ErrNotFound
+	a.Capability, a.Presentation = json.RawMessage(r.capability), json.RawMessage(r.presentation)
+	if err := json.Unmarshal([]byte(r.request), &a.Request); err != nil {
+		return Approval{}, err
+	}
+	if a.CreatedAt, err = parseTime(r.created); err != nil {
+		return Approval{}, err
+	}
+	if a.DecidedAt, err = parseTime(r.decided); err != nil {
+		return Approval{}, err
+	}
+	return a, nil
 }
 
 // ListEvents returns the events of a run in sequence order.
@@ -550,7 +706,14 @@ func (s *Store) ListEvents(ctx context.Context, runID string) ([]Event, error) {
 // observer only after commit.
 type txn struct {
 	tx     *sql.Tx
+	stmts  map[string]*sql.Stmt
 	events []Event
+	// cache, when set, is the loop's copy of the run, whose last written
+	// row lends the text of unchanged fields. steps and approvals are the
+	// rows written, which the driver applies to it after commit.
+	cache     *runCache
+	steps     []stepRow
+	approvals []approvalRow
 }
 
 func (s *Store) tx(ctx context.Context, obs Observer, fn func(t *txn) error) error {
@@ -566,7 +729,7 @@ func (s *Store) tx(ctx context.Context, obs Observer, fn func(t *txn) error) err
 			tx.Rollback()
 		}
 	}()
-	t := &txn{tx: tx}
+	t := &txn{tx: tx, stmts: s.stmts}
 	if err := fn(t); err != nil {
 		done = true
 		tx.Rollback()
@@ -584,6 +747,22 @@ func (s *Store) tx(ctx context.Context, obs Observer, fn func(t *txn) error) err
 	return nil
 }
 
+// exec and queryRow run a statement in the transaction, prepared when the
+// store holds it.
+func (t *txn) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if st := t.stmts[query]; st != nil {
+		return t.tx.StmtContext(ctx, st).ExecContext(ctx, args...)
+	}
+	return t.tx.ExecContext(ctx, query, args...)
+}
+
+func (t *txn) queryRow(ctx context.Context, query string, args ...any) *sql.Row {
+	if st := t.stmts[query]; st != nil {
+		return t.tx.StmtContext(ctx, st).QueryRowContext(ctx, args...)
+	}
+	return t.tx.QueryRowContext(ctx, query, args...)
+}
+
 func (t *txn) insertRun(ctx context.Context, r Run) error {
 	_, err := t.tx.ExecContext(ctx, `INSERT INTO runs (id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.Goal, r.Status, r.Reason, r.ReasonDetail, string(toJSON(r.Limits)), r.StepCount, formatTime(r.CreatedAt), formatTime(r.StartedAt), formatTime(r.FinishedAt), marshalOpt(r.Result), r.ModelCalls, r.Usage.InputTokens, r.Usage.OutputTokens, r.Usage.CachedInputTokens, int64(r.EstimatedCost))
@@ -593,8 +772,7 @@ func (t *txn) insertRun(ctx context.Context, r Run) error {
 // loadRun reads a run inside the transaction, so what it returns is what
 // the transaction's writes apply to, accounting totals included.
 func (t *txn) loadRun(ctx context.Context, id string) (Run, error) {
-	row := t.tx.QueryRowContext(ctx, `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros, active_ms FROM runs WHERE id = ?`, id)
-	return scanRun(row)
+	return scanRun(t.queryRow(ctx, sqlSelectRun, id))
 }
 
 // requireRun fails with ErrRunState unless the run is in one of from.
@@ -603,12 +781,29 @@ func (t *txn) requireRun(ctx context.Context, id string, from ...RunStatus) (Run
 	if err != nil {
 		return Run{}, err
 	}
+	return r, inStatus(id, r.Status, from)
+}
+
+// requireStatus is requireRun for a caller that needs only the check: it
+// reads the status alone.
+func (t *txn) requireStatus(ctx context.Context, id string, from ...RunStatus) error {
+	var status RunStatus
+	if err := t.queryRow(ctx, sqlRunStatus, id).Scan(&status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	return inStatus(id, status, from)
+}
+
+func inStatus(id string, status RunStatus, from []RunStatus) error {
 	for _, f := range from {
-		if r.Status == f {
-			return r, nil
+		if status == f {
+			return nil
 		}
 	}
-	return r, fmt.Errorf("%w: run %s is %s, not %s", ErrRunState, id, r.Status, statusList(from))
+	return fmt.Errorf("%w: run %s is %s, not %s", ErrRunState, id, status, statusList(from))
 }
 
 func statusList(ss []RunStatus) string {
@@ -624,7 +819,7 @@ func statusList(ss []RunStatus) string {
 // moved it first. It never writes step_count or the accounting columns,
 // which have their own increments.
 func (t *txn) transition(ctx context.Context, r Run, from ...RunStatus) error {
-	if _, err := t.requireRun(ctx, r.ID, from...); err != nil {
+	if err := t.requireStatus(ctx, r.ID, from...); err != nil {
 		return err
 	}
 	res, err := t.tx.ExecContext(ctx, `UPDATE runs SET status=?, reason=?, reason_detail=?, finished_at=?, result_json=? WHERE id=?`,
@@ -641,7 +836,7 @@ func (t *txn) transition(ctx context.Context, r Run, from ...RunStatus) error {
 // claimStep advances step_count from index to index+1 on a RUNNING run.
 // A second loop on the same run, or a run cancelled meanwhile, loses.
 func (t *txn) claimStep(ctx context.Context, runID string, index int) error {
-	res, err := t.tx.ExecContext(ctx, `UPDATE runs SET step_count = step_count + 1 WHERE id=? AND status=? AND step_count=?`, runID, StatusRunning, index)
+	res, err := t.exec(ctx, sqlClaimStep, runID, StatusRunning, index)
 	if err != nil {
 		return err
 	}
@@ -655,18 +850,30 @@ func (t *txn) claimStep(ctx context.Context, runID string, index int) error {
 	return nil
 }
 
+func (t *txn) encodeStep(st Step) stepRow {
+	if t.cache == nil {
+		return encodeStep(st, nil)
+	}
+	return encodeStep(st, &t.cache.last)
+}
+
 func (t *txn) insertStep(ctx context.Context, st Step) error {
-	_, err := t.tx.ExecContext(ctx, `INSERT INTO steps (id, run_id, idx, status, decision_json, policy_json, observation_json, observation_hash, started_at, finished_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		st.ID, st.RunID, st.Index, st.Status, marshalOpt(st.Decision), marshalOpt(st.Policy), marshalOpt(st.Observation), obsHash(st.Observation), formatTime(st.StartedAt), formatTime(st.FinishedAt))
-	return err
+	r := t.encodeStep(st)
+	if _, err := t.exec(ctx, sqlInsertStep,
+		r.id, r.runID, r.index, r.status, r.decision, r.policy, r.observation, r.hash, r.started, r.finished); err != nil {
+		return err
+	}
+	t.steps = append(t.steps, r)
+	return nil
 }
 
 // updateStep writes a step whose stored status is one of from, and fails
 // with ErrRunState when it is not: another writer, such as Cancel, moved
 // the step first.
 func (t *txn) updateStep(ctx context.Context, st Step, from ...StepStatus) error {
-	res, err := t.tx.ExecContext(ctx, `UPDATE steps SET status=?, decision_json=?, policy_json=?, observation_json=?, observation_hash=?, started_at=?, finished_at=? WHERE id=?`+stepGuard(len(from)),
-		append([]any{st.Status, marshalOpt(st.Decision), marshalOpt(st.Policy), marshalOpt(st.Observation), obsHash(st.Observation), formatTime(st.StartedAt), formatTime(st.FinishedAt), st.ID}, stepArgs(from)...)...)
+	r := t.encodeStep(st)
+	res, err := t.exec(ctx, sqlUpdateStep+stepGuard(len(from)),
+		append([]any{r.status, r.decision, r.policy, r.observation, r.hash, r.started, r.finished, r.id}, stepArgs(from)...)...)
 	if err != nil {
 		return err
 	}
@@ -677,6 +884,7 @@ func (t *txn) updateStep(ctx context.Context, st Step, from ...StepStatus) error
 		}
 		return fmt.Errorf("%w: step %s is %s", ErrRunState, st.ID, status)
 	}
+	t.steps = append(t.steps, r)
 	return nil
 }
 
@@ -714,7 +922,7 @@ func (t *txn) updateModelCall(ctx context.Context, c ModelCall) error {
 }
 
 func (t *txn) addActiveTime(ctx context.Context, runID string, dur time.Duration) error {
-	_, err := t.tx.ExecContext(ctx, `UPDATE runs SET active_ms = active_ms + ? WHERE id=?`, dur.Milliseconds(), runID)
+	_, err := t.exec(ctx, sqlAddActiveTime, dur.Milliseconds(), runID)
 	return err
 }
 
@@ -729,9 +937,14 @@ func (t *txn) insertApproval(ctx context.Context, a Approval) error {
 	if err != nil {
 		return err
 	}
-	_, err = t.tx.ExecContext(ctx, `INSERT INTO approvals (id, run_id, step_id, kind, capability_json, presentation_json, request_json, hash, status, created_at, decided_at, decided_by, note, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.RunID, a.StepID, a.Kind, string(orEmptyObject(a.Capability)), string(orEmptyObject(a.Presentation)), string(req), a.Hash, a.Status, formatTime(a.CreatedAt), formatTime(a.DecidedAt), a.DecidedBy, a.Note, formatTime(a.ExpiresAt))
-	return err
+	r := approvalRow{id: a.ID, runID: a.RunID, stepID: a.StepID, kind: a.Kind, capability: string(orEmptyObject(a.Capability)), presentation: string(orEmptyObject(a.Presentation)), request: string(req), hash: a.Hash,
+		status: a.Status, created: formatTime(a.CreatedAt), decided: formatTime(a.DecidedAt), decidedBy: a.DecidedBy, note: a.Note, expires: formatTime(a.ExpiresAt)}
+	if _, err := t.tx.ExecContext(ctx, `INSERT INTO approvals (`+approvalColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.id, r.runID, r.stepID, r.kind, r.capability, r.presentation, r.request, r.hash, r.status, r.created, r.decided, r.decidedBy, r.note, r.expires); err != nil {
+		return err
+	}
+	t.approvals = append(t.approvals, r)
+	return nil
 }
 
 func (t *txn) decideApproval(ctx context.Context, a Approval) error {
@@ -757,7 +970,7 @@ func (t *txn) appendEvent(ctx context.Context, e Event) error {
 	if len(e.Payload) == 0 {
 		e.Payload = json.RawMessage("{}")
 	}
-	row := t.tx.QueryRowContext(ctx, `INSERT INTO events (run_id, step_id, at, type, payload_json) VALUES (?,?,?,?,?) RETURNING seq`,
+	row := t.queryRow(ctx, sqlAppendEvent,
 		e.RunID, e.StepID, formatTime(e.At), e.Type, string(e.Payload))
 	if err := row.Scan(&e.Seq); err != nil {
 		return err

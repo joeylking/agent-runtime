@@ -390,18 +390,11 @@ func cmdRuns(ctx context.Context, e *env) error {
 }
 
 func cmdShow(ctx context.Context, e *env, runID string) error {
-	summary, err := view.Summary(ctx, e.store, runID)
+	detail, err := view.Detail(ctx, e.store, runID)
 	if err != nil {
 		return err
 	}
-	steps, err := view.Steps(ctx, e.store, runID)
-	if err != nil {
-		return err
-	}
-	approvals, err := e.store.ListApprovals(ctx, runID)
-	if err != nil {
-		return err
-	}
+	summary, steps, approvals := detail.Run, detail.Steps, detail.Approvals
 	pending := pendingOnly(approvals)
 	if e.json {
 		var waiting *agentrt.Approval

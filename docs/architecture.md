@@ -38,6 +38,11 @@ Each recorded state change takes one reading of `Config.Now`, in an order
 that does not change between releases: a consumer with a deterministic
 clock keys its own records on that sequence.
 
+A loop loads its run's steps and approvals once, when `Start` or `Resume`
+enters it, and keeps them. After each write commits, the loop decodes the
+columns that write stored, so what it keeps equals a fresh load. It still
+reads the run row at every step. `docs/performance.md` has the numbers.
+
 JSON a consumer supplies is checked where it enters: decision arguments
 and results, tool content, and approval capabilities and presentations
 must be one well-formed value, valid UTF-8, with no repeated object key,
@@ -61,7 +66,10 @@ within a step reserve their projection before dispatch, and a request with
 no output cap is refused under a token or cost limit because it cannot be
 projected. A `ServedError` from an adapter is charged at the usage the
 provider reported and not retried. The agent has no handle to the policy
-or the store.
+or the store. The agent and the policy each receive copies: a change
+either makes to what it was handed reaches neither the driver nor the
+other, except a write into a `RawMessage`'s bytes, which only that
+consumer's own later views carry.
 
 ## Approvals
 

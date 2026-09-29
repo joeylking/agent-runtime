@@ -69,6 +69,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -141,7 +142,7 @@ func (o Options) toolUseID(st agentrt.Step) string {
 	if o.ToolUseID != nil {
 		return o.ToolUseID(st)
 	}
-	return fmt.Sprintf("step_%d", st.Index)
+	return "step_" + strconv.Itoa(st.Index)
 }
 
 // Messages renders the conversation for one decision from in.Steps, which
@@ -153,13 +154,18 @@ func Messages(in agentrt.StepInput, opts Options) []agentrt.Message {
 	if opts.Opening == nil {
 		panic("render: Options.Opening is required")
 	}
-	msgs := []agentrt.Message{{Role: "user", Content: []agentrt.ContentBlock{{Type: "text", Text: opts.Opening(in)}}}}
 	n := 0
 	for _, st := range in.Steps {
 		if st.Decision != nil {
 			n++
 		}
 	}
+	msgs := make([]agentrt.Message, 1, 1+2*n)
+	msgs[0] = agentrt.Message{Role: "user", Content: []agentrt.ContentBlock{{Type: "text", Text: opts.Opening(in)}}}
+	// Each turn's blocks are carved from one allocation per role, capped
+	// at the turn's own blocks so that appending to one cannot reach the next.
+	answers := make([]agentrt.ContentBlock, n)
+	turns := make([]agentrt.ContentBlock, 0, 2*n)
 	i := 0
 	for _, st := range in.Steps {
 		if st.Decision == nil {
@@ -168,42 +174,47 @@ func Messages(in agentrt.StepInput, opts Options) []agentrt.Message {
 		full := i >= n-opts.recent()
 		i++
 		id := opts.toolUseID(st)
-		blocks := synthesize(st, id)
+		var blocks []agentrt.ContentBlock
+		turns, blocks = synthesize(turns, st, id)
 		if opts.Assistant != nil {
 			if custom := opts.Assistant(st, id); custom != nil {
 				blocks = custom
 			}
 		}
-		block := DefaultObservation(st, id, full, opts.maxContent())
+		block := &answers[i-1]
+		*block = DefaultObservation(st, id, full, opts.maxContent())
 		if opts.Observation != nil {
 			if custom := opts.Observation(st, id, full); custom.Type != "" {
-				block = custom
+				*block = custom
 			}
 		}
 		msgs = append(msgs,
 			agentrt.Message{Role: "assistant", Content: blocks},
-			agentrt.Message{Role: "user", Content: []agentrt.ContentBlock{block}})
+			agentrt.Message{Role: "user", Content: answers[i-1 : i : i]})
 	}
 	return msgs
 }
 
 // synthesize renders a recorded decision as an assistant turn: the reason
 // as text when there is one, then the tool_use block. A decision that was
-// not a tool call has only its text, because there is nothing to call.
-func synthesize(st agentrt.Step, toolUseID string) []agentrt.ContentBlock {
+// not a tool call has only its text, because there is nothing to call. The
+// turn is appended to dst and returned capped at its own blocks.
+func synthesize(dst []agentrt.ContentBlock, st agentrt.Step, toolUseID string) (rest, turn []agentrt.ContentBlock) {
+	start := len(dst)
 	d := st.Decision
 	if d.Kind != agentrt.DecideToolCall || d.Tool == "" {
 		text := d.Reason
 		if text == "" {
 			text = "(no tool call)"
 		}
-		return []agentrt.ContentBlock{{Type: "text", Text: text}}
+		dst = append(dst, agentrt.ContentBlock{Type: "text", Text: text})
+	} else {
+		if d.Reason != "" {
+			dst = append(dst, agentrt.ContentBlock{Type: "text", Text: d.Reason})
+		}
+		dst = append(dst, agentrt.ContentBlock{Type: "tool_use", ToolUseID: toolUseID, Name: d.Tool, Input: orEmptyObject(d.Args)})
 	}
-	var blocks []agentrt.ContentBlock
-	if d.Reason != "" {
-		blocks = append(blocks, agentrt.ContentBlock{Type: "text", Text: d.Reason})
-	}
-	return append(blocks, agentrt.ContentBlock{Type: "tool_use", ToolUseID: toolUseID, Name: d.Tool, Input: orEmptyObject(d.Args)})
+	return dst, dst[start:len(dst):len(dst)]
 }
 
 // DefaultObservation renders what a step produced, or a nudge when there
@@ -215,13 +226,16 @@ func DefaultObservation(st agentrt.Step, toolUseID string, full bool, maxBytes i
 	if st.Decision == nil || st.Decision.Kind != agentrt.DecideToolCall || st.Decision.Tool == "" || st.Observation == nil {
 		return agentrt.ContentBlock{Type: "text", Text: nudge(st)}
 	}
+	// The content is copied into a string only when it is rendered in full.
 	o := st.Observation
-	content := string(o.Content)
-	if !full || len(content) > maxBytes {
-		content = "[summary] " + o.Summary
-	}
-	if o.Kind == agentrt.ObserveInterrupted {
+	var content string
+	switch {
+	case o.Kind == agentrt.ObserveInterrupted:
 		content = InterruptedText
+	case !full || len(o.Content) > maxBytes:
+		content = "[summary] " + o.Summary
+	default:
+		content = string(o.Content)
 	}
 	return agentrt.ContentBlock{Type: "tool_result", ToolUseID: toolUseID, Content: content, IsError: o.Failure()}
 }

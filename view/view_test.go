@@ -253,3 +253,58 @@ func TestCancel_WrapsADatabaseLockedByAnotherConsumer(t *testing.T) {
 		t.Fatalf("message is not plain prose: %v", err)
 	}
 }
+
+// Runs reads pending approvals for every run in one query; each row equals
+// what Summary, which reads the run's own approvals, says for that run:
+// waiting with one pending approval, waiting with two, cancelled with one
+// left pending, and finished.
+func TestRuns_OneQueryMatchesPerRunSummaries(t *testing.T) {
+	store, _ := pausedRun(t)
+	ctx := context.Background()
+	tools := []agentrt.Tool{newTool("push", agentrt.RemoteMutation)}
+	start := func() string {
+		d, err := agentrt.NewDriver(agentrt.Config{Store: store, Agent: &scripted.Agent{Decisions: []agentrt.Decision{scripted.ToolCall("push", `{"n":1}`, "")}}, Policy: agentrt.DefaultPolicy(), Tools: tools})
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, err := d.Start(ctx, "g", agentrt.Limits{MaxSteps: 5, MaxConsecutiveToolFailures: 3, LoopThreshold: 3})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return run.ID
+	}
+	two := start()
+	if _, err := store.DB().Exec(`INSERT INTO approvals SELECT 'second', run_id, step_id, kind, capability_json, presentation_json, request_json, hash, status, created_at, decided_at, decided_by, note, expires_at FROM approvals WHERE run_id = ?`, two); err != nil {
+		t.Fatal(err)
+	}
+	cancelled := start()
+	if err := agentrt.Cancel(ctx, store, nil, cancelled, "joey", "stop"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := view.Runs(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows = %+v", rows)
+	}
+	named := 0
+	for _, row := range rows {
+		one, err := view.Summary(ctx, store, row.ID)
+		if err != nil || one != row {
+			t.Errorf("Runs row %+v, Summary %+v (%v)", row, one, err)
+		}
+		if row.PendingApprovalID != "" {
+			named++
+		}
+	}
+	if named != 1 {
+		t.Errorf("%d rows name a pending approval, want only the run waiting on exactly one", named)
+	}
+	if _, err := store.GetApproval(ctx, cancelled, "second"); !errors.Is(err, agentrt.ErrNotFound) {
+		t.Errorf("another run's approval: %v, want ErrNotFound", err)
+	}
+	if a, err := store.GetApproval(ctx, two, "second"); err != nil || a.ID != "second" || a.RunID != two {
+		t.Errorf("GetApproval = %+v, %v", a, err)
+	}
+}

@@ -165,6 +165,20 @@ exists, reference given), **Verified** (a named test exercises it).
 | `render.Decide` caps the reason on every branch, fails on a context-window overflow, and names the tool calls it did not execute; the stop-reason vocabulary is exported | Verified | `TestDecide_NoToolCallReasonIsCapped`, `TestDecide_ContextWindowExceededFails`, `TestDecide_ExtraToolUsesAreNamed` |
 | The recent-results window counts rendered steps; `DefaultObservation` accepts a step without a decision; `Truncate` never exceeds n bytes | Verified | `TestMessages_RecentWindowCountsRenderedSteps`, `TestDefaultObservation_StepWithoutADecisionIsNudged`, `TestTruncate_NeverExceedsN` |
 
+## Performance
+
+See `docs/performance.md` for the numbers.
+
+| Capability | Status | Reference |
+|---|---|---|
+| Benchmarks for whole driver runs, rendering, and the run listing | Implemented | `bench_test.go`, `render/bench_test.go`, `view/bench_test.go` |
+| A loop loads its steps and approvals once and keeps them. What the agent and the policy receive, the events, the clock readings, and the stored rows equal the old reread-every-step path, through a pause, a resume, and an interruption | Verified | `cache.go`, `TestDriver_CachedViewEqualsReloadedView` |
+| The kept steps and approvals equal a fresh load after every write; a failed write leaves them unchanged; a rewritten field is decoded again | Verified | `TestDriver_CacheEqualsStoreAfterEveryWrite`, `TestDriver_FailedWriteLeavesCacheUnchanged`, `TestDriver_CacheDecodesRewrittenFields` |
+| The agent and the policy get copies: neither reaches the driver's steps or the other's view | Verified | `TestDriver_ConsumersCannotCorruptEachOther` |
+| `render.Messages` output is byte-identical to the previous implementation; turns that share an allocation stay independent | Verified | `TestMessages_MatchesOracle`, `TestMessages_AppendingToATurnLeavesTheNextAlone` |
+| `view.Runs` reads pending approvals in one query and matches per-run summaries; `GetApproval` is one row and refuses another run's approval | Verified | `Store.PendingApprovalIDs`, `TestRuns_OneQueryMatchesPerRunSummaries` |
+| `show` reads the run, its steps, and its approvals once each | Implemented | `view.Detail`, `cmd/agentrt` `cmdShow` |
+
 ## Not implemented
 
 | Capability | Where it is planned |

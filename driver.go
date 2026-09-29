@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 	"unicode/utf8"
@@ -45,6 +46,12 @@ type Driver struct {
 	reconcile func(ctx context.Context, view RunView) (Reconciliation, error)
 	now       func() time.Time
 	newID     func() string
+	// reload makes the loop load its steps and approvals from the store at
+	// every step and encode every field of each step it writes, as it did
+	// before it kept them; written is called after each write the loop
+	// applies to its cache. Both are for tests.
+	reload  bool
+	written func(*runCache)
 }
 
 // NewDriver validates the configuration and compiles every tool schema.
@@ -158,8 +165,11 @@ func afterEffect(ctx context.Context) (context.Context, context.CancelFunc) {
 
 var running = []RunStatus{StatusRunning}
 
-// loop executes steps until the run leaves RUNNING.
+// loop executes steps until the run leaves RUNNING. It reads the run at
+// every step, because model calls and an operator change it, and loads its
+// steps and approvals once, keeping them as it writes.
 func (d *Driver) loop(ctx context.Context, runID string) (Run, error) {
+	var c *runCache
 	for {
 		run, err := d.store.GetRun(ctx, runID)
 		if err != nil {
@@ -168,42 +178,41 @@ func (d *Driver) loop(ctx context.Context, runID string) (Run, error) {
 		if run.Status != StatusRunning {
 			return run, nil
 		}
-		steps, err := d.store.ListSteps(ctx, runID)
-		if err != nil {
-			return Run{}, err
+		if c == nil || c.stale || d.reload {
+			if c, err = d.load(ctx, runID); err != nil {
+				return Run{}, err
+			}
 		}
-		approvals, err := d.store.ListApprovals(ctx, runID)
-		if err != nil {
-			return Run{}, err
-		}
+		n := len(c.steps)
+		steps := c.steps[:n:n]
 
 		// Limits are checked before a step is started.
 		if run.StepCount >= run.Limits.MaxSteps {
-			return d.settle(ctx, runID, running, ending{status: StatusFailed, reason: ReasonLimitSteps,
+			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: ReasonLimitSteps,
 				detail: fmt.Sprintf("step limit %d reached", run.Limits.MaxSteps), limit: true})
 		}
 		if n := consecutiveFailures(steps); n >= run.Limits.MaxConsecutiveToolFailures {
-			return d.settle(ctx, runID, running, ending{status: StatusFailed, reason: ReasonRepeatedToolFailures,
+			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: ReasonRepeatedToolFailures,
 				detail: fmt.Sprintf("%d consecutive failed steps", n), limit: true})
 		}
 		if l := run.Limits; l.MaxActiveTime > 0 && run.ActiveTime >= l.MaxActiveTime {
-			return d.settle(ctx, runID, running, ending{status: StatusFailed, reason: ReasonLimitActiveTime,
+			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: ReasonLimitActiveTime,
 				detail: fmt.Sprintf("active time %s reached limit %s", run.ActiveTime.Round(time.Millisecond), l.MaxActiveTime), limit: true})
 		}
 		if l := run.Limits; l.MaxElapsedTime > 0 && d.now().Sub(run.CreatedAt) >= l.MaxElapsedTime {
-			return d.settle(ctx, runID, running, ending{status: StatusFailed, reason: ReasonLimitElapsedTime,
+			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: ReasonLimitElapsedTime,
 				detail: fmt.Sprintf("elapsed time reached limit %s", l.MaxElapsedTime), limit: true})
 		}
 		if n, sig := repeatedOutcome(steps); n >= run.Limits.LoopThreshold {
 			at := d.now()
-			return d.settle(ctx, runID, running, ending{status: StatusFailed, reason: ReasonLoopDetected,
+			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: ReasonLoopDetected,
 				detail: fmt.Sprintf("%s produced the same observation %d times in a row", sig.tool, n),
 				pre: func(t *txn) error {
 					return t.appendEvent(ctx, Event{RunID: runID, At: at, Type: EventLoopDetected, Payload: toJSON(map[string]any{"repeats": n, "tool": sig.tool, "args_hash": sig.args, "observation_hash": sig.obs})})
 				}})
 		}
 
-		step, err := d.startStep(ctx, run)
+		step, err := d.startStep(ctx, c, run)
 		if err != nil {
 			return d.lost(ctx, runID, err)
 		}
@@ -213,7 +222,9 @@ func (d *Driver) loop(ctx context.Context, runID string) (Run, error) {
 		if d.model != nil {
 			mc = &caller{d: d, cfg: *d.model, runID: run.ID, stepID: step.ID}
 		}
-		decision, err := d.agent.Decide(ctx, StepInput{Run: run, Steps: steps, Approvals: approvals, Tools: d.specs, Model: mc})
+		in := StepInput{Run: run, Tools: slices.Clone(d.specs), Model: mc}
+		in.Steps, in.Approvals = c.agent.view(c, n)
+		decision, err := d.agent.Decide(ctx, in)
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
 				// Cancelled while deciding: the step stays in flight and
@@ -229,7 +240,7 @@ func (d *Driver) loop(ctx context.Context, runID string) (Run, error) {
 			case errors.As(err, &unavailable):
 				reason = ReasonModelUnavailable
 			}
-			return d.settle(ctx, runID, running, ending{status: StatusFailed, reason: reason, detail: err.Error(), limit: reason != ReasonAgentError,
+			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: reason, detail: err.Error(), limit: reason != ReasonAgentError,
 				step: &step, stepStatus: StepFailed, stepDetail: "agent error: " + err.Error()})
 		}
 
@@ -238,13 +249,13 @@ func (d *Driver) loop(ctx context.Context, runID string) (Run, error) {
 		// JSON that cannot be stored as JSON is kept as a string.
 		recorded := recordable(decision)
 		step.Decision = &recorded
-		if err := d.recordDecision(ctx, &step); err != nil {
+		if err := d.recordDecision(ctx, c, &step); err != nil {
 			return d.lost(ctx, runID, err)
 		}
 
 		if verr := d.validateDecision(decision); verr != nil {
 			obs := observation(ObserveInvalidDecision, map[string]any{"error": verr.Error()}, "invalid decision: "+verr.Error())
-			if err := d.endStep(ctx, &step, StepFailed, &obs, verr.Error()); err != nil {
+			if err := d.endStep(ctx, c, &step, StepFailed, &obs, verr.Error()); err != nil {
 				return d.lost(ctx, runID, err)
 			}
 			continue
@@ -252,17 +263,19 @@ func (d *Driver) loop(ctx context.Context, runID string) (Run, error) {
 
 		switch decision.Kind {
 		case DecideComplete:
-			return d.settle(ctx, runID, running, ending{status: StatusCompleted, reason: ReasonGoalCompleted, result: decision.Result,
+			return d.settle(ctx, c, runID, running, ending{status: StatusCompleted, reason: ReasonGoalCompleted, result: decision.Result,
 				step: &step, stepStatus: StepDone})
 		case DecideFail:
-			return d.settle(ctx, runID, running, ending{status: StatusFailed, reason: ReasonGoalFailed, detail: decision.Message,
+			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: ReasonGoalFailed, detail: decision.Message,
 				step: &step, stepStatus: StepDone})
 		}
 
 		// tool_call
 		req := ToolRequest{RunID: run.ID, StepID: step.ID, Spec: d.tools[decision.Tool].Spec(), Args: orEmptyObject(decision.Args)}
-		pd, perr := d.policy.Evaluate(ctx, req, RunView{Run: run, Steps: steps, Approvals: approvals})
-		if fin, r, err := d.apply(ctx, run, &step, req, pd, perr, nil, time.Time{}); err != nil || fin {
+		view := RunView{Run: run}
+		view.Steps, view.Approvals = c.policy.view(c, n)
+		pd, perr := d.policy.Evaluate(ctx, req, view)
+		if fin, r, err := d.apply(ctx, c, run, &step, req, pd, perr, nil, time.Time{}); err != nil || fin {
 			return r, err
 		}
 	}
@@ -418,7 +431,7 @@ func checkPolicy(pd PolicyDecision) error {
 // runtime always has, one reading per recorded state change, because a
 // consumer with a deterministic clock keys its own records on that
 // sequence. resumedAt is the reading Resume took for run.resumed.
-func (d *Driver) apply(ctx context.Context, run Run, step *Step, req ToolRequest, pd PolicyDecision, perr error, granted *Approval, resumedAt time.Time) (finished bool, out Run, err error) {
+func (d *Driver) apply(ctx context.Context, c *runCache, run Run, step *Step, req ToolRequest, pd PolicyDecision, perr error, granted *Approval, resumedAt time.Time) (finished bool, out Run, err error) {
 	from, suffix := running, ""
 	if granted != nil {
 		from, suffix = []RunStatus{StatusWaitingForApproval}, " on resume"
@@ -433,7 +446,7 @@ func (d *Driver) apply(ctx context.Context, run Run, step *Step, req ToolRequest
 		return true, r, err
 	}
 	settle := func(e ending) (bool, Run, error) {
-		r, err := d.settle(ctx, run.ID, from, e)
+		r, err := d.settle(ctx, c, run.ID, from, e)
 		if err != nil && granted == nil {
 			return fail(err)
 		}
@@ -472,7 +485,7 @@ func (d *Driver) apply(ctx context.Context, run Run, step *Step, req ToolRequest
 			startAt = d.now()
 			step.StartedAt = startAt
 		}
-		if err := d.store.tx(ctx, d.observer, func(t *txn) error {
+		if err := d.write(ctx, c, func(t *txn) error {
 			if err := d.enter(ctx, t, run, granted, resumedAt); err != nil {
 				return err
 			}
@@ -490,11 +503,11 @@ func (d *Driver) apply(ctx context.Context, run Run, step *Step, req ToolRequest
 		}); err != nil {
 			return fail(err)
 		}
-		return d.runTool(ctx, run, step, req)
+		return d.runTool(ctx, c, run, step, req)
 	case pd.Outcome == Deny:
 		obs := observation(ObservePolicyDenied, map[string]any{"tool": req.Spec.Name, "reason": pd.Reason}, "denied"+suffix+": "+pd.Reason)
 		stepAt := d.now()
-		if err := d.store.tx(ctx, d.observer, func(t *txn) error {
+		if err := d.write(ctx, c, func(t *txn) error {
 			if err := d.enter(ctx, t, run, granted, resumedAt); err != nil {
 				return err
 			}
@@ -514,7 +527,7 @@ func (d *Driver) apply(ctx context.Context, run Run, step *Step, req ToolRequest
 		// In the loop this is the first request; on resume the policy now
 		// wants something other than what was granted, so the run pauses
 		// again.
-		r, err := d.pause(ctx, run.ID, step, req, pd, from, policyAt)
+		r, err := d.pause(ctx, c, run.ID, step, req, pd, from, policyAt)
 		if err != nil {
 			return fail(err)
 		}
@@ -531,8 +544,7 @@ func (d *Driver) apply(ctx context.Context, run Run, step *Step, req ToolRequest
 // pass.
 func (d *Driver) enter(ctx context.Context, t *txn, run Run, granted *Approval, now time.Time) error {
 	if granted == nil {
-		_, err := t.requireRun(ctx, run.ID, StatusRunning)
-		return err
+		return t.requireStatus(ctx, run.ID, StatusRunning)
 	}
 	run.Status = StatusRunning
 	if err := t.transition(ctx, run, StatusWaitingForApproval); err != nil {
@@ -547,7 +559,7 @@ func (d *Driver) enter(ctx context.Context, t *txn, run Run, granted *Approval, 
 // The tool has had its effect by the time it returns, so the outcome is
 // recorded even when ctx was cancelled meanwhile; the cancellation is then
 // returned.
-func (d *Driver) runTool(ctx context.Context, run Run, step *Step, req ToolRequest) (bool, Run, error) {
+func (d *Driver) runTool(ctx context.Context, c *runCache, run Run, step *Step, req ToolRequest) (bool, Run, error) {
 	obs, abort := d.execute(ctx, req)
 	rctx, cancel := afterEffect(ctx)
 	defer cancel()
@@ -556,17 +568,17 @@ func (d *Driver) runTool(ctx context.Context, run Run, step *Step, req ToolReque
 	finished := true
 	switch {
 	case abort != nil:
-		out, err = d.settle(rctx, run.ID, running, ending{status: StatusFailed, reason: ReasonToolAbort, detail: abort.Detail,
+		out, err = d.settle(rctx, c, run.ID, running, ending{status: StatusFailed, reason: ReasonToolAbort, detail: abort.Detail,
 			step: step, stepStatus: StepFailed, obs: &obs, stepDetail: obs.Summary})
 	case obs.Failure():
 		finished = false
-		err = d.endStep(rctx, step, StepFailed, &obs, obs.Summary)
+		err = d.endStep(rctx, c, step, StepFailed, &obs, obs.Summary)
 	case req.Spec.Terminal:
-		out, err = d.settle(rctx, run.ID, running, ending{status: StatusCompleted, reason: ReasonGoalCompleted, detail: "terminal tool " + req.Spec.Name, result: obs.Content,
+		out, err = d.settle(rctx, c, run.ID, running, ending{status: StatusCompleted, reason: ReasonGoalCompleted, detail: "terminal tool " + req.Spec.Name, result: obs.Content,
 			step: step, stepStatus: StepDone, obs: &obs})
 	default:
 		finished = false
-		err = d.endStep(rctx, step, StepDone, &obs, "")
+		err = d.endStep(rctx, c, step, StepDone, &obs, "")
 	}
 	if err != nil {
 		r, err := d.lost(ctx, run.ID, err)
@@ -624,10 +636,10 @@ func observation(kind ObservationKind, content any, summary string) Observation 
 }
 
 // startStep claims the next step index of a RUNNING run and records it.
-func (d *Driver) startStep(ctx context.Context, run Run) (Step, error) {
+func (d *Driver) startStep(ctx context.Context, c *runCache, run Run) (Step, error) {
 	now := d.now()
 	step := Step{ID: d.newID(), RunID: run.ID, Index: run.StepCount, Status: StepDeciding, StartedAt: now}
-	err := d.store.tx(ctx, d.observer, func(t *txn) error {
+	err := d.write(ctx, c, func(t *txn) error {
 		if err := t.claimStep(ctx, run.ID, step.Index); err != nil {
 			return err
 		}
@@ -639,10 +651,10 @@ func (d *Driver) startStep(ctx context.Context, run Run) (Step, error) {
 	return step, err
 }
 
-func (d *Driver) recordDecision(ctx context.Context, step *Step) error {
+func (d *Driver) recordDecision(ctx context.Context, c *runCache, step *Step) error {
 	now := d.now()
-	return d.store.tx(ctx, d.observer, func(t *txn) error {
-		if _, err := t.requireRun(ctx, step.RunID, StatusRunning); err != nil {
+	return d.write(ctx, c, func(t *txn) error {
+		if err := t.requireStatus(ctx, step.RunID, StatusRunning); err != nil {
 			return err
 		}
 		if err := t.updateStep(ctx, *step, StepDeciding); err != nil {
@@ -653,10 +665,10 @@ func (d *Driver) recordDecision(ctx context.Context, step *Step) error {
 }
 
 // endStep finishes a step of a RUNNING run without ending the run.
-func (d *Driver) endStep(ctx context.Context, step *Step, status StepStatus, obs *Observation, detail string) error {
+func (d *Driver) endStep(ctx context.Context, c *runCache, step *Step, status StepStatus, obs *Observation, detail string) error {
 	now := d.now()
-	return d.store.tx(ctx, d.observer, func(t *txn) error {
-		if _, err := t.requireRun(ctx, step.RunID, StatusRunning); err != nil {
+	return d.write(ctx, c, func(t *txn) error {
+		if err := t.requireStatus(ctx, step.RunID, StatusRunning); err != nil {
 			return err
 		}
 		return d.endStepTx(ctx, t, step, status, obs, detail, now)
@@ -723,15 +735,15 @@ type ending struct {
 //
 // The step ends at one clock reading and the run at the next, as when
 // they were written separately.
-func (d *Driver) settle(ctx context.Context, runID string, from []RunStatus, e ending) (Run, error) {
+func (d *Driver) settle(ctx context.Context, c *runCache, runID string, from []RunStatus, e ending) (Run, error) {
 	var stepAt time.Time
 	if e.step != nil {
 		stepAt = d.now()
 	}
 	now := d.now()
 	var out Run
-	err := d.store.tx(ctx, d.observer, func(t *txn) error {
-		if _, err := t.requireRun(ctx, runID, from...); err != nil {
+	err := d.write(ctx, c, func(t *txn) error {
+		if err := t.requireStatus(ctx, runID, from...); err != nil {
 			return err
 		}
 		if e.pre != nil {
@@ -777,12 +789,12 @@ func approvalHash(kind string, capability, presentation json.RawMessage, req Too
 // the run, which must be in one of from. The step moves to
 // awaiting_approval from whatever status it holds, and step.policy
 // precedes approval.requested.
-func (d *Driver) pause(ctx context.Context, runID string, step *Step, req ToolRequest, pd PolicyDecision, from []RunStatus, policyAt time.Time) (Run, error) {
+func (d *Driver) pause(ctx context.Context, c *runCache, runID string, step *Step, req ToolRequest, pd PolicyDecision, from []RunStatus, policyAt time.Time) (Run, error) {
 	now := d.now()
 	fromStep := step.Status
 	step.Status, step.Policy = StepAwaitingApproval, &pd
 	var out Run
-	err := d.store.tx(ctx, d.observer, func(t *txn) error {
+	err := d.write(ctx, c, func(t *txn) error {
 		r, err := t.requireRun(ctx, runID, from...)
 		if err != nil {
 			return err
@@ -879,7 +891,7 @@ func decide(ctx context.Context, store *Store, obs Observer, clock func() time.T
 		return err
 	}
 	return store.tx(ctx, obs, func(t *txn) error {
-		if _, err := t.requireRun(ctx, runID, StatusWaitingForApproval); err != nil {
+		if err := t.requireStatus(ctx, runID, StatusWaitingForApproval); err != nil {
 			return err
 		}
 		if err := t.decideApproval(ctx, a); err != nil {
@@ -1049,8 +1061,8 @@ func (d *Driver) resumeApproved(ctx context.Context, run Run) (Run, error) {
 	// Policy is evaluated while the run is still WAITING, so the move to
 	// RUNNING and what the policy decided commit together: a crash between
 	// them cannot drop the approved request.
-	pd, perr := d.policy.Evaluate(ctx, req, RunView{Run: run, Steps: prior, Approvals: approvals})
-	if fin, r, err := d.apply(ctx, run, step, req, pd, perr, granted, resumedAt); err != nil || fin {
+	pd, perr := d.policy.Evaluate(ctx, req, RunView{Run: run, Steps: cloneSteps(prior), Approvals: cloneApprovals(approvals)})
+	if fin, r, err := d.apply(ctx, nil, run, step, req, pd, perr, granted, resumedAt); err != nil || fin {
 		return r, err
 	}
 	return d.loop(ctx, run.ID)
@@ -1076,7 +1088,7 @@ func (d *Driver) resumeInterrupted(ctx context.Context, run Run) (Run, error) {
 	}
 	if len(inFlight) > 0 {
 		if err := d.store.tx(ctx, d.observer, func(t *txn) error {
-			if _, err := t.requireRun(ctx, run.ID, resumable...); err != nil {
+			if err := t.requireStatus(ctx, run.ID, resumable...); err != nil {
 				return err
 			}
 			for _, st := range inFlight {
@@ -1096,25 +1108,25 @@ func (d *Driver) resumeInterrupted(ctx context.Context, run Run) (Run, error) {
 		}
 	}
 	if d.reconcile != nil {
-		rec, err := d.reconcile(ctx, RunView{Run: run, Steps: steps, Approvals: approvals})
+		rec, err := d.reconcile(ctx, RunView{Run: run, Steps: cloneSteps(steps), Approvals: cloneApprovals(approvals)})
 		if err != nil {
-			return d.settle(ctx, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: "reconcile: " + err.Error()})
+			return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: "reconcile: " + err.Error()})
 		}
 		switch rec.Outcome {
 		case ReconcileContinue:
 		case ReconcileCompleted:
 			if len(bytes.TrimSpace(rec.Result)) > 0 {
 				if cerr := checkJSON(rec.Result); cerr != nil {
-					return d.settle(ctx, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: "reconcile: result is not usable JSON: " + cerr.Error()})
+					return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: "reconcile: result is not usable JSON: " + cerr.Error()})
 				}
 			}
-			return d.settle(ctx, run.ID, resumable, ending{status: StatusCompleted, reason: ReasonGoalCompleted, detail: "completed by reconciliation: " + rec.Detail, result: rec.Result})
+			return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusCompleted, reason: ReasonGoalCompleted, detail: "completed by reconciliation: " + rec.Detail, result: rec.Result})
 		case ReconcileConflict:
-			return d.settle(ctx, run.ID, resumable, ending{status: StatusFailed, reason: ReasonReconcileConflict, detail: rec.Detail})
+			return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonReconcileConflict, detail: rec.Detail})
 		case ReconcileWaiting:
 			return d.reconcilePause(ctx, run, inFlight, rec, now)
 		default:
-			return d.settle(ctx, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: fmt.Sprintf("reconcile: unknown outcome %q", rec.Outcome)})
+			return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: fmt.Sprintf("reconcile: unknown outcome %q", rec.Outcome)})
 		}
 	}
 	run.Status = StatusRunning
@@ -1139,16 +1151,16 @@ func (d *Driver) reconcilePause(ctx context.Context, run Run, interrupted []*Ste
 		if rec.Detail != "" {
 			detail += ": " + rec.Detail
 		}
-		return d.settle(ctx, run.ID, resumable, ending{status: StatusFailed, reason: ReasonReconcileConflict, detail: detail})
+		return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonReconcileConflict, detail: detail})
 	}
 	if rec.Pause == nil {
 		return conflict("reconciliation asked to wait but gave no approval to wait for")
 	}
 	if rec.Pause.Outcome != RequireApproval {
-		return d.settle(ctx, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: fmt.Sprintf("reconcile: waiting needs a require_approval decision, got %q", rec.Pause.Outcome)})
+		return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: fmt.Sprintf("reconcile: waiting needs a require_approval decision, got %q", rec.Pause.Outcome)})
 	}
 	if err := checkPolicy(*rec.Pause); err != nil {
-		return d.settle(ctx, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: "reconcile: " + err.Error()})
+		return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: "reconcile: " + err.Error()})
 	}
 	var step *Step
 	for _, st := range interrupted {
@@ -1161,5 +1173,5 @@ func (d *Driver) reconcilePause(ctx context.Context, run Run, interrupted []*Ste
 	}
 	req := ToolRequest{RunID: run.ID, StepID: step.ID, Spec: d.tools[step.Decision.Tool].Spec(), Args: orEmptyObject(step.Decision.Args)}
 	step.Observation, step.FinishedAt = nil, time.Time{}
-	return d.pause(ctx, run.ID, step, req, *rec.Pause, resumable, now)
+	return d.pause(ctx, nil, run.ID, step, req, *rec.Pause, resumable, now)
 }
