@@ -53,7 +53,8 @@ func TestClassifyTransport_EveryClass(t *testing.T) {
 		{"body too large", fmt.Errorf("read: %w", providers.ErrBodyTooLarge), permanent},
 		{"connection refused", &url.Error{Op: "Post", URL: "http://x", Err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}}, transient},
 		{"connection reset", &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}, transient},
-		{"mid-body EOF", io.ErrUnexpectedEOF, transient},
+		{"mid-body EOF", io.ErrUnexpectedEOF, bare},
+		{"wrapped mid-body EOF", fmt.Errorf("read: %w", io.ErrUnexpectedEOF), bare},
 	} {
 		got := providers.ClassifyTransport(tc.err)
 		var tr agentrt.TransientError
@@ -213,8 +214,13 @@ func TestClassifyResponse_CarriesRetryAfter(t *testing.T) {
 	var se providers.StatusError
 	err := providers.ClassifyResponse("openai", resp, []byte("slow down"))
 	var tr agentrt.TransientError
-	if !errors.As(err, &tr) || !errors.As(err, &se) || se.RetryAfter != 7*time.Second {
+	if !errors.As(err, &tr) || !errors.As(err, &se) || se.RetryAfter != 7*time.Second || tr.RetryAfter != 7*time.Second {
 		t.Fatalf("err = %#v", err)
+	}
+	// ClassifyStatus has no header to read, so the delay is absent on both.
+	err = providers.ClassifyStatus("openai", 429, []byte("slow down"))
+	if !errors.As(err, &tr) || !errors.As(err, &se) || se.RetryAfter != 0 || tr.RetryAfter != 0 {
+		t.Fatalf("ClassifyStatus err = %#v", err)
 	}
 	for _, v := range []string{"", "soon", "-3"} {
 		if d := providers.RetryAfter(http.Header{"Retry-After": {v}}); d != 0 {
@@ -223,6 +229,26 @@ func TestClassifyResponse_CarriesRetryAfter(t *testing.T) {
 	}
 	if d := providers.RetryAfter(http.Header{"Retry-After": {time.Now().Add(time.Hour).UTC().Format(http.TimeFormat)}}); d <= 0 || d > time.Hour {
 		t.Fatalf("an HTTP date = %v", d)
+	}
+}
+
+func TestRetryAfter_AbsurdOrNegativeIsAbsent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		v    string
+	}{
+		{"more than an hour in seconds", "3601"},
+		{"negative seconds", "-1"},
+		{"more than an hour as a date", time.Now().Add(time.Hour + time.Minute).UTC().Format(http.TimeFormat)},
+		{"a date already past", time.Now().Add(-time.Minute).UTC().Format(http.TimeFormat)},
+	} {
+		if d := providers.RetryAfter(http.Header{"Retry-After": {tc.v}}); d != 0 {
+			t.Errorf("%s: Retry-After %q = %v, want zero", tc.name, tc.v, d)
+		}
+	}
+	// Exactly one hour in seconds is still honoured.
+	if d := providers.RetryAfter(http.Header{"Retry-After": {"3600"}}); d != time.Hour {
+		t.Fatalf("3600 seconds = %v, want exactly an hour", d)
 	}
 }
 

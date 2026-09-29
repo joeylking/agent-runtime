@@ -34,19 +34,30 @@
 // classifies the tools the server offered when it was written: a server
 // that offers a different set is pinned again and the rules edited, which
 // Load says in as many words rather than silently dropping a tool.
+//
+// SIGINT and SIGTERM cancel pin or run between steps rather than killing the
+// process outright: the MCP connection and the database are closed in
+// whatever state the last committed step left them, and, for run, once a run
+// has actually been recorded, the exact -resume command is printed on
+// stderr before the process exits non-zero.
 package main
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	agentrt "github.com/joeylking/agent-runtime"
@@ -90,10 +101,59 @@ and everything the agent does to it passes the runtime's policy first.
 `
 
 func main() {
-	if err := dispatch(os.Args[1:]); err != nil {
+	// Ctrl-C or a kill must not corrupt the run: cancelling this context
+	// stops the loop between steps, and every deferred Close still runs, so
+	// the database and the MCP connection are both left in a state the run
+	// can be resumed from.
+	ctx, stop := signalContext(context.Background(), signal.Notify)
+	defer stop()
+	if err := dispatch(ctx, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+// signalContext returns a context derived from parent that is cancelled when
+// this process receives SIGINT or SIGTERM, and the stop function that ends
+// the watch early. notify is signal.Notify, taken as a parameter so a test
+// can drive the cancellation itself instead of sending this process a real
+// signal.
+func signalContext(parent context.Context, notify func(chan<- os.Signal, ...os.Signal)) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	sig := make(chan os.Signal, 1)
+	notify(sig, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-sig:
+			cancel()
+		case <-done:
+		}
+	}()
+	var once sync.Once
+	return ctx, func() { once.Do(func() { close(done) }); cancel() }
+}
+
+// newRunID returns a random 128-bit hex identifier, in the same shape the
+// driver generates for itself. The example needs its own, chosen before the
+// call, so that Ctrl-C during Start still leaves it able to print the run
+// that can be resumed: driver.Start returns no run at all when its context
+// is cancelled mid-step.
+func newRunID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("agent-runtime example: crypto/rand unavailable: " + err.Error())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// resumable reports whether a run was actually recorded, so an interrupted
+// run is only offered as resumable when there is something to resume: a
+// signal caught before the first write ever reached the store leaves
+// nothing behind.
+func resumable(ctx context.Context, store *agentrt.Store, runID string) bool {
+	_, err := store.GetRun(ctx, runID)
+	return err == nil
 }
 
 // userCacheDir returns this example's own directory under the OS's
@@ -114,7 +174,7 @@ func userCacheDir() (string, error) {
 
 // dispatch runs one of the two phases. They are separate commands because
 // pinning is something an operator does once, reads, and keeps.
-func dispatch(args []string) error {
+func dispatch(ctx context.Context, args []string) error {
 	cache, err := userCacheDir()
 	if err != nil {
 		return err
@@ -130,7 +190,7 @@ func dispatch(args []string) error {
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		return pin(*dir, *manifest)
+		return pin(ctx, *dir, *manifest)
 	case "run":
 		fs := flag.NewFlagSet("run", flag.ExitOnError)
 		dir := fs.String("dir", filepath.Join(cache, "mcp-sandbox"), "sandbox the server is given, created with a README.md when absent")
@@ -142,7 +202,7 @@ func dispatch(args []string) error {
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		return run(config{dir: *dir, manifest: *manifest, rules: *rules, db: *db, model: *model, resume: *resume})
+		return run(ctx, config{dir: *dir, manifest: *manifest, rules: *rules, db: *db, model: *model, resume: *resume})
 	default:
 		return fmt.Errorf("unknown command %q: use pin or run", args[0])
 	}
@@ -152,8 +212,14 @@ func dispatch(args []string) error {
 // sandbox and nowhere else. The name prefixes what the model sees.
 func server(dir string) mcp.Server {
 	return mcp.Server{
-		Name:           "fs",
-		Command:        []string{"npx", "-y", "@modelcontextprotocol/server-filesystem", dir},
+		Name:    "fs",
+		Command: []string{"npx", "-y", "@modelcontextprotocol/server-filesystem", dir},
+		// npx may still be fetching the package on a first run, which can
+		// take far longer than a live server ever should to answer; a much
+		// shorter bound would make the common first run fail. The session
+		// itself is not shortened by this once connecting, initializing, and
+		// the first listing are done.
+		ConnectTimeout: 2 * time.Minute,
 		DefaultTimeout: 5 * time.Second,
 	}
 }
@@ -161,13 +227,14 @@ func server(dir string) mcp.Server {
 // pin starts the server, records what it presents, and prints one line per
 // tool with the server's own annotations, which is what the operator is
 // classifying against.
-func pin(dir, manifestPath string) error {
+func pin(ctx context.Context, dir, manifestPath string) error {
 	if err := sandbox(dir); err != nil {
 		return err
 	}
-	// Not a bounded context: npx may be fetching the server on the first
-	// run, and the session outlives the call that opened it.
-	m, err := mcp.Pin(context.Background(), server(dir))
+	// Connecting, initializing, and this listing are bounded by
+	// server(dir)'s ConnectTimeout, not by ctx directly; ctx only lets
+	// Ctrl-C cut the wait short.
+	m, err := mcp.Pin(ctx, server(dir))
 	if err != nil {
 		return err
 	}
@@ -218,7 +285,7 @@ type config struct {
 	dir, manifest, rules, db, model, resume string
 }
 
-func run(cfg config) error {
+func run(ctx context.Context, cfg config) error {
 	if err := sandbox(cfg.dir); err != nil {
 		return err
 	}
@@ -249,9 +316,9 @@ func run(cfg config) error {
 		}
 	}
 
-	// Not a bounded context, for the same reason as Pin: the session lives
-	// as long as the run.
-	ctx := context.Background()
+	// Connecting, initializing, and the first listing are bounded by
+	// server(cfg.dir)'s ConnectTimeout, not by ctx directly; the session
+	// Load returns is not shortened by it, and lives as long as the run.
 	tools, report, err := mcp.Load(ctx, server(cfg.dir), manifest, rules)
 	if err != nil {
 		if report != nil {
@@ -276,14 +343,23 @@ func run(cfg config) error {
 	}
 
 	var r agentrt.Run
+	runID := cfg.resume
 	if cfg.resume != "" {
 		r, err = driver.Resume(ctx, cfg.resume)
 	} else {
+		// Chosen here, not left to Start, so a Ctrl-C during the call still
+		// leaves a run id to print below: Start returns none of its own when
+		// interrupted mid-step.
+		runID = newRunID()
 		limits := agentrt.DefaultLimits()
 		limits.MaxSteps, limits.MaxModelCalls, limits.MaxOutputTokensPerCall = 12, 12, maxOutputTokens
-		r, err = driver.Start(ctx, goal, limits)
+		r, err = driver.StartWithID(ctx, runID, goal, limits)
 	}
 	if err != nil {
+		if ctx.Err() != nil && resumable(context.Background(), store, runID) {
+			fmt.Fprintf(os.Stderr, "interrupted; resume with:\n  go run ./examples/mcp run -dir %s -manifest %s -rules %s -db %s -resume %s\n",
+				cfg.dir, cfg.manifest, cfg.rules, cfg.db, runID)
+		}
 		return err
 	}
 	// The run returned by a pause predates the last step's accounting, so

@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
+
+	agentrt "github.com/joeylking/agent-runtime"
 )
 
 // TestUserCacheDir_IsCreatedPerUserOnly: the sandbox, the manifest, and the
@@ -95,11 +99,88 @@ func TestDispatch_DefaultPathsAreUnderTheCacheDirectory(t *testing.T) {
 	// dispatch("run") resolves its flag defaults (which creates the cache
 	// directory) and only then reads the manifest pin writes; with none on
 	// disk it fails there, before ever touching Node or Ollama.
-	err = dispatch([]string{"run"})
+	err = dispatch(context.Background(), []string{"run"})
 	if err == nil || !strings.Contains(err.Error(), "run `go run ./examples/mcp pin` first") {
 		t.Fatalf("err = %v", err)
 	}
 	if _, statErr := os.Stat(cache); statErr != nil {
 		t.Fatalf("userCacheDir was not created by dispatch: %v", statErr)
+	}
+}
+
+// TestSignalContext_CancelsOnASignal drives the watch with a fake notify
+// instead of sending this process a real signal, and checks that the
+// returned context is cancelled once one arrives, and not before.
+func TestSignalContext_CancelsOnASignal(t *testing.T) {
+	var sig chan<- os.Signal
+	fakeNotify := func(c chan<- os.Signal, want ...os.Signal) {
+		sig = c
+		if len(want) != 2 || want[0] != os.Interrupt {
+			t.Errorf("notify was asked for %v, want SIGINT first", want)
+		}
+	}
+	ctx, stop := signalContext(context.Background(), fakeNotify)
+	defer stop()
+	select {
+	case <-ctx.Done():
+		t.Fatal("context cancelled before any signal arrived")
+	default:
+	}
+	sig <- os.Interrupt
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("context was not cancelled after the signal")
+	}
+}
+
+// TestSignalContext_StopEndsTheWatchAndCancels checks the other way out:
+// stop, called with no signal ever sent, still leaves the watching goroutine
+// free to exit and still cancels the context, as a normal, uninterrupted
+// exit needs.
+func TestSignalContext_StopEndsTheWatchAndCancels(t *testing.T) {
+	notified := false
+	fakeNotify := func(c chan<- os.Signal, _ ...os.Signal) { notified = true }
+	ctx, stop := signalContext(context.Background(), fakeNotify)
+	stop()
+	if !notified {
+		t.Fatal("signalContext must register with notify unconditionally")
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop must cancel the context")
+	}
+	stop() // calling it twice must not panic or hang
+}
+
+func TestResumable_FalseForARunNeverRecorded(t *testing.T) {
+	store, err := agentrt.OpenStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if resumable(context.Background(), store, newRunID()) {
+		t.Fatal("an id nothing ever wrote must not be reported resumable")
+	}
+}
+
+func TestNewRunID_LooksLikeTheDriversOwn(t *testing.T) {
+	a, b := newRunID(), newRunID()
+	if a == b || len(a) != 32 {
+		t.Fatalf("ids = %q, %q, want distinct 32-char hex ids", a, b)
+	}
+}
+
+// TestServer_SetsAConnectTimeoutExplicitly guards against the default
+// silently doing the job: pin and run must each ask for one, long enough for
+// npx to fetch the package on a first run.
+func TestServer_SetsAConnectTimeoutExplicitly(t *testing.T) {
+	s := server(t.TempDir())
+	if s.ConnectTimeout <= 0 {
+		t.Fatal("server() must set ConnectTimeout explicitly, not rely on the default")
+	}
+	if s.ConnectTimeout < 30*time.Second {
+		t.Fatalf("ConnectTimeout = %s, want it generous enough for npx's first fetch", s.ConnectTimeout)
 	}
 }

@@ -446,6 +446,9 @@ func TestGenerate_ErrorsCarryNeitherTheRequestNorTheKey(t *testing.T) {
 		if errors.As(err, &tr) != tc.transient {
 			t.Fatalf("%d: transient = %v", tc.status, !tc.transient)
 		}
+		if tc.transient && tr.RetryAfter != 2*time.Second {
+			t.Fatalf("%d: TransientError.RetryAfter = %v, want the header's 2s", tc.status, tr.RetryAfter)
+		}
 		for _, format := range []string{"%v", "%+v", "%#v"} {
 			if out := fmt.Sprintf(format, err); strings.Contains(out, "SECRET") {
 				t.Fatalf("%d: %s printed the key: %s", tc.status, format, out)

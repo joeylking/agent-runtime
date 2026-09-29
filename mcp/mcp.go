@@ -21,6 +21,21 @@
 // the operator's credentials out of it, and nothing else about the host is
 // sandboxed.
 //
+// A stdio server does not inherit this process's environment: it gets PATH,
+// HOME, and TMPDIR (the Windows equivalents on Windows), then every name
+// Server.InheritEnv lists, taken from this process, then Server.Env as
+// written. A server that needs a credential is given that one variable
+// through Env or InheritEnv and nothing else.
+//
+// Connecting, the initialize handshake, and the first tool listing are
+// bounded together by Server.ConnectTimeout (default 30s), so a server that
+// never answers cannot hang Pin or Load; the session Load returns keeps
+// working past that deadline once the phase completes. A listing itself is
+// further bounded by MaxToolPages and MaxTools, so a server that pages
+// forever or offers an unbounded tool set fails the listing rather than
+// holding the client, and a streamable HTTP response over
+// MaxResponseBodyBytes fails the same way.
+//
 // Resources, prompts, sampling, elicitation, and the server side of MCP are
 // out of scope, and a call the server answers with an input request fails.
 package mcp
@@ -52,6 +67,10 @@ const (
 	MaxToolPages = 100
 	MaxTools     = 1000
 )
+
+// DefaultConnectTimeout bounds connecting, the initialize handshake, and the
+// first tool listing when a Server names no ConnectTimeout of its own.
+const DefaultConnectTimeout = 30 * time.Second
 
 // clientName and clientVersion identify this adapter to a server.
 const (
@@ -91,6 +110,16 @@ type Server struct {
 	HTTPClient *http.Client
 	// DefaultTimeout bounds a call for a Rule that names no timeout.
 	DefaultTimeout time.Duration
+	// ConnectTimeout bounds connecting, the initialize handshake, and the
+	// first tool listing, together, as one phase; zero means
+	// DefaultConnectTimeout. It does not shorten the life of the session Pin
+	// or Load returns: once the phase completes, the connection keeps
+	// working past this deadline under the caller's own context, because the
+	// SDK does not tie a client session's lifetime to the context passed to
+	// Connect for either a stdio or a streamable HTTP transport. On expiry
+	// the error names which step timed out and, for a stdio server, includes
+	// the stderr tail.
+	ConnectTimeout time.Duration
 	// MaxContentBytes caps one result's recorded content: the JSON the
 	// runtime records, truncation marker included. Zero means
 	// DefaultMaxContentBytes.
@@ -128,6 +157,13 @@ func (s Server) contentCap() int {
 		return s.MaxContentBytes
 	}
 	return DefaultMaxContentBytes
+}
+
+func (s Server) connectTimeout() time.Duration {
+	if s.ConnectTimeout > 0 {
+		return s.ConnectTimeout
+	}
+	return DefaultConnectTimeout
 }
 
 // newTransport returns the transport, the stderr tail when one is kept, and
@@ -168,13 +204,16 @@ func (s Server) newTransport(rec *listRecorder) (sdk.Transport, *stderrTail, fun
 // it and the consumer closes it when the run is over. There is no reconnect:
 // once the session drops, every call fails.
 type Connection struct {
-	server  string
-	session *sdk.ClientSession
-	rec     *listRecorder
-	stderr  *stderrTail
+	server         string
+	session        *sdk.ClientSession
+	rec            *listRecorder
+	stderr         *stderrTail
+	connectTimeout time.Duration
 }
 
-// Close ends the session, and with it a stdio server's subprocess.
+// Close ends the session, and with it a stdio server's subprocess. Close is
+// safe to call more than once and from more than one goroutine, including
+// while a call is in flight, because sdk.ClientSession.Close is.
 func (c *Connection) Close() error { return c.session.Close() }
 
 // stderrWait bounds how long a failure waits for a dead server's stderr.
@@ -196,11 +235,25 @@ func connect(ctx context.Context, s Server) (*Connection, error) {
 	session, err := client.Connect(ctx, transport, nil)
 	started()
 	if err != nil {
-		wait, cancel := context.WithTimeout(context.Background(), stderrWait)
-		defer cancel()
-		return nil, tail.annotate(wait, fmt.Errorf("mcp: server %q: connect: %w", s.Name, err))
+		return nil, phaseErr(s.Name, "connect", s.connectTimeout(), tail, err)
 	}
-	return &Connection{server: s.Name, session: session, rec: rec, stderr: tail}, nil
+	return &Connection{server: s.Name, session: session, rec: rec, stderr: tail, connectTimeout: s.connectTimeout()}, nil
+}
+
+// phaseErr reports the failure of one bounded step of connecting: connect
+// (which includes the initialize handshake, since the SDK's Connect does
+// both) or list tools. When the step's own context deadline is what ended
+// it, the error names the step and its bound rather than repeating
+// "context deadline exceeded"; a stdio server's stderr tail is appended once
+// its end of the pipe closes or stderrWait passes.
+func phaseErr(server, step string, timeout time.Duration, tail *stderrTail, err error) error {
+	msg := fmt.Errorf("mcp: server %q: %s: %w", server, step, err)
+	if errors.Is(err, context.DeadlineExceeded) {
+		msg = fmt.Errorf("mcp: server %q: %s: timed out after %s", server, step, timeout)
+	}
+	wait, cancel := context.WithTimeout(context.Background(), stderrWait)
+	defer cancel()
+	return tail.annotate(wait, msg)
 }
 
 // liveTool is one tool as the server listed it: the SDK's decoding for the
@@ -217,9 +270,7 @@ func (c *Connection) listTools(ctx context.Context) (map[string]liveTool, error)
 	out, err := c.listPages(ctx)
 	if err != nil {
 		c.Close()
-		wait, cancel := context.WithTimeout(context.Background(), stderrWait)
-		defer cancel()
-		return nil, c.stderr.annotate(wait, fmt.Errorf("mcp: server %q: list tools: %w", c.server, err))
+		return nil, phaseErr(c.server, "list tools", c.connectTimeout, c.stderr, err)
 	}
 	return out, nil
 }
@@ -330,12 +381,14 @@ func Pin(ctx context.Context, server Server) (*Manifest, error) {
 	if err := server.validate(); err != nil {
 		return nil, err
 	}
-	conn, err := connect(ctx, server)
+	pctx, cancel := context.WithTimeout(ctx, server.connectTimeout())
+	defer cancel()
+	conn, err := connect(pctx, server)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	live, err := conn.listTools(ctx)
+	live, err := conn.listTools(pctx)
 	if err != nil {
 		return nil, err
 	}

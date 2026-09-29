@@ -5,10 +5,23 @@
 // unpriced stay distinguishable.
 //
 // The adapter does not stream and does not retry. The runtime's accounting
-// caller owns retries, so every attempt is recorded; a timeout is returned
-// bare so that caller charges it as ambiguous. A reply the server served but
-// that cannot be used, because it does not decode or carries an error field,
-// is an agentrt.ServedError with whatever usage the reply reported.
+// caller owns retries, so every attempt is recorded; a timeout, and a read
+// that fails after the status line (the connection was lost mid-response, so
+// the request may have been served), are both returned bare so that caller
+// charges them as ambiguous. A 429 or a 5xx becomes a providers.StatusError
+// wrapped in agentrt.TransientError, which the caller retries; any other
+// non-2xx is the StatusError alone, which ends the run. A reply the server
+// served but that cannot be used, because it does not decode or carries an
+// error field, is an agentrt.ServedError with whatever usage the reply
+// reported.
+//
+// A request has no deadline of its own: the caller's context is what bounds
+// it, and providers.DefaultTimeout (15 minutes) is only a backstop for a
+// context with none. A response body over providers.MaxBodyBytes (16 MiB)
+// fails the read rather than being read in full.
+//
+// Host resolves the server once, at New: the configured Host, then
+// OLLAMA_HOST, then DefaultHost; nothing else is read from the environment.
 //
 // Ollama's chat API has no switch for parallel tool calls, so a reply may
 // carry several. Every one is returned; the runtime executes the first and

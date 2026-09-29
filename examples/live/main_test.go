@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	agentrt "github.com/joeylking/agent-runtime"
 )
@@ -79,5 +81,69 @@ func TestRun_CreatesTheDatabaseFile0600(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Fatalf("db file mode = %o, want 0600", perm)
+	}
+}
+
+// TestSignalContext_CancelsOnASignal drives the watch with a fake notify
+// instead of sending this process a real signal, and checks that the
+// returned context is cancelled once one arrives, and not before.
+func TestSignalContext_CancelsOnASignal(t *testing.T) {
+	var sig chan<- os.Signal
+	fakeNotify := func(c chan<- os.Signal, want ...os.Signal) {
+		sig = c
+		if len(want) != 2 || want[0] != os.Interrupt {
+			t.Errorf("notify was asked for %v, want SIGINT first", want)
+		}
+	}
+	ctx, stop := signalContext(context.Background(), fakeNotify)
+	defer stop()
+	select {
+	case <-ctx.Done():
+		t.Fatal("context cancelled before any signal arrived")
+	default:
+	}
+	sig <- os.Interrupt
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("context was not cancelled after the signal")
+	}
+}
+
+// TestSignalContext_StopEndsTheWatchAndCancels checks the other way out:
+// stop, called with no signal ever sent, still leaves the watching goroutine
+// free to exit and still cancels the context, as a normal, uninterrupted
+// exit needs.
+func TestSignalContext_StopEndsTheWatchAndCancels(t *testing.T) {
+	notified := false
+	fakeNotify := func(c chan<- os.Signal, _ ...os.Signal) { notified = true }
+	ctx, stop := signalContext(context.Background(), fakeNotify)
+	stop()
+	if !notified {
+		t.Fatal("signalContext must register with notify unconditionally")
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop must cancel the context")
+	}
+	stop() // calling it twice must not panic or hang
+}
+
+func TestResumable_FalseForARunNeverRecorded(t *testing.T) {
+	store, err := agentrt.OpenStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if resumable(context.Background(), store, newRunID()) {
+		t.Fatal("an id nothing ever wrote must not be reported resumable")
+	}
+}
+
+func TestNewRunID_LooksLikeTheDriversOwn(t *testing.T) {
+	a, b := newRunID(), newRunID()
+	if a == b || len(a) != 32 {
+		t.Fatalf("ids = %q, %q, want distinct 32-char hex ids", a, b)
 	}
 }

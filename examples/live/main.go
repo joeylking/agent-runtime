@@ -22,18 +22,27 @@
 // repeating the first command above without -db still finds the same file,
 // but another account on a shared machine cannot pre-create or read it the
 // way it could a fixed name in the shared temporary directory.
+//
+// SIGINT and SIGTERM cancel the run between steps rather than killing it
+// outright: the database is closed in whatever state the last committed
+// step left it, and, once a run has actually been recorded, the exact
+// -resume command is printed on stderr before the process exits non-zero.
 package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	agentrt "github.com/joeylking/agent-runtime"
@@ -73,10 +82,58 @@ func main() {
 	baseURL := flag.String("base-url", "", "host for ollama:, base URL for openai: (default Ollama's /v1)")
 	resume := flag.String("resume", "", "resume this run instead of starting one")
 	flag.Parse()
-	if err := run(*dbPath, *modelName, *baseURL, *resume); err != nil {
+	// Ctrl-C or a kill must not corrupt the run: cancelling this context
+	// stops the loop between steps, and every deferred Close still runs, so
+	// the database is left in a state the run can be resumed from.
+	ctx, stop := signalContext(context.Background(), signal.Notify)
+	defer stop()
+	if err := run(ctx, *dbPath, *modelName, *baseURL, *resume); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+// signalContext returns a context derived from parent that is cancelled when
+// this process receives SIGINT or SIGTERM, and the stop function that ends
+// the watch early. notify is signal.Notify, taken as a parameter so a test
+// can drive the cancellation itself instead of sending this process a real
+// signal.
+func signalContext(parent context.Context, notify func(chan<- os.Signal, ...os.Signal)) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	sig := make(chan os.Signal, 1)
+	notify(sig, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-sig:
+			cancel()
+		case <-done:
+		}
+	}()
+	var once sync.Once
+	return ctx, func() { once.Do(func() { close(done) }); cancel() }
+}
+
+// newRunID returns a random 128-bit hex identifier, in the same shape the
+// driver generates for itself. The example needs its own, chosen before the
+// call, so that Ctrl-C during Start still leaves it able to print the run
+// that can be resumed: driver.Start returns no run at all when its context
+// is cancelled mid-step.
+func newRunID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("agent-runtime example: crypto/rand unavailable: " + err.Error())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// resumable reports whether a run was actually recorded, so an interrupted
+// run is only offered as resumable when there is something to resume: a
+// signal caught before the first write ever reached the store leaves
+// nothing behind.
+func resumable(ctx context.Context, store *agentrt.Store, runID string) bool {
+	_, err := store.GetRun(ctx, runID)
+	return err == nil
 }
 
 // userCacheDir returns this example's own directory under the OS's per-user
@@ -103,7 +160,7 @@ func defaultDBPath() (string, error) {
 	return filepath.Join(dir, "live.db"), nil
 }
 
-func run(dbPath, modelName, baseURL, resumeID string) error {
+func run(ctx context.Context, dbPath, modelName, baseURL, resumeID string) error {
 	model, prices, err := buildModel(modelName, baseURL)
 	if err != nil {
 		return err
@@ -136,16 +193,23 @@ func run(dbPath, modelName, baseURL, resumeID string) error {
 	}
 
 	fmt.Printf("database: %s\nmodel:    %s\n\n", dbPath, model.Name())
-	ctx := context.Background()
 	var r agentrt.Run
+	runID := resumeID
 	if resumeID != "" {
 		r, err = driver.Resume(ctx, resumeID)
 	} else {
+		// Chosen here, not left to Start, so a Ctrl-C during the call still
+		// leaves a run id to print below: Start returns none of its own when
+		// interrupted mid-step.
+		runID = newRunID()
 		limits := agentrt.DefaultLimits()
 		limits.MaxSteps, limits.MaxModelCalls, limits.MaxOutputTokensPerCall = 12, 12, maxOutputTokens
-		r, err = driver.Start(ctx, goal, limits)
+		r, err = driver.StartWithID(ctx, runID, goal, limits)
 	}
 	if err != nil {
+		if ctx.Err() != nil && resumable(context.Background(), store, runID) {
+			fmt.Fprintf(os.Stderr, "interrupted; resume with:\n  go run ./examples/live -db %s -resume %s\n", dbPath, runID)
+		}
 		return err
 	}
 	// The run returned by a pause predates the last step's accounting, so

@@ -159,11 +159,13 @@ func Load(ctx context.Context, server Server, manifest *Manifest, rules Rules) (
 	}
 	defer checker.close()
 
-	conn, err := connect(ctx, server)
+	pctx, cancel := context.WithTimeout(ctx, server.connectTimeout())
+	defer cancel()
+	conn, err := connect(pctx, server)
 	if err != nil {
 		return nil, nil, err
 	}
-	live, err := conn.listTools(ctx)
+	live, err := conn.listTools(pctx)
 	if err != nil {
 		return nil, nil, err
 	}

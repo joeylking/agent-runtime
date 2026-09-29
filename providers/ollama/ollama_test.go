@@ -244,6 +244,40 @@ func TestGenerate_ErrorsClassified(t *testing.T) {
 	}
 }
 
+// hijackMidBody starts a server that answers the status line and headers,
+// writes part of the promised body, then cuts the connection: the request
+// was received, so a reply may have been billed, but no answer came back.
+func hijackMidBody(t *testing.T) *ollama.Model {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj := w.(http.Hijacker)
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n")
+		buf.WriteString(`{"message":{"role":"assistant"`)
+		buf.Flush()
+		conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+	return newModel(t, ollama.Config{Model: "test-model", Host: srv.URL})
+}
+
+func TestGenerate_MidBodyFailureIsAmbiguousNotPermanent(t *testing.T) {
+	m := hijackMidBody(t)
+	_, err := m.Generate(context.Background(), agentrt.ModelRequest{})
+	var tr agentrt.TransientError
+	var se providers.StatusError
+	var served agentrt.ServedError
+	if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err = %v, want it to wrap io.ErrUnexpectedEOF", err)
+	}
+	if errors.As(err, &tr) || errors.As(err, &se) || errors.As(err, &served) {
+		t.Fatalf("err = %#v, want it bare so the accounting caller charges it as ambiguous, not retried or classified", err)
+	}
+}
+
 func TestFree_PricesTheReportedName(t *testing.T) {
 	m := newModel(t, ollama.Config{Model: "qwen3:30b-a3b"})
 	prices := ollama.Free(m)

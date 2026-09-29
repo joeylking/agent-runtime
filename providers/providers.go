@@ -161,8 +161,9 @@ type StatusError struct {
 	Status   int
 	Body     string
 	// RetryAfter is the delay the provider asked for in a Retry-After
-	// header, or zero. The runtime's TransientError has no field for it, so
-	// a caller that wants it finds this error with errors.As.
+	// header, or zero. A transient StatusError carries the same value on the
+	// agentrt.TransientError that wraps it, so a caller can read it from
+	// either with errors.As.
 	RetryAfter time.Duration
 }
 
@@ -172,11 +173,12 @@ func (e StatusError) Error() string {
 
 // ClassifyTransport maps a failed HTTP round trip onto the runtime's
 // classes. A timeout is returned bare so the accounting caller charges it
-// as ambiguous, and so is the caller's cancellation, which is not the
-// provider's failure. A host that does not resolve, a certificate that does
-// not verify, and a URL that cannot be sent are permanent. Anything else,
-// such as a refused or reset connection or a body cut off mid-read, is
-// transient.
+// as ambiguous, and so is a body cut off mid-read, because the provider
+// received the request and may have billed it. The caller's cancellation
+// is returned bare too: it is not the provider's failure. A host that does
+// not resolve, a certificate that does not verify, and a URL that cannot
+// be sent are permanent. Anything else, such as a refused or reset
+// connection, is transient.
 func ClassifyTransport(err error) error {
 	if err == nil {
 		return nil
@@ -186,6 +188,9 @@ func ClassifyTransport(err error) error {
 	}
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
+		return err
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
 		return err
 	}
 	if permanentTransport(err) {
@@ -232,7 +237,8 @@ func ClassifyStatus(provider string, status int, body []byte) error {
 }
 
 // ClassifyResponse is ClassifyStatus for a response whose headers are at
-// hand, so a Retry-After header is carried on the StatusError.
+// hand, so a Retry-After header is carried on the StatusError and, when the
+// status is transient, on the agentrt.TransientError wrapping it too.
 func ClassifyResponse(provider string, resp *http.Response, body []byte) error {
 	return classify(provider, resp.StatusCode, body, RetryAfter(resp.Header))
 }
@@ -243,13 +249,20 @@ func classify(provider string, status int, body []byte, after time.Duration) err
 	}
 	err := StatusError{Provider: provider, Status: status, Body: excerpt(body), RetryAfter: after}
 	if Transient(status) {
-		return agentrt.TransientError{Err: err}
+		return agentrt.TransientError{Err: err, RetryAfter: after}
 	}
 	return err
 }
 
+// maxRetryAfter bounds what RetryAfter reports. A provider's own retry
+// clock cannot be trusted past this, so a longer or negative value is
+// treated the same as no header at all rather than stalling a caller for an
+// absurd delay.
+const maxRetryAfter = time.Hour
+
 // RetryAfter parses a Retry-After header, in seconds or as an HTTP date,
-// and returns zero when there is none or it cannot be read.
+// and returns zero when there is none, it cannot be read, or it names a
+// negative or more-than-an-hour delay.
 func RetryAfter(h http.Header) time.Duration {
 	v := strings.TrimSpace(h.Get("Retry-After"))
 	if v == "" {
@@ -259,10 +272,14 @@ func RetryAfter(h http.Header) time.Duration {
 		if s < 0 {
 			return 0
 		}
-		return time.Duration(s) * time.Second
+		d := time.Duration(s) * time.Second
+		if d > maxRetryAfter {
+			return 0
+		}
+		return d
 	}
 	if t, err := http.ParseTime(v); err == nil {
-		if d := time.Until(t); d > 0 {
+		if d := time.Until(t); d > 0 && d <= maxRetryAfter {
 			return d
 		}
 	}

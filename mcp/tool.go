@@ -65,7 +65,7 @@ func (t *tool) Call(ctx context.Context, call agentrt.ToolCall) (agentrt.ToolRes
 	defer cancel()
 	res, err := t.conn.session.CallTool(ctx, &sdk.CallToolParams{Name: t.remote, Arguments: args})
 	if err != nil {
-		return agentrt.ToolResult{}, err
+		return agentrt.ToolResult{}, fmt.Errorf("mcp: server %q: tool %q: %w", t.conn.server, t.remote, err)
 	}
 	if res.NeedsInput() {
 		return agentrt.ToolResult{}, fmt.Errorf("%s: the server asked for more input, which this adapter does not support", t.spec.Name)
