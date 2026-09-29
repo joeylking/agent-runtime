@@ -176,3 +176,80 @@ func TestPendingApproval_SelectionRule(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// TestApprove_WrapsRunNotWaiting: a run already resumed, finished, or
+// otherwise no longer waiting must be matchable as a caller's own condition
+// rather than a string a front end has to parse.
+func TestApprove_WrapsRunNotWaiting(t *testing.T) {
+	store, runID := pausedRun(t)
+	ctx := context.Background()
+	a, err := view.PendingApproval(ctx, store, runID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agentrt.Cancel(ctx, store, nil, runID, "joey", "moved on"); err != nil {
+		t.Fatal(err)
+	}
+	if err := view.Approve(ctx, store, nil, runID, a.ID, "joey", ""); !errors.Is(err, view.ErrRunNotWaiting) {
+		t.Fatalf("err = %v, want ErrRunNotWaiting", err)
+	}
+}
+
+// TestReject_WrapsApprovalAlreadyDecided: deciding a second time is a
+// distinct condition from PendingApproval's own ErrNotPending (which fires
+// before the core is ever called); this is the core's own guard.
+func TestReject_WrapsApprovalAlreadyDecided(t *testing.T) {
+	store, runID := pausedRun(t)
+	ctx := context.Background()
+	a, err := view.PendingApproval(ctx, store, runID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := view.Approve(ctx, store, nil, runID, a.ID, "joey", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Bypass PendingApproval's own not-pending check by calling the core
+	// directly through the wrapper, on the id of the approval just decided.
+	if err := view.Reject(ctx, store, nil, runID, a.ID, "joey", "too late"); !errors.Is(err, view.ErrApprovalDecided) {
+		t.Fatalf("err = %v, want ErrApprovalDecided", err)
+	}
+}
+
+// TestCancel_WrapsADatabaseLockedByAnotherConsumer holds a write
+// transaction open on a second connection to the same file, forcing the
+// wrapped call to collide with SQLite's own busy timeout, and checks the
+// resulting message reads as prose rather than just the raw SQLite code.
+func TestCancel_WrapsADatabaseLockedByAnotherConsumer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "locked.db")
+	store, err := agentrt.OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	ctx := context.Background()
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO runs (id, goal, status, limits_json, created_at) VALUES ('r1','g','RUNNING','{}','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+
+	locker, err := agentrt.OpenExisting(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	tx, err := locker.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE runs SET goal = goal`); err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	err = view.Cancel(ctx, store, nil, "r1", "joey", "")
+	if !errors.Is(err, view.ErrDatabaseLocked) {
+		t.Fatalf("err = %v, want ErrDatabaseLocked", err)
+	}
+	if !strings.Contains(err.Error(), "locked by another consumer") {
+		t.Fatalf("message is not plain prose: %v", err)
+	}
+}

@@ -2,6 +2,10 @@
 // and prints the persisted event trace. It makes no network calls.
 //
 //	go run ./examples/scripted [-db path]
+//
+// -db defaults to a fresh file under a per-user cache directory
+// (os.UserCacheDir()/agentrt), created 0700 so another account on a shared
+// machine cannot pre-create or read it.
 package main
 
 import (
@@ -35,15 +39,41 @@ func (t tool) Call(_ context.Context, c agentrt.ToolCall) (agentrt.ToolResult, e
 }
 
 func main() {
-	dbPath := flag.String("db", "", "SQLite file (default: temporary file)")
-	flag.Parse()
-	if *dbPath == "" {
-		*dbPath = filepath.Join(os.TempDir(), fmt.Sprintf("agentrt-example-%d.db", time.Now().UnixNano()))
+	def, err := defaultDBPath()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
 	}
+	dbPath := flag.String("db", def, "SQLite file (default: a fresh file under the per-user cache directory)")
+	flag.Parse()
 	if err := run(*dbPath); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+// userCacheDir returns this example's own directory under the OS's per-user
+// cache directory, created 0700: on a machine other accounts can log into,
+// the shared temporary directory lets another account pre-create a file at
+// a predictable path before this one gets to it.
+func userCacheDir() (string, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(base, "agentrt")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+func defaultDBPath() (string, error) {
+	dir, err := userCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, fmt.Sprintf("scripted-%d.db", time.Now().UnixNano())), nil
 }
 
 func run(dbPath string) error {
@@ -52,6 +82,11 @@ func run(dbPath string) error {
 		return err
 	}
 	defer store.Close()
+	if dbPath != ":memory:" {
+		if err := os.Chmod(dbPath, 0o600); err != nil {
+			return err
+		}
+	}
 
 	c := &counter{}
 	tools := []agentrt.Tool{

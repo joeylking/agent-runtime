@@ -13,7 +13,7 @@ body:
     attributes:
       label: Runtime version
       description: The core module's version or commit, from `go list -m github.com/joeylking/agent-runtime`.
-      placeholder: v0.2.0
+      placeholder: v0.2.1
     validations:
       required: true
   - type: dropdown

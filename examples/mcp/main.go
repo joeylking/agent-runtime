@@ -10,19 +10,30 @@
 // and prints the report: what registered, what was refused and why, and every
 // tool left unclassified, which is fail-closed and the point of the demo.
 //
+// From a fresh clone, first (once, from the repository root): the consumer
+// modules are pinned to released versions on the module proxy, so running
+// them from the repository root needs a local workspace:
+//
+//	go work init . ./examples/live ./examples/mcp ./mcp ./providers/anthropic ./providers/ollama ./providers/openai
+//
+// Then:
+//
 //	go run ./examples/mcp pin
 //	go run ./examples/mcp run
 //	go run ./cmd/agentrt -db <path> approve <run>
 //	go run ./examples/mcp run -resume <run>
 //
-// It needs Node for `npx @modelcontextprotocol/server-filesystem` and a local
-// Ollama server. The sandbox, the manifest, and the database default to fixed
-// paths in the temporary directory so the four commands address the same run;
-// rules.json is read from this directory, so both commands are run from the
-// repository root. The shipped rules.json classifies the tools the server
-// offered when it was written: a server that offers a different set is pinned
-// again and the rules edited, which Load says in as many words rather than
-// silently dropping a tool.
+// It needs Node for `npx @modelcontextprotocol/server-filesystem` and a
+// local Ollama server. The sandbox, the manifest, and the database default
+// to fixed names under a per-user cache directory (os.UserCacheDir()/
+// agentrt, created 0700), so the four commands above address the same run
+// by default but another account on a shared machine cannot pre-create or
+// read any of the three the way it could a fixed name in the shared
+// temporary directory. rules.json is read from this directory, so both
+// commands are run from the repository root. The shipped rules.json
+// classifies the tools the server offered when it was written: a server
+// that offers a different set is pinned again and the rules edited, which
+// Load says in as many words rather than silently dropping a tool.
 package main
 
 import (
@@ -85,28 +96,47 @@ func main() {
 	}
 }
 
+// userCacheDir returns this example's own directory under the OS's
+// per-user cache directory, created 0700: a fixed name in the shared
+// temporary directory lets another account on the same machine pre-create
+// or read the sandbox, the manifest, or the database first.
+func userCacheDir() (string, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(base, "agentrt")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
 // dispatch runs one of the two phases. They are separate commands because
 // pinning is something an operator does once, reads, and keeps.
 func dispatch(args []string) error {
-	tmp := os.TempDir()
+	cache, err := userCacheDir()
+	if err != nil {
+		return err
+	}
 	if len(args) == 0 {
 		return errors.New("usage: go run ./examples/mcp <pin|run> [flags], or -h on either")
 	}
 	switch args[0] {
 	case "pin":
 		fs := flag.NewFlagSet("pin", flag.ExitOnError)
-		dir := fs.String("dir", filepath.Join(tmp, "agentrt-mcp-sandbox"), "sandbox the server is given, created with a README.md when absent")
-		manifest := fs.String("manifest", filepath.Join(tmp, "agentrt-mcp-manifest.json"), "manifest to write for the operator to review")
+		dir := fs.String("dir", filepath.Join(cache, "mcp-sandbox"), "sandbox the server is given, created with a README.md when absent")
+		manifest := fs.String("manifest", filepath.Join(cache, "mcp-manifest.json"), "manifest to write for the operator to review")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		return pin(*dir, *manifest)
 	case "run":
 		fs := flag.NewFlagSet("run", flag.ExitOnError)
-		dir := fs.String("dir", filepath.Join(tmp, "agentrt-mcp-sandbox"), "sandbox the server is given, created with a README.md when absent")
-		manifest := fs.String("manifest", filepath.Join(tmp, "agentrt-mcp-manifest.json"), "manifest written by pin")
+		dir := fs.String("dir", filepath.Join(cache, "mcp-sandbox"), "sandbox the server is given, created with a README.md when absent")
+		manifest := fs.String("manifest", filepath.Join(cache, "mcp-manifest.json"), "manifest written by pin")
 		rules := fs.String("rules", filepath.Join("examples", "mcp", "rules.json"), "the operator's classification of the server's tools")
-		db := fs.String("db", filepath.Join(tmp, "agentrt-mcp.db"), "SQLite file")
+		db := fs.String("db", filepath.Join(cache, "mcp.db"), "SQLite file")
 		model := fs.String("model", "ollama:qwen3:30b-a3b", "ollama:<model> to run")
 		resume := fs.String("resume", "", "resume this run instead of starting one")
 		if err := fs.Parse(args[1:]); err != nil {
@@ -145,7 +175,7 @@ func pin(dir, manifestPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(manifestPath, append(raw, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(manifestPath, append(raw, '\n'), 0o600); err != nil {
 		return err
 	}
 	fmt.Printf("sandbox:  %s\nmanifest: %s\n\n%d tools, with the server's own hints, which classify nothing:\n\n", dir, manifestPath, len(m.Tools))
@@ -213,6 +243,11 @@ func run(cfg config) error {
 		return err
 	}
 	defer store.Close()
+	if cfg.db != ":memory:" {
+		if err := os.Chmod(cfg.db, 0o600); err != nil {
+			return err
+		}
+	}
 
 	// Not a bounded context, for the same reason as Pin: the session lives
 	// as long as the run.
@@ -295,10 +330,10 @@ func sandbox(dir string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "README.md"), []byte(sandboxREADME), 0o644)
+	return os.WriteFile(filepath.Join(dir, "README.md"), []byte(sandboxREADME), 0o600)
 }
 
 func readManifest(path string) (*mcp.Manifest, error) {

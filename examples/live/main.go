@@ -3,14 +3,25 @@
 // is changed. It is the shortest complete consumer: an Agent built from
 // render, three tools, a policy, and a terminal tool to finish on.
 //
+// From a fresh clone, first (once, from the repository root): the
+// consumer modules are pinned to released versions on the module proxy, so
+// running them from the repository root needs a local workspace:
+//
+//	go work init . ./examples/live ./examples/mcp ./mcp ./providers/anthropic ./providers/ollama ./providers/openai
+//
+// Then:
+//
 //	go run ./examples/live
 //	go run ./cmd/agentrt -db <path> approve <run>
 //	go run ./examples/live -db <path> -resume <run>
 //
 // The default model is Ollama's own API; -model openai:<id> with -base-url
 // pointing at Ollama's /v1 runs the same thing through the
-// OpenAI-compatible adapter. The database defaults to a fixed path in the
-// temporary directory so the three commands above address the same run.
+// OpenAI-compatible adapter. The database defaults to a fixed name under a
+// per-user cache directory (os.UserCacheDir()/agentrt, created 0700), so
+// repeating the first command above without -db still finds the same file,
+// but another account on a shared machine cannot pre-create or read it the
+// way it could a fixed name in the shared temporary directory.
 package main
 
 import (
@@ -52,7 +63,12 @@ A denied or failed call is answered with its reason; read it and adapt.`
 const maxOutputTokens = 4096
 
 func main() {
-	dbPath := flag.String("db", filepath.Join(os.TempDir(), "agentrt-live.db"), "SQLite file")
+	def, err := defaultDBPath()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	dbPath := flag.String("db", def, "SQLite file (default: a fixed name under the per-user cache directory)")
 	modelName := flag.String("model", "ollama:qwen3:30b-a3b", "provider:model, either ollama: or openai:")
 	baseURL := flag.String("base-url", "", "host for ollama:, base URL for openai: (default Ollama's /v1)")
 	resume := flag.String("resume", "", "resume this run instead of starting one")
@@ -61,6 +77,30 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+// userCacheDir returns this example's own directory under the OS's per-user
+// cache directory, created 0700: a fixed name in the shared temporary
+// directory lets another account on the same machine pre-create or read it
+// first.
+func userCacheDir() (string, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(base, "agentrt")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+func defaultDBPath() (string, error) {
+	dir, err := userCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "live.db"), nil
 }
 
 func run(dbPath, modelName, baseURL, resumeID string) error {
@@ -76,6 +116,11 @@ func run(dbPath, modelName, baseURL, resumeID string) error {
 		return err
 	}
 	defer store.Close()
+	if dbPath != ":memory:" {
+		if err := os.Chmod(dbPath, 0o600); err != nil {
+			return err
+		}
+	}
 
 	c := &counter{}
 	driver, err := agentrt.NewDriver(agentrt.Config{
@@ -154,7 +199,7 @@ func buildModel(name, baseURL string) (agentrt.Model, agentrt.PriceTable, error)
 		m, err := openai.New(openai.Config{Model: id, BaseURL: baseURL})
 		return m, openai.Free(m), err
 	}
-	return nil, nil, fmt.Errorf("model %q must start with ollama: or openai:", name)
+	return nil, nil, fmt.Errorf("model %q needs an ollama: or openai: prefix", name)
 }
 
 // modelAgent is the whole agent: render the recorded steps, ask the model,

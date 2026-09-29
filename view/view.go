@@ -24,7 +24,10 @@ type RunSummary struct {
 	ReasonDetail string                 `json:"reason_detail,omitempty"`
 	Steps        int                    `json:"steps"`
 	CreatedAt    time.Time              `json:"created_at"`
-	FinishedAt   time.Time              `json:"finished_at,omitempty"`
+	// FinishedAt uses omitzero, not omitempty: time.Time is a struct, and
+	// omitempty never treats a struct as empty, so a zero time.Time would
+	// otherwise be marshaled as its zero-value RFC 3339 rendering.
+	FinishedAt time.Time `json:"finished_at,omitzero"`
 	// PendingApprovalID is set only for a run waiting for approval, which is
 	// the only state in which an approval can still be decided.
 	PendingApprovalID string         `json:"pending_approval_id,omitempty"`
@@ -168,4 +171,76 @@ func pendingApprovals(ctx context.Context, store *agentrt.Store, runID string) (
 		}
 	}
 	return pending, nil
+}
+
+// Errors decideError wraps around whatever agentrt.Approve, agentrt.Reject,
+// and agentrt.Cancel report, so a caller such as cmd/agentrt can match the
+// shape of a failure instead of parsing its text. The core functions return
+// plain fmt.Errorf values with no sentinel of their own; these give one.
+var (
+	// ErrRunNotWaiting means the run is not (or no longer) waiting for
+	// approval: another decision, a resume, or an expiry already moved it
+	// on.
+	ErrRunNotWaiting = errors.New("run is not waiting for approval")
+	// ErrApprovalDecided means the named approval was already approved,
+	// rejected, or expired; it is not the caller's to decide again.
+	ErrApprovalDecided = errors.New("approval is already decided")
+	// ErrDatabaseLocked means another process holds the database open for
+	// writing. It wraps the driver's own error, whose text carries the raw
+	// SQLite code, so a front end can say something a person can act on.
+	ErrDatabaseLocked = errors.New("database is locked by another consumer")
+)
+
+// Approve records an approval decision, wrapping the core's error so
+// ErrRunNotWaiting, ErrApprovalDecided, and ErrDatabaseLocked can be
+// matched with errors.Is.
+func Approve(ctx context.Context, store *agentrt.Store, obs agentrt.Observer, runID, approvalID, by, note string) error {
+	return wrapDecideErr(agentrt.Approve(ctx, store, obs, runID, approvalID, by, note))
+}
+
+// Reject records a rejection, wrapping errors the same way Approve does.
+func Reject(ctx context.Context, store *agentrt.Store, obs agentrt.Observer, runID, approvalID, by, note string) error {
+	return wrapDecideErr(agentrt.Reject(ctx, store, obs, runID, approvalID, by, note))
+}
+
+// Cancel ends a run, wrapping errors the same way Approve does.
+func Cancel(ctx context.Context, store *agentrt.Store, obs agentrt.Observer, runID, by, note string) error {
+	return wrapDecideErr(agentrt.Cancel(ctx, store, obs, runID, by, note))
+}
+
+func wrapDecideErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if isLocked(err) {
+		return fmt.Errorf("%w: %v", ErrDatabaseLocked, err)
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "not waiting for approval"):
+		return fmt.Errorf("%w: %v", ErrRunNotWaiting, err)
+	case strings.Contains(msg, "already"):
+		return fmt.Errorf("%w: %v", ErrApprovalDecided, err)
+	}
+	return err
+}
+
+// coder is what modernc.org/sqlite's *sqlite.Error implements; matching the
+// interface rather than importing the driver keeps this package's
+// dependency on the exact SQLite binding minimal.
+type coder interface{ Code() int }
+
+// SQLite result codes for a database another connection is writing to.
+// https://www.sqlite.org/rescode.html
+const (
+	sqliteBusy   = 5
+	sqliteLocked = 6
+)
+
+func isLocked(err error) bool {
+	var c coder
+	if errors.As(err, &c) {
+		return c.Code() == sqliteBusy || c.Code() == sqliteLocked
+	}
+	return strings.Contains(err.Error(), "SQLITE_BUSY") || strings.Contains(err.Error(), "SQLITE_LOCKED") || strings.Contains(err.Error(), "database is locked")
 }
