@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -99,12 +100,18 @@ type Limits struct {
 	MaxEstimatedCost Micros `json:"max_estimated_cost_micros,omitempty"`
 	// MaxActiveTime bounds the sum of step durations while RUNNING;
 	// approval waits are excluded. MaxElapsedTime is an absolute deadline
-	// from creation, including waits. ApprovalTTL expires a pending
-	// approval and cancels the run when it is next touched. Zero disables
-	// each.
+	// from creation, including waits. ApprovalTTL bounds how long an
+	// approval may stay pending: once it passes, the approval expires and
+	// the run is cancelled when it is next touched. It does not bound an
+	// approval already decided. GrantTTL bounds how long an approved grant
+	// may wait for Resume, measured from its decision: Resume finding a
+	// grant older than that expires it and cancels the run instead of
+	// executing it. Zero disables each; a run stored before GrantTTL
+	// existed decodes it as zero.
 	MaxActiveTime  time.Duration `json:"max_active_time,omitempty"`
 	MaxElapsedTime time.Duration `json:"max_elapsed_time,omitempty"`
 	ApprovalTTL    time.Duration `json:"approval_ttl,omitempty"`
+	GrantTTL       time.Duration `json:"grant_ttl,omitempty"`
 }
 
 // DefaultLimits returns conservative defaults.
@@ -192,6 +199,14 @@ type Decision struct {
 	Result json.RawMessage `json:"result,omitempty"`
 	// Message applies to fail.
 	Message string `json:"message,omitempty"`
+	// InvalidArgs and InvalidResult are set only on a recorded decision:
+	// arguments or a result the agent returned that were not usable JSON,
+	// kept verbatim in place of Args or Result, which are then empty. When
+	// either is not UTF-8, both are base64 and InvalidBase64 is set. A valid
+	// decision never has them, so its stored form is unchanged by them.
+	InvalidArgs   string `json:"invalid_args,omitempty"`
+	InvalidResult string `json:"invalid_result,omitempty"`
+	InvalidBase64 bool   `json:"invalid_base64,omitempty"`
 }
 
 // ObservationKind classifies what the agent sees after a step.
@@ -232,6 +247,11 @@ type Step struct {
 	Observation *Observation
 	StartedAt   time.Time
 	FinishedAt  time.Time
+	// DecodeError is set when a stored column of the step could not be
+	// decoded; the fields it would have filled are left empty. It lets a
+	// damaged row be listed, shown, and cancelled rather than failing every
+	// read of its run, and a driver refuses to continue such a run.
+	DecodeError string
 }
 
 // SideEffect classifies what a tool may do. Policy is evaluated on it.
@@ -360,6 +380,9 @@ type Approval struct {
 	DecidedAt    time.Time       `json:"decided_at,omitzero"`
 	DecidedBy    string          `json:"decided_by,omitempty"`
 	Note         string          `json:"note,omitempty"`
+	// DecodeError is set when a stored column of the approval could not be
+	// decoded, as on Step. Such an approval cannot be decided or resumed.
+	DecodeError string `json:"decode_error,omitempty"`
 }
 
 // Policy decides whether a validated tool request may execute. It is evaluated
@@ -457,14 +480,19 @@ const (
 // Observer receives every event after it has been committed.
 type Observer func(Event)
 
-// toJSON marshals a value the runtime builds itself for an event payload or
-// a stored column. Consumer JSON is checked by checkJSON where it enters,
-// so a failure here is a runtime bug; it is recorded as an error object
-// rather than panicking with a transaction open.
-func toJSON(v any) json.RawMessage {
+// errEncode marks a value the runtime could not encode for storage or a
+// hash. Consumer JSON is checked by checkJSON where it enters, so it means
+// a runtime bug or a check missed; the write that needed the value fails,
+// and the run fails as internal_error without executing anything more.
+var errEncode = errors.New("agentrt: cannot encode")
+
+// toJSON marshals a value for an event payload, a stored column, or a
+// hash. It never substitutes: a stand-in would be stored as the record, or
+// hashed as the approval, of every value that failed alike.
+func toJSON(v any) (json.RawMessage, error) {
 	b, err := json.Marshal(v)
 	if err != nil {
-		b, _ = json.Marshal(map[string]string{"marshal_error": err.Error()})
+		return nil, fmt.Errorf("%w: %w", errEncode, err)
 	}
-	return b
+	return b, nil
 }

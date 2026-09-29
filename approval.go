@@ -2,17 +2,44 @@ package agentrt
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 )
 
-// approvalHash binds an approval to exactly what was asked and shown.
-func approvalHash(kind string, capability, presentation json.RawMessage, req ToolRequest) string {
-	return contentHash(toJSON(map[string]any{
+// approvalHash binds an approval to exactly what was asked and shown. A
+// value the encoder or the canonical decoder refuses is an error, never a
+// stand-in hash; for everything else it is contentHash of the same bytes
+// it always hashed.
+func approvalHash(kind string, capability, presentation json.RawMessage, req ToolRequest) (string, error) {
+	b, err := toJSON(map[string]any{
 		"kind": kind, "capability": orEmptyObject(capability), "presentation": orEmptyObject(presentation), "request": req,
-	}))
+	})
+	if err != nil {
+		return "", err
+	}
+	c, err := canonicalJSON(b)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", errEncode, err)
+	}
+	sum := sha256.Sum256(c)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// verifyHash reports whether a stored approval still matches its hash. An
+// approval whose fields no longer hash at all, as one stored with the hash
+// of an encoding error, does not.
+func verifyHash(a Approval) error {
+	if a.DecodeError != "" {
+		return fmt.Errorf("%w: %s", ErrApprovalHash, a.DecodeError)
+	}
+	if h, err := approvalHash(a.Kind, a.Capability, a.Presentation, a.Request); err != nil || h != a.Hash {
+		return ErrApprovalHash
+	}
+	return nil
 }
 
 // pause records a hash-bound approval for the step's request and parks
@@ -33,7 +60,9 @@ func (d *Driver) pause(ctx context.Context, c *runCache, runID string, step *Ste
 		if r.Limits.ApprovalTTL > 0 {
 			a.ExpiresAt = now.Add(r.Limits.ApprovalTTL)
 		}
-		a.Hash = approvalHash(a.Kind, a.Capability, a.Presentation, a.Request)
+		if a.Hash, err = approvalHash(a.Kind, a.Capability, a.Presentation, a.Request); err != nil {
+			return err
+		}
 		if err := t.updateStep(ctx, *step, fromStep); err != nil {
 			return err
 		}
@@ -41,16 +70,16 @@ func (d *Driver) pause(ctx context.Context, c *runCache, runID string, step *Ste
 		if err := t.transition(ctx, r, from...); err != nil {
 			return err
 		}
-		if err := t.appendEvent(ctx, Event{RunID: runID, StepID: step.ID, At: policyAt, Type: EventStepPolicy, Payload: toJSON(step.Policy)}); err != nil {
+		if err := t.emit(ctx, Event{RunID: runID, StepID: step.ID, At: policyAt, Type: EventStepPolicy}, step.Policy); err != nil {
 			return err
 		}
 		if err := t.insertApproval(ctx, a); err != nil {
 			return err
 		}
 		out = r
-		return t.appendEvent(ctx, Event{RunID: runID, StepID: step.ID, At: now, Type: EventApprovalRequested, Payload: toJSON(map[string]any{
+		return t.emit(ctx, Event{RunID: runID, StepID: step.ID, At: now, Type: EventApprovalRequested}, map[string]any{
 			"approval_id": a.ID, "kind": pd.Kind, "reason": pd.Reason, "capability": a.Capability, "presentation": a.Presentation, "hash": a.Hash,
-		})})
+		})
 	})
 	if err != nil {
 		return Run{}, err
@@ -65,12 +94,12 @@ var ErrApprovalHash = errors.New("agentrt: approval hash does not match its reco
 // from the stored fields. The run stays WAITING until Resume. Expiry is
 // judged by the driver's clock.
 func (d *Driver) Approve(ctx context.Context, runID, approvalID, by, note string) error {
-	return decide(ctx, d.store, d.observer, d.now, runID, approvalID, by, note, ApprovalApproved)
+	return decide(ctx, d.store, d.observer, d.now, runID, approvalID, "", by, note, ApprovalApproved)
 }
 
 // Reject marks a pending approval rejected and ends the run as CANCELLED.
 func (d *Driver) Reject(ctx context.Context, runID, approvalID, by, note string) error {
-	return decide(ctx, d.store, d.observer, d.now, runID, approvalID, by, note, ApprovalRejected)
+	return decide(ctx, d.store, d.observer, d.now, runID, approvalID, "", by, note, ApprovalRejected)
 }
 
 // Approve records an approval decision without a driver, for command-line
@@ -78,18 +107,47 @@ func (d *Driver) Reject(ctx context.Context, runID, approvalID, by, note string)
 // run. The hash is recomputed from the stored fields first. Expiry is
 // judged by the wall clock.
 func Approve(ctx context.Context, store *Store, obs Observer, runID, approvalID, by, note string) error {
-	return decide(ctx, store, obs, time.Now, runID, approvalID, by, note, ApprovalApproved)
+	return decide(ctx, store, obs, time.Now, runID, approvalID, "", by, note, ApprovalApproved)
 }
 
 // Reject records a rejection without a driver and ends the run as CANCELLED.
 func Reject(ctx context.Context, store *Store, obs Observer, runID, approvalID, by, note string) error {
-	return decide(ctx, store, obs, time.Now, runID, approvalID, by, note, ApprovalRejected)
+	return decide(ctx, store, obs, time.Now, runID, approvalID, "", by, note, ApprovalRejected)
+}
+
+// ErrApprovalChanged means the stored approval is no longer the one the
+// operator was shown.
+var ErrApprovalChanged = errors.New("agentrt: approval is not the one that was shown")
+
+// ApproveShown is Approve for a front end that displayed the approval
+// first: shownHash is the hash of what the operator read, and the decision
+// is refused with ErrApprovalChanged if the stored approval differs. The
+// comparison is made in the transaction that records the decision, and the
+// update is conditional on the hash, so a writer cannot change the row
+// between the check and the decision.
+func ApproveShown(ctx context.Context, store *Store, obs Observer, runID, approvalID, shownHash, by, note string) error {
+	if shownHash == "" {
+		return fmt.Errorf("%w: approval %s: no hash was shown", ErrApprovalChanged, approvalID)
+	}
+	return decide(ctx, store, obs, time.Now, runID, approvalID, shownHash, by, note, ApprovalApproved)
+}
+
+// RejectShown is Reject with the same binding as ApproveShown.
+func RejectShown(ctx context.Context, store *Store, obs Observer, runID, approvalID, shownHash, by, note string) error {
+	if shownHash == "" {
+		return fmt.Errorf("%w: approval %s: no hash was shown", ErrApprovalChanged, approvalID)
+	}
+	return decide(ctx, store, obs, time.Now, runID, approvalID, shownHash, by, note, ApprovalRejected)
 }
 
 // decide records an approval decision. A run that is not waiting fails
 // with ErrRunState; an approval that is not pending, or has expired, with
-// ErrNotPending.
-func decide(ctx context.Context, store *Store, obs Observer, clock func() time.Time, runID, approvalID, by, note string, status ApprovalStatus) error {
+// ErrNotPending; one whose fields no longer match its hash with
+// ErrApprovalHash; and, when shown is set, one whose hash is not shown with
+// ErrApprovalChanged. The checks are repeated on the row read inside the
+// deciding transaction, which holds the write lock, and the update is
+// conditional on the hash checked.
+func decide(ctx context.Context, store *Store, obs Observer, clock func() time.Time, runID, approvalID, shown, by, note string, status ApprovalStatus) error {
 	run, err := store.GetRun(ctx, runID)
 	if err != nil {
 		return err
@@ -101,11 +159,17 @@ func decide(ctx context.Context, store *Store, obs Observer, clock func() time.T
 	if err != nil {
 		return err
 	}
-	if a.Status != ApprovalPending {
-		return fmt.Errorf("%w: approval %s is already %s", ErrNotPending, approvalID, a.Status)
+	check := func(a Approval) error {
+		if a.Status != ApprovalPending {
+			return fmt.Errorf("%w: approval %s is already %s", ErrNotPending, approvalID, a.Status)
+		}
+		if shown != "" && a.Hash != shown {
+			return fmt.Errorf("%w: approval %s", ErrApprovalChanged, approvalID)
+		}
+		return verifyHash(a)
 	}
-	if approvalHash(a.Kind, a.Capability, a.Presentation, a.Request) != a.Hash {
-		return ErrApprovalHash
+	if err := check(a); err != nil {
+		return err
 	}
 	now := clock()
 	if !a.ExpiresAt.IsZero() && now.After(a.ExpiresAt) {
@@ -114,41 +178,47 @@ func decide(ctx context.Context, store *Store, obs Observer, clock func() time.T
 		}
 		return fmt.Errorf("%w: approval %s expired at %s", ErrNotPending, approvalID, a.ExpiresAt.Format(time.RFC3339))
 	}
-	a.Status, a.DecidedAt, a.DecidedBy, a.Note = status, now, by, note
-	// Loaded before the transaction: the store has a single connection.
-	steps, err := store.ListSteps(ctx, runID)
-	if err != nil {
-		return err
-	}
 	return store.tx(ctx, obs, func(t *txn) error {
 		if err := t.requireStatus(ctx, runID, StatusWaitingForApproval); err != nil {
 			return err
 		}
-		if err := t.decideApproval(ctx, a); err != nil {
+		cur, err := t.getApproval(ctx, runID, approvalID)
+		if err != nil {
 			return err
 		}
-		if err := t.appendEvent(ctx, Event{RunID: runID, StepID: a.StepID, At: now, Type: EventApprovalDecided, Payload: toJSON(map[string]any{"approval_id": a.ID, "status": status, "by": by, "note": note})}); err != nil {
+		if err := check(cur); err != nil {
+			return err
+		}
+		cur.Status, cur.DecidedAt, cur.DecidedBy, cur.Note = status, now, by, note
+		if err := t.decideApproval(ctx, cur, ApprovalPending, cur.Hash); err != nil {
+			return err
+		}
+		if err := t.emit(ctx, Event{RunID: runID, StepID: cur.StepID, At: now, Type: EventApprovalDecided}, map[string]any{"approval_id": cur.ID, "status": status, "by": by, "note": note}); err != nil {
 			return err
 		}
 		if status != ApprovalRejected {
 			return nil
 		}
-		for _, st := range steps {
-			if st.ID != a.StepID {
-				continue
-			}
-			o := observation(ObservePolicyDenied, map[string]any{"approval_id": a.ID, "note": note}, "approval rejected: "+note)
-			from := st.Status
-			st.Status, st.Observation, st.FinishedAt = StepFailed, &o, now
-			if err := t.updateStep(ctx, st, from); err != nil {
-				return err
-			}
-		}
-		run.Status, run.Reason, run.ReasonDetail, run.FinishedAt = StatusCancelled, ReasonApprovalRejected, note, now
-		if err := t.transition(ctx, run, StatusWaitingForApproval); err != nil {
+		// Only the awaiting step's outcome columns are written: its
+		// decision and policy stay exactly as stored.
+		o := observation(ObservePolicyDenied, map[string]string{"approval_id": cur.ID, "note": note}, "approval rejected: "+note)
+		obsJSON, err := marshalOpt(&o)
+		if err != nil {
 			return err
 		}
-		return t.appendEvent(ctx, Event{RunID: runID, At: now, Type: EventRunFinished, Payload: toJSON(map[string]any{"status": run.Status, "reason": run.Reason, "detail": note, "steps": run.StepCount})})
+		if _, err := t.tx.ExecContext(ctx, `UPDATE steps SET status=?, observation_json=?, observation_hash=?, finished_at=? WHERE id=? AND run_id=?`,
+			StepFailed, obsJSON, o.ContentHash, formatTime(now), cur.StepID, runID); err != nil {
+			return err
+		}
+		r, err := t.loadRun(ctx, runID)
+		if err != nil {
+			return err
+		}
+		r.Status, r.Reason, r.ReasonDetail, r.FinishedAt = StatusCancelled, ReasonApprovalRejected, note, now
+		if err := t.transition(ctx, r, StatusWaitingForApproval); err != nil {
+			return err
+		}
+		return t.emit(ctx, Event{RunID: runID, At: now, Type: EventRunFinished}, map[string]any{"status": r.Status, "reason": r.Reason, "detail": note, "steps": r.StepCount})
 	})
 }
 
@@ -159,7 +229,8 @@ func decide(ctx context.Context, store *Store, obs Observer, clock func() time.T
 // observation naming the cancellation, and pending approvals are left as
 // they are. A loop still executing the run finds it cancelled at its next
 // write and stops there; the runtime does not interrupt a tool already
-// running.
+// running, and what such a tool returns is appended to the cancelled run
+// as a late step.tool_finished event.
 func (d *Driver) Cancel(ctx context.Context, runID, by, note string) error {
 	return cancelRun(ctx, d.store, d.observer, d.now, runID, by, note)
 }
@@ -181,38 +252,48 @@ func cancelRun(ctx context.Context, store *Store, obs Observer, clock func() tim
 		return fmt.Errorf("%w: run %s is already %s", ErrRunState, runID, run.Status)
 	}
 	now := clock()
-	o := observation(ObserveInterrupted, map[string]any{"by": by, "note": note}, "cancelled by operator: "+note)
+	o := observation(ObserveInterrupted, map[string]string{"by": by, "note": note}, "cancelled by operator: "+note)
+	obsJSON, err := marshalOpt(&o)
+	if err != nil {
+		return err
+	}
 	return store.tx(ctx, obs, func(t *txn) error {
 		r, err := t.requireRun(ctx, runID, notTerminal...)
 		if err != nil {
 			return err
 		}
 		if _, err := t.tx.ExecContext(ctx, `UPDATE steps SET status=?, observation_json=?, observation_hash=?, finished_at=? WHERE run_id=? AND status IN (?,?,?)`,
-			StepFailed, marshalOpt(&o), o.ContentHash, formatTime(now), runID, StepDeciding, StepAwaitingApproval, StepExecuting); err != nil {
+			StepFailed, obsJSON, o.ContentHash, formatTime(now), runID, StepDeciding, StepAwaitingApproval, StepExecuting); err != nil {
 			return err
 		}
 		r.Status, r.Reason, r.ReasonDetail, r.FinishedAt = StatusCancelled, ReasonOperatorCancelled, note, now
 		if err := t.transition(ctx, r, notTerminal...); err != nil {
 			return err
 		}
-		return t.appendEvent(ctx, Event{RunID: runID, At: now, Type: EventRunFinished, Payload: toJSON(map[string]any{"status": r.Status, "reason": r.Reason, "detail": note, "by": by, "steps": r.StepCount})})
+		return t.emit(ctx, Event{RunID: runID, At: now, Type: EventRunFinished}, map[string]any{"status": r.Status, "reason": r.Reason, "detail": note, "by": by, "steps": r.StepCount})
 	})
 }
 
-// expireApproval marks a pending approval expired and cancels the run.
+// expireApproval marks an approval expired, pending or a grant never
+// resumed, and cancels the run.
 func expireApproval(ctx context.Context, store *Store, obs Observer, run Run, a Approval, now time.Time) error {
-	a.Status, a.DecidedAt, a.Note = ApprovalExpired, now, "expired"
+	from := a.Status
+	if from == ApprovalPending {
+		a.DecidedAt, a.Note = now, "expired"
+	}
+	// A grant keeps who decided it and when; its expiry is the event.
+	a.Status = ApprovalExpired
 	run.Status, run.Reason, run.ReasonDetail, run.FinishedAt = StatusCancelled, ReasonApprovalExpired, "approval "+a.ID+" expired", now
 	return store.tx(ctx, obs, func(t *txn) error {
-		if err := t.decideApproval(ctx, a); err != nil {
+		if err := t.decideApproval(ctx, a, from, a.Hash); err != nil {
 			return err
 		}
 		if err := t.transition(ctx, run, StatusWaitingForApproval); err != nil {
 			return err
 		}
-		if err := t.appendEvent(ctx, Event{RunID: run.ID, StepID: a.StepID, At: now, Type: EventApprovalDecided, Payload: toJSON(map[string]any{"approval_id": a.ID, "status": ApprovalExpired})}); err != nil {
+		if err := t.emit(ctx, Event{RunID: run.ID, StepID: a.StepID, At: now, Type: EventApprovalDecided}, map[string]any{"approval_id": a.ID, "status": ApprovalExpired}); err != nil {
 			return err
 		}
-		return t.appendEvent(ctx, Event{RunID: run.ID, At: now, Type: EventRunFinished, Payload: toJSON(map[string]any{"status": run.Status, "reason": run.Reason, "detail": run.ReasonDetail, "steps": run.StepCount})})
+		return t.emit(ctx, Event{RunID: run.ID, At: now, Type: EventRunFinished}, map[string]any{"status": run.Status, "reason": run.Reason, "detail": run.ReasonDetail, "steps": run.StepCount})
 	})
 }

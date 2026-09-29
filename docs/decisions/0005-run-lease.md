@@ -20,11 +20,15 @@ one cannot.
 
 The heartbeat is time-based, not per step, because a tool or model call
 can outlast any TTL a crash should be detected within. It writes one
-statement outside any transaction, so on the store's one connection it
-waits its turn like every other write and never holds the connection
-across anything else. Renewal is compare-and-set on the owner; when it
-fails, or the lease expires unrenewed, the loop stops before its next side
-effect, a tool call or a model request, and returns `ErrLeaseLost`. A tool
+statement outside any transaction, on a connection of its own for a
+file-backed store: on the store's one shared connection it waited behind
+whatever held it, and a consumer holding `DB()` with rows open starved
+it until another process took a live run over. Renewal is compare-and-set
+on the owner; when it fails, or the lease expires unrenewed, the loop
+stops before its next side effect, a tool call or a model request, and
+returns `ErrLeaseLost`. The writes that start those side effects check
+the stored expiry against the wall clock as well as the owner, so a loop
+stalled past its expiry starts nothing even when nobody has taken the run. A tool
 call already in flight cannot be recalled. Its outcome is recorded only if
 its loop still holds the lease when it returns; otherwise the step stays as
 it was for the new owner, whose reconciliation treats it as interrupted,
@@ -37,10 +41,21 @@ about; acquiring, renewing, and releasing are not events, so the event
 sequence of an ordinary run, which consumers' tests and replays compare,
 is unchanged.
 
+The owner stored is `Config.LeaseOwner` followed by a random suffix drawn
+per `Driver`. A configured name alone identified nothing: two replicas
+configured alike held one owner, so each took the other's live run as its
+own, and one driver running a run in two calls did the same. With the
+suffix no two drivers share an owner, and a driver also refuses a second
+call on a run it is executing.
+
 An operator's Cancel needs no lease: it is the operator's authority, it
 releases the lease with the run, and a live loop stops at its next write
-as before. A database written before the lease has runs with none, and a
-RUNNING one among them is free to Resume.
+as before. A database written before the lease has runs with none. The
+migration that adds the lease gives every RUNNING run one, `DefaultLeaseTTL`
+long under a placeholder owner, because a process of the older version
+may still be executing it; after that it is free to Resume. An older
+version ignores leases altogether, so every process of one must be
+stopped before a current one first opens the file.
 
 Alternatives: an advisory file lock or SQLite's own locking, which do not
 survive the process as a record and say nothing to a reader of the row;
@@ -50,10 +65,13 @@ long calls a lease is for and adds a statement per step; stamping lease
 times with `Config.Now`.
 
 Tradeoffs: a process that dies holding a lease blocks Resume of its run
-for up to one TTL, 30 seconds by default, unless it restarts with the same
-`LeaseOwner`. Lease expiry compares wall clocks, so processes on different
-machines sharing a file need clocks agreeing to well within the TTL. The
-heartbeat is a goroutine and a write every TTL/3 per running call.
+for up to one TTL, 30 seconds by default, including for the same process
+restarted: there is no instant takeover by name, because a name is not
+proof that the old process is gone. Lease expiry compares wall clocks, so
+processes on different machines sharing a file need clocks agreeing to
+well within the TTL, and SQLite on a network filesystem is unsupported.
+The heartbeat is a goroutine, a second connection per file-backed store,
+and a write every TTL/3 per running call.
 
 Revisit when: runs are executed by more than one machine against a store
 that is not one SQLite file, or a consumer needs to hand a live run from

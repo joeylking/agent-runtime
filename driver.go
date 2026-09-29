@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -30,10 +31,12 @@ type Config struct {
 	// Zero means DefaultLeaseTTL. Lease times are read from the wall
 	// clock, never from Now.
 	LeaseTTL time.Duration
-	// LeaseOwner identifies this driver in the leases it takes. Empty
-	// means a random id per Driver. A process that keeps its id across a
-	// restart may resume its own runs without waiting for their leases to
-	// expire, so an id must never be shared by two live processes.
+	// LeaseOwner names this driver in the leases it takes, for an operator
+	// reading them. The owner stored is the name followed by a random
+	// suffix drawn per Driver, so two drivers, in one process or two,
+	// never hold a lease as the same owner, and a restarted process waits
+	// out the leases its previous life held like any other process. Empty
+	// means the random part alone.
 	LeaseOwner string
 }
 
@@ -65,6 +68,11 @@ type Driver struct {
 	wall        func() time.Time
 	sleep       func(context.Context, time.Duration) error
 	noHeartbeat bool
+	// active holds the runs a call of this driver is executing, so a second
+	// Start or Resume of one of them here is refused rather than taking
+	// over the lease this driver itself holds.
+	mu     sync.Mutex
+	active map[string]bool
 }
 
 // NewDriver validates the configuration and compiles every tool schema.
@@ -95,9 +103,9 @@ func NewDriver(cfg Config) (*Driver, error) {
 		wall:      time.Now,
 		sleep:     sleep,
 	}
-	d.terms = leaseTerms{owner: cfg.LeaseOwner, ttl: cfg.LeaseTTL, wall: func() time.Time { return d.wall() }}
-	if d.terms.owner == "" {
-		d.terms.owner = newID()
+	d.terms = leaseTerms{owner: newID(), ttl: cfg.LeaseTTL, wall: func() time.Time { return d.wall() }}
+	if cfg.LeaseOwner != "" {
+		d.terms.owner = cfg.LeaseOwner + "/" + d.terms.owner[:12]
 	}
 	if d.terms.ttl <= 0 {
 		d.terms.ttl = DefaultLeaseTTL
@@ -150,6 +158,10 @@ func (d *Driver) StartWithID(ctx context.Context, id, goal string, limits Limits
 	if id == "" {
 		return Run{}, errors.New("agentrt: run id is required")
 	}
+	if !d.claim(id) {
+		return Run{}, d.busy(ctx, id)
+	}
+	defer d.unclaim(id)
 	now := d.now()
 	run := Run{
 		ID:        id,
@@ -164,7 +176,7 @@ func (d *Driver) StartWithID(ctx context.Context, id, goal string, limits Limits
 		if err := t.insertRun(ctx, run); err != nil {
 			return err
 		}
-		if err := t.appendEvent(ctx, Event{RunID: run.ID, At: now, Type: EventRunCreated, Payload: toJSON(map[string]any{"goal": goal, "limits": limits})}); err != nil {
+		if err := t.emit(ctx, Event{RunID: run.ID, At: now, Type: EventRunCreated}, map[string]any{"goal": goal, "limits": limits}); err != nil {
 			return err
 		}
 		return t.appendEvent(ctx, Event{RunID: run.ID, At: now, Type: EventRunStarted})
@@ -176,6 +188,36 @@ func (d *Driver) StartWithID(ctx context.Context, id, goal string, limits Limits
 	defer func() { l.stop(out, err) }()
 	l.start(at)
 	return d.loop(ctx, l)
+}
+
+// claim marks a run as executing in a call of this driver, and reports
+// false when another call already is.
+func (d *Driver) claim(runID string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.active[runID] {
+		return false
+	}
+	if d.active == nil {
+		d.active = map[string]bool{}
+	}
+	d.active[runID] = true
+	return true
+}
+
+func (d *Driver) unclaim(runID string) {
+	d.mu.Lock()
+	delete(d.active, runID)
+	d.mu.Unlock()
+}
+
+// busy is the error for a run another call of this driver is executing.
+func (d *Driver) busy(ctx context.Context, runID string) error {
+	e := ErrRunLeased{RunID: runID, Owner: d.terms.owner}
+	if owner, until, err := d.store.lease(ctx, runID); err == nil && owner == d.terms.owner {
+		e.ExpiresAt = until
+	}
+	return e
 }
 
 // sleep waits for d or until ctx is done.

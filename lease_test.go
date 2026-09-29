@@ -489,10 +489,12 @@ func TestStore_ReleasedMigrationsAreUnchanged(t *testing.T) {
 	}
 }
 
-// A database written by v0.2.1 opens and migrates with its runs intact,
-// and its interrupted run, which has no lease, is taken over by Resume
-// without a takeover event. OpenExisting refuses it before the migration
-// and opens it after.
+// A database written by v0.2.1 opens and migrates with its runs intact.
+// Its RUNNING run may still be executing in a v0.2.1 process, which knows
+// nothing of leases, so the migration stamps it with a lease one TTL long:
+// Resume is refused until that passes and then takes the run over, with
+// a takeover event naming the older version. OpenExisting refuses the
+// database before the migration and opens it after.
 func TestStore_V021DatabaseMigratesWithItsRuns(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v021.db")
 	v021(t, path)
@@ -520,8 +522,12 @@ func TestStore_V021DatabaseMigratesWithItsRuns(t *testing.T) {
 	if err != nil || crashed.Status != StatusRunning || crashed.ActiveTime != 1500*time.Millisecond {
 		t.Fatalf("interrupted run: %+v %v", crashed, err)
 	}
-	if owner, until := storedLease(t, st, "crashed"); owner != "" || !until.IsZero() {
-		t.Fatalf("lease %q %v on a migrated run", owner, until)
+	migrated := time.Now()
+	if owner, until := storedLease(t, st, "crashed"); owner != preLeaseOwner || until.Before(migrated.Add(DefaultLeaseTTL-5*time.Second)) || until.After(migrated.Add(DefaultLeaseTTL)) {
+		t.Fatalf("lease %q %v on a migrated run, want %q about %s from now", owner, until, preLeaseOwner, DefaultLeaseTTL)
+	}
+	if owner, _ := storedLease(t, st, "done"); owner != "" {
+		t.Fatalf("a finished run was leased by %q", owner)
 	}
 	if ro, err := OpenExisting(path, true); err != nil {
 		t.Fatalf("OpenExisting after the migration: %v", err)
@@ -529,10 +535,18 @@ func TestStore_V021DatabaseMigratesWithItsRuns(t *testing.T) {
 		ro.Close()
 	}
 	work := &stubTool{spec: ToolSpec{Name: "work", Description: "w", InputSchema: []byte(`{"type":"object"}`), SideEffect: LocalMutation, Timeout: time.Second}}
-	d, err := NewDriver(Config{Store: st, Agent: &listAgent{decisions: []Decision{{}, {Kind: DecideComplete}}}, Policy: DefaultPolicy(), Tools: []Tool{work}})
+	d, err := NewDriver(Config{Store: st, Agent: &listAgent{decisions: []Decision{{}, {Kind: DecideComplete}}}, Policy: DefaultPolicy(), Tools: []Tool{work},
+		Reconcile: func(context.Context, RunView) (Reconciliation, error) {
+			return Reconciliation{Outcome: ReconcileContinue}, nil
+		}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	var leased ErrRunLeased
+	if _, err := d.Resume(ctx, "crashed"); !errors.As(err, &leased) || leased.Owner != preLeaseOwner {
+		t.Fatalf("resume within the grace lease: %v", err)
+	}
+	d.wall = func() time.Time { return migrated.Add(DefaultLeaseTTL + time.Second) }
 	got, err := d.Resume(ctx, "crashed")
 	if err != nil || got.Status != StatusCompleted || work.calls != 0 {
 		t.Fatalf("resume: %v %s, %d calls", err, got.Status, work.calls)
@@ -542,8 +556,11 @@ func TestStore_V021DatabaseMigratesWithItsRuns(t *testing.T) {
 	for _, e := range events {
 		types = append(types, e.Type)
 	}
-	if want := "step.interrupted run.resumed step.started step.decided run.finished"; strings.Join(types, " ") != want {
+	if want := "lease.taken_over step.interrupted run.resumed step.started step.decided run.finished"; strings.Join(types, " ") != want {
 		t.Fatalf("events %v, want %s", types, want)
+	}
+	if !strings.Contains(string(events[0].Payload), preLeaseOwner) {
+		t.Fatalf("takeover payload = %s", events[0].Payload)
 	}
 }
 

@@ -3,6 +3,7 @@ package agentrt
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -17,7 +18,7 @@ func (d *Driver) startStep(ctx context.Context, c *runCache, run Run) (Step, err
 		if err := t.insertStep(ctx, step); err != nil {
 			return err
 		}
-		return t.appendEvent(ctx, Event{RunID: run.ID, StepID: step.ID, At: now, Type: EventStepStarted, Payload: toJSON(map[string]any{"index": step.Index})})
+		return t.emit(ctx, Event{RunID: run.ID, StepID: step.ID, At: now, Type: EventStepStarted}, map[string]any{"index": step.Index})
 	})
 	return step, err
 }
@@ -31,7 +32,7 @@ func (d *Driver) recordDecision(ctx context.Context, c *runCache, step *Step) er
 		if err := t.updateStep(ctx, *step, StepDeciding); err != nil {
 			return err
 		}
-		return t.appendEvent(ctx, Event{RunID: step.RunID, StepID: step.ID, At: now, Type: EventStepDecided, Payload: toJSON(step.Decision)})
+		return t.emit(ctx, Event{RunID: step.RunID, StepID: step.ID, At: now, Type: EventStepDecided}, step.Decision)
 	})
 }
 
@@ -66,7 +67,7 @@ func (d *Driver) endStepTx(ctx context.Context, t *txn, step *Step, status StepS
 		} else {
 			payload["error"] = detail
 		}
-		if err := t.appendEvent(ctx, Event{RunID: step.RunID, StepID: step.ID, At: now, Type: EventStepToolFinished, Payload: toJSON(payload)}); err != nil {
+		if err := t.emit(ctx, Event{RunID: step.RunID, StepID: step.ID, At: now, Type: EventStepToolFinished}, payload); err != nil {
 			return err
 		}
 	}
@@ -78,7 +79,7 @@ func (d *Driver) endStepTx(ctx context.Context, t *txn, step *Step, status StepS
 		payload["observation"] = obs.Kind
 		payload["content_hash"] = obs.ContentHash
 	}
-	return t.appendEvent(ctx, Event{RunID: step.RunID, StepID: step.ID, At: now, Type: EventStepFailed, Payload: toJSON(payload)})
+	return t.emit(ctx, Event{RunID: step.RunID, StepID: step.ID, At: now, Type: EventStepFailed}, payload)
 }
 
 // ending is how a run ends: its terminal status and reason, and the step
@@ -136,15 +137,75 @@ func (d *Driver) settle(ctx context.Context, c *runCache, runID string, from []R
 			return err
 		}
 		if e.limit {
-			if err := t.appendEvent(ctx, Event{RunID: runID, At: now, Type: EventLimitExceeded, Payload: toJSON(map[string]any{"reason": e.reason, "detail": e.detail})}); err != nil {
+			if err := t.emit(ctx, Event{RunID: runID, At: now, Type: EventLimitExceeded}, map[string]any{"reason": e.reason, "detail": e.detail}); err != nil {
 				return err
 			}
 		}
 		out = r
-		return t.appendEvent(ctx, Event{RunID: runID, At: now, Type: EventRunFinished, Payload: toJSON(map[string]any{"status": e.status, "reason": e.reason, "detail": e.detail, "steps": r.StepCount})})
+		return t.emit(ctx, Event{RunID: runID, At: now, Type: EventRunFinished}, map[string]any{"status": e.status, "reason": e.reason, "detail": e.detail, "steps": r.StepCount})
 	})
 	if err != nil {
 		return Run{}, err
 	}
 	return out, nil
+}
+
+// failInternal ends a run in one of from as internal_error when a write
+// the loop needed could not be made because a value would not encode. The
+// step in flight is failed with an observation saying so, and nothing more
+// is executed.
+func (d *Driver) failInternal(ctx context.Context, runID string, from []RunStatus, cause error) (Run, error) {
+	now := d.now()
+	detail := "internal: " + cause.Error()
+	o := observation(ObserveInvalidDecision, map[string]string{"error": detail}, detail)
+	obsJSON, err := marshalOpt(&o)
+	if err != nil {
+		return Run{}, err
+	}
+	var out Run
+	if err := d.write(ctx, nil, func(t *txn) error {
+		r, err := t.requireRun(ctx, runID, from...)
+		if err != nil {
+			return err
+		}
+		if _, err := t.tx.ExecContext(ctx, `UPDATE steps SET status=?, observation_json=?, observation_hash=?, finished_at=? WHERE run_id=? AND status IN (?,?,?)`,
+			StepFailed, obsJSON, o.ContentHash, formatTime(now), runID, StepDeciding, StepAwaitingApproval, StepExecuting); err != nil {
+			return err
+		}
+		r.Status, r.Reason, r.ReasonDetail, r.FinishedAt = StatusFailed, ReasonInternalError, detail, now
+		if err := t.transition(ctx, r, from...); err != nil {
+			return err
+		}
+		out = r
+		return t.emit(ctx, Event{RunID: runID, At: now, Type: EventRunFinished}, map[string]any{"status": r.Status, "reason": r.Reason, "detail": detail, "steps": r.StepCount})
+	}); err != nil {
+		return Run{}, fmt.Errorf("%w (and failing the run: %w)", cause, err)
+	}
+	return out, nil
+}
+
+// recordLate appends what a tool returned to a run an operator cancelled
+// while the tool ran, as a step.tool_finished event marked late. The run
+// stays cancelled and the step row keeps what Cancel wrote; the event is
+// the record of the side effect. It reports whether the run was such a
+// run.
+func (d *Driver) recordLate(ctx context.Context, step *Step, obs Observation) bool {
+	now := d.now()
+	late := false
+	err := d.store.tx(ctx, d.observer, func(t *txn) error {
+		r, err := t.loadRun(ctx, step.RunID)
+		if err != nil {
+			return err
+		}
+		if r.Status != StatusCancelled || r.Reason != ReasonOperatorCancelled {
+			return nil
+		}
+		late = true
+		payload := map[string]any{"tool": step.Decision.Tool, "duration_ms": now.Sub(step.StartedAt).Milliseconds(), "late": true, "observation": obs}
+		if obs.Kind == ObserveToolResult {
+			payload["summary"], payload["content_hash"] = obs.Summary, obs.ContentHash
+		}
+		return t.emit(ctx, Event{RunID: step.RunID, StepID: step.ID, At: now, Type: EventStepToolFinished}, payload)
+	})
+	return late && err == nil
 }

@@ -170,9 +170,9 @@ func TestContentHash_Golden(t *testing.T) {
 		}
 	}
 	req := ToolRequest{RunID: "r1", StepID: "s1", Spec: ToolSpec{Name: "push", Description: "push <main> & tag", InputSchema: json.RawMessage(`{"type":"object"}`), SideEffect: RemoteMutation, Timeout: 30 * time.Second}, Args: json.RawMessage(`{"n":7,"ref":"refs/heads/main"}`)}
-	got := approvalHash("remote_mutation", json.RawMessage(`{"tool":"push","args":{"n":7}}`), json.RawMessage(`{"title":"Publish <PR> & tag","lines":1.0}`), req)
-	if want := "175bcfc7a7e3cdab6b98d7b50caf9f2a8e59d5208211b97de39a4b027c7fa0b2"; got != want {
-		t.Errorf("approvalHash = %s, want %s", got, want)
+	got, err := approvalHash("remote_mutation", json.RawMessage(`{"tool":"push","args":{"n":7}}`), json.RawMessage(`{"title":"Publish <PR> & tag","lines":1.0}`), req)
+	if want := "175bcfc7a7e3cdab6b98d7b50caf9f2a8e59d5208211b97de39a4b027c7fa0b2"; err != nil || got != want {
+		t.Errorf("approvalHash = %s, %v, want %s", got, err, want)
 	}
 }
 
@@ -187,5 +187,37 @@ func TestCheckJSON_RejectsWhatWouldHashLossily(t *testing.T) {
 		if err := checkJSON(json.RawMessage(bad)); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+// Nesting past maxJSONDepth is refused where it enters, however it is
+// spelled; brackets inside strings do not count.
+func TestCheckJSON_RefusesDeepNesting(t *testing.T) {
+	nest := func(n int) string { return strings.Repeat("[", n) + strings.Repeat("]", n) }
+	for _, ok := range []string{nest(maxJSONDepth), `{"a":` + nest(maxJSONDepth-1) + `}`, `"` + strings.Repeat("[{", 10000) + `"`, `["\"[[["]`} {
+		if err := checkJSON(json.RawMessage(ok)); err != nil {
+			t.Errorf("%.40s: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{nest(maxJSONDepth + 1), `{"a":` + nest(maxJSONDepth) + `}`, nest(10000), `{"x":` + strings.Repeat(`{"x":`, 9998) + `1` + strings.Repeat("}", 9999)} {
+		if err := checkJSON(json.RawMessage(bad)); err == nil || !strings.Contains(err.Error(), "nested deeper") {
+			t.Errorf("%.40s: %v", bad, err)
+		}
+	}
+}
+
+// A request the encoder or the canonical decoder refuses has no approval
+// hash, on any Go release: not the hash of an error message every such
+// request would share (Go 1.27), nor one over bytes the store cannot read
+// back (Go 1.26).
+func TestApprovalHash_ErrorsRatherThanSubstituting(t *testing.T) {
+	deep := func(key string) ToolRequest {
+		args := `{"` + key + `":` + strings.Repeat("[", 10000) + strings.Repeat("]", 10000) + `}`
+		return ToolRequest{RunID: "r", StepID: "s", Spec: ToolSpec{Name: "t"}, Args: json.RawMessage(args)}
+	}
+	a, errA := approvalHash("k", nil, nil, deep("a"))
+	b, errB := approvalHash("k", nil, nil, deep("b"))
+	if errA == nil || errB == nil || a != "" || b != "" {
+		t.Fatalf("hashes %q %v, %q %v; want errors", a, errA, b, errB)
 	}
 }

@@ -122,7 +122,8 @@ func (r *Recorder) Generate(ctx context.Context, req agentrt.ModelRequest) (agen
 	if err != nil {
 		return resp, err
 	}
-	if err := os.MkdirAll(r.Dir, 0o755); err != nil {
+	// Recordings hold whole conversations: they are the operator's alone.
+	if err := os.MkdirAll(r.Dir, 0o700); err != nil {
 		return resp, err
 	}
 	r.mu.Lock()
@@ -147,11 +148,36 @@ func (r *Recorder) Generate(ctx context.Context, req agentrt.ModelRequest) (agen
 	if err := enc.Encode(rec); err != nil {
 		return resp, err
 	}
-	tmp := filepath.Join(r.Dir, key+".tmp")
-	if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil {
-		return resp, err
+	return resp, writeFile(r.Dir, sequencePath(r.Dir, key, n), buf.Bytes())
+}
+
+// writeFile writes b to path through a file of its own creating in dir,
+// owner-only and synced before it is renamed into place, so no one else
+// can prepare the name, read it, or leave a recording half written.
+func writeFile(dir, path string, b []byte) (err error) {
+	f, err := os.CreateTemp(dir, ".recording-*.tmp")
+	if err != nil {
+		return err
 	}
-	return resp, os.Rename(tmp, sequencePath(r.Dir, key, n))
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(f.Name())
+		}
+	}()
+	if err := f.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }
 
 // sequencePath names the nth exchange for a key. The first keeps the

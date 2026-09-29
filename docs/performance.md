@@ -269,3 +269,40 @@ allocations and a few hundred bytes per step, 1.3% of allocations. A run
 also pays one wall-clock read per tool call. Taking the lease is two
 columns in the write that moves the run to RUNNING, and resuming an
 interrupted run takes it in one extra transaction, once per resume.
+
+## Security fixes: durable commits
+
+A store opened for writing now syncs every commit (`synchronous=FULL`
+instead of `NORMAL`), because in WAL mode `NORMAL` can lose the last
+commits on power loss, and the last commit may be the `step.tool_started`
+of a tool that ran. That costs one `fsync` of the WAL per transaction,
+four per step. Measured with the command below, `-count=3`, medians, on
+the same machine: before the fixes, after them, and after them with the
+sync level put back to `NORMAL` to separate its cost from the rest.
+
+```
+GOWORK=off go test -run '^$' -bench BenchmarkDriver -benchmem -count=3 .
+```
+
+| Run | time per step | | | bytes per run | | allocations per run | |
+|---|---|---|---|---|---|---|---|
+| | before | after | after, `NORMAL` | before | after | before | after |
+| 10 steps, small | 219 µs | 305 µs (+40%) | 220 µs | 442 KiB | 446 KiB | 7,729 | 7,720 |
+| 10 steps, 8 KiB | 310 µs | 377 µs (+22%) | 300 µs | 1.60 MiB | 1.60 MiB | 7,998 | 7,984 |
+| 100 steps, small | 224 µs | 294 µs (+31%) | 219 µs | 8.14 MiB | 8.66 MiB | 77,777 | 77,643 |
+| 100 steps, 8 KiB | 293 µs | 377 µs (+29%) | 301 µs | 21.0 MiB | 21.5 MiB | 80,597 | 80,468 |
+| 400 steps, small | 234 µs | 316 µs (+35%) | 241 µs | 83.3 MiB | 92.3 MiB | 313,789 | 313,353 |
+| 400 steps, 8 KiB | 295 µs | 385 µs (+30%) | 303 µs | 134.8 MiB | 143.8 MiB | 324,266 | 323,784 |
+
+All of the added time is the sync: with `NORMAL` the fixed code runs as
+fast as before. It is about 20 µs per commit here, on an Apple SSD, where
+`fsync` does not force the drive's own cache (SQLite's `fullfsync` is
+off). On a disk where `fsync` waits for the medium it is milliseconds per
+commit, and a step's cost would be dominated by it. That cost was taken
+on purpose: a lost `step.tool_started` would let the next owner treat a
+tool that ran as one that never started.
+
+The bytes grew with the structs the handouts copy: `Step` gained
+`DecodeError` and `Decision` gained the three `Invalid` fields, and the
+agent's and the policy's mirrors copy O(n) of each per step. The extra is
+about 60 bytes per prior step per step, 2% at 100 steps and 11% at 400.

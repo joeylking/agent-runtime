@@ -22,7 +22,7 @@ exists, reference given), **Verified** (a named test exercises it).
 | Policy re-evaluated on resume; a different required approval pauses again | Verified | `TestApproval_ResumeRepausesWhenPolicyWantsDifferentApproval` |
 | Terminal tools complete the run with their result | Verified | `TestDriver_TerminalToolCompletesRun` |
 | `ErrAbortRun` ends the run with `tool_abort` | Verified | `TestDriver_ToolAbortEndsRun` |
-| Resume of a run found mid-step: step marked interrupted, consumer reconciliation runs, side effects never re-executed | Verified | `TestResume_InterruptedStepIsReconciledAndContinued` |
+| Resume of a run found mid-step: step marked interrupted, consumer reconciliation runs, side effects re-executed only when reconciliation or an operator says so | Verified | `TestResume_InterruptedStepIsReconciledAndContinued`, `TestResume_InterruptedSideEffectWaitsForAnOperator` |
 | Model interface with content blocks, tool uses, usage; the agent's only handle is the accounting wrapper | Verified | `model.go`, `TestModel_UsageAndCostRecorded` |
 | Every attempt reserved as a row before dispatch; usage, latency, cost recorded; run totals maintained | Verified | `TestModel_UsageAndCostRecorded`, `TestModel_TransientRetryThenSuccess` |
 | Call limit enforced before dispatch; token and cost limits enforced on totals plus a conservative projection | Verified | `TestModel_CallLimitStopsBeforeDispatch`, `TestModel_TokenAndCostLimitsProjected` |
@@ -48,10 +48,10 @@ exists, reference given), **Verified** (a named test exercises it).
 
 | Capability | Status | Reference |
 |---|---|---|
-| Transport classification: a timeout is returned bare so the caller charges it as ambiguous; every other transport error is transient | Verified | `providers`, `TestClassifyTransport_TimeoutIsBareAndOthersAreTransient` |
+| Transport classification: a timeout or a body cut off mid-read is returned bare so the caller charges it as ambiguous; caller cancellation, a host that does not resolve, a certificate failure, and a malformed URL are permanent; every other transport error is transient | Verified | `providers`, `TestClassifyTransport_EveryClass`, `TestClassifyTransport_RealRoundTrips` |
 | HTTP status classification: 408, 429, 529, and 5xx are transient, other non-2xx permanent, both carrying the status and a bounded body excerpt | Verified | `TestClassifyStatus_RetryableAndPermanent`, `TestClassifyStatus_BodyExcerptIsBounded` |
 | An SDK adapter with only a status code and an error classifies the same way | Verified | `TestClassifyAPIError_StatusOnlyAdapter` |
-| Provider response bodies are read under a 16 MiB bound | Verified | `TestReadBody_StopsAtTheLimit` |
+| Provider response bodies are read under a 16 MiB bound, and a larger one is refused by name | Verified | `TestReadBody_RefusesABodyOverTheLimit`, `TestClient_LimitsBodiesAndNeverSharesTheDefault` |
 | Tool-use ids synthesized for providers that omit them | Verified | `TestSynthesizeToolUseID_UniquePerIndex` |
 | Price lookup refuses an unpriced paid model; a local model is recorded as free, so free and unpriced stay distinguishable | Verified | `providers/prices.go`, `TestPriceFor_UnpricedModelRefused`, `TestFree_DistinguishesFreeFromUnpriced`, `TestMerge_LaterTableWins` |
 | Budgets parsed from `5`, `4.41`, `$0.50` | Verified | `TestParseDollars_AcceptedForms` |
@@ -185,8 +185,52 @@ See ADR 5.
 | A loop that loses its lease stops before its next tool call or model request and returns `ErrLeaseLost`; the step in flight is left for the next owner | Verified | `TestLease_LoopThatLosesItsLeaseStopsBeforeTheNextToolCall`, `TestLease_ExpiredLeaseStopsTheLoopBeforeItsNextSideEffect`, `TestLease_NoModelCallAfterTheLeaseIsLost` |
 | The heartbeat renews the lease through a tool call several TTLs long, and stops when the call returns or panics; a panicking call releases its lease | Verified | `TestLease_LongToolCallKeepsTheLease`, `TestLease_HeartbeatStopsOnReturnAndOnPanic` |
 | An operator's Cancel needs no lease and releases it | Verified | `TestLease_CancelNeedsNoLease`, `TestCancel_LiveLoopStopsAtItsNextWrite` |
-| A v0.2.1 database migrates with its runs intact; its RUNNING run has no lease and is resumed without a takeover event; `OpenExisting` refuses an older or newer schema; the released migrations are pinned | Verified | `TestStore_V021DatabaseMigratesWithItsRuns`, `TestOpenExisting_RefusesEitherOtherVersion`, `TestStore_ReleasedMigrationsAreUnchanged` |
+| A v0.2.1 database migrates with its runs intact; its RUNNING run gets a lease one `DefaultLeaseTTL` long under a placeholder owner, is refused until that passes, and is then taken over with a takeover event; `OpenExisting` refuses an older or newer schema; the released migrations are pinned | Verified | `TestStore_V021DatabaseMigratesWithItsRuns`, `TestOpenExisting_RefusesEitherOtherVersion`, `TestStore_ReleasedMigrationsAreUnchanged` |
 | The ordinary path's events and clock readings are unchanged | Verified | `TestDriver_CachedViewEqualsReloadedView`, `TestDriver_ClockReadingsAreStable` |
+
+## Security sweep
+
+Every fix in the security sweep on the `audit-fixes` branch, core and
+modules, with the test that verifies it. See `SECURITY.md` and ADR 6.
+
+| Capability | Status | Reference |
+|---|---|---|
+| Consumer JSON nested deeper than 256 levels is refused where it enters: arguments and results as `invalid_decision`, tool content as `tool_error` keeping the bytes, a capability or a reconciliation's result by failing the run as `internal_error`; a tool schema that deep is refused at registration | Verified | `hash.go` `checkDepth`, `TestCheckJSON_RefusesDeepNesting`, `TestDriver_DeepJSONIsRefusedWhereItEnters` |
+| Nothing stored or hashed is replaced by a stand-in; an approval hash is an error for a request that does not encode, and a stored approval with the hash of an encoding error is refused by Approve and Resume | Verified | `approval.go` `approvalHash`, `TestApprovalHash_ErrorsRatherThanSubstituting`, `TestApproval_HashOfAnEncodingErrorIsRefused` |
+| A step or approval row that will not decode is listed with `DecodeError`; Resume fails its run as `internal_error` without rewriting it, it cannot be approved, and Cancel closes the run | Verified | `TestStore_UndecodableRowsDoNotWedgeTheRun` |
+| Only a step's latest approval is a grant; Resume with it pending returns `ErrRunState` and changes nothing, however often it is called | Verified | `TestResume_OnlyTheLatestApprovalOfAStepGrants`, `TestResume_RepausedStepDoesNotPileUpApprovals`, `TestResume_ReconciledRepauseLeavesNoOldGrantUsable` |
+| A new database and its WAL files are owner-only under any umask; a database or WAL file others can write is refused with `ErrInsecureMode`, one others can read is tightened by a writer that owns it | Verified | `store.go` `secureFiles`, `TestStore_FilesAreOwnerOnlyUnderAnyUmask`, `TestStore_ModesInAChildProcess`, `TestStore_RefusesADatabaseOthersCanWrite`, `TestStore_TightensADatabaseOthersCanRead` |
+| `OpenExisting` refuses a symbolic link with `ErrSymlink` | Verified | `TestOpenExisting_RefusesASymbolicLink` |
+| Usage with a negative count or more cached input than input, and a `ServedError` wrapping `ErrUnusableUsage` from an adapter, is charged the conservative estimate, recorded as an error, not retried, and ends the run as `model_unavailable`; totals and costs saturate | Verified | `model.go` `usable`, `TestModel_UnusableUsageIsChargedTheEstimate`, `TestModel_TotalsSaturateRatherThanWrap` |
+| A tool schema is compiled from itself and the standard metaschemas: a reference to a file, a URL, or a pipe fails registration and nothing is read | Verified | `schema.go`, `TestNewDriver_SchemaReferencesOutsideItselfAreRefused` |
+| Two drivers configured with one `LeaseOwner` hold different leases; one driver refuses a second call on a run it is executing; taking over one's own expired lease is recorded | Verified | `TestLease_SameLeaseOwnerNameIsTwoOwners`, `TestLease_OneDriverRefusesASecondCallOnItsRun`, `TestLease_OwnExpiredLeaseTakeoverIsRecorded` |
+| The heartbeat renews on its own connection, so a consumer holding `DB()` cannot starve it; a lapsed lease starts no tool and sends no model request | Verified | `TestLease_HeldConnectionDoesNotStarveTheHeartbeat`, `TestLease_LapsedLeaseStartsNoSideEffect` |
+| Without `Reconcile`, a step interrupted while executing a tool that is not ReadOnly pauses on an `interrupted_side_effect` approval; approving runs it again once on the same step, rejecting ends the run; ReadOnly and deciding steps continue | Verified | `resume.go` `interruptedPause`, `TestResume_InterruptedSideEffectWaitsForAnOperator`, `TestResume_InterruptedReadOnlyOrDecidingStepContinues` |
+| A tool's outcome when an operator cancelled the run during it is appended as a late `step.tool_finished` | Verified | `TestCancel_ToolOutcomeIsAppendedLate` |
+| Resume checks an approved request against the tool's current schema; `ReconcileWaiting` pauses only a valid executing tool call | Verified | `TestResume_ApprovedArgumentsMeetTheCurrentSchema`, `TestResume_ReconcilePausesOnlyAValidExecutingStep` |
+| Arguments that were not JSON are recorded in `Decision.InvalidArgs`, never in `Args`; rendering them is unchanged | Verified | `TestDriver_InvalidArgumentsAreRecordedOutOfBand`, `TestDriver_UnusableJSONDecisionsAreRecordedInvalid` |
+| `render.Decide` composes the reason and then caps it, each unexecuted tool name capped | Verified | `TestDecide_ReasonIsCappedAfterComposing`, `TestDecide_StopReasonsAndToolCall` |
+| `ApproveShown` and `RejectShown` compare the shown hash in the deciding transaction, with the update conditional on it | Verified | `TestApproval_ShownDecisionIsAtomic` |
+| A grant not resumed within `Limits.GrantTTL` of its decision expires at `Resume` and cancels the run with nothing executed; `ApprovalTTL` alone never expires a grant; a run stored without `grant_ttl` reads it as zero | Verified | `resume.go`, `TestResume_GrantNotResumedWithinTheTTLExpires`, `TestResume_ApprovalTTLAloneNeverExpiresAGrant`, `TestStore_LimitsWithoutGrantTTLDecodeToZero` |
+| Connections run with `trusted_schema` off and defensive mode on; a database holding a trigger or view is refused with `ErrUnsafeSchema`; writers sync every commit | Verified | `TestStore_RefusesTriggersAndViewsAndHardensItsConnections` |
+| The page reads (`ListRunsPage`, `GetRunCapped`, `ListStepsPage`, `ListApprovalsPage`, `ListEventsPage`, `PendingApprovalIDsOf`) decode only the rows of their page, cap every text column at `MaxPageText`, read an oversized step or approval column as its identifying fields, and take totals from `COUNT` | Verified | `TestStore_PagesAreBounded`, `TestStore_PageReadsOnlyThePage` |
+| Recordings are written owner-only through a file the recorder created, synced, then renamed | Verified | `TestRecorder_WritesOwnerOnlyThroughItsOwnFile` |
+| `cmd/agentrt` `runs`, `show`, and `events` read only the page they print, with totals from `COUNT`, from a database whose other rows would fail a full read | Verified | `cmd/agentrt`, `TestRead_OnlyThePageIsReadFromAHugeDatabase`, `TestRuns_LimitAndOffsetPageTheOutput`, `TestShow_LimitAndOffsetPageSteps`, `TestEvents_LimitAndOffsetPageTheOutput` |
+| `approve` and `reject` decide against the hash of the approval they printed and refuse a changed one; `-json` carries the decided hash | Verified | `TestDecide_BindsToTheHashActuallyShown`, `TestDecide_JSONIncludesTheDecidedHash`, `view` `TestApproveShown_RefusesAChangedApproval`, `TestApproveShown_AcceptsTheHashActuallyStored`, `TestRejectShown_RefusesAChangedApproval` |
+| The approval prompt prints one field per line with its size, bounds a long string by head and tail, and ends with a line of its own; `-json` bounds an approval the same way | Verified | `TestShow_LongArgumentTruncatedHeadAndTail`, `TestShow_TextModeCapsAnOversizedField`, `TestBoundValue_TruncatesOnlyOversizedStrings`, `TestBoundApproval_BoundsTheThreeJSONFields` |
+| `trace.Sanitize` escapes bidi controls, zero-width and invisible characters, the line and paragraph separators, and the tag block, and cuts runs of combining marks; ordinary scripts pass unchanged | Verified | `TestSanitize_BidiOverridesEscaped`, `TestSanitize_ReviewerBidiString`, `TestSanitize_ZeroWidthAndInvisibleEscaped`, `TestSanitize_LineAndParagraphSeparatorsEscaped`, `TestSanitize_TagBlockEscaped`, `TestSanitize_ExcessCombiningMarksCutWithMarker`, `TestSanitize_FewCombiningMarksSurviveUnmarked`, `TestSanitize_LegitimateScriptsAndEmojiSurvive`, `TestShow_BidiAndCombiningMarksInArgumentsEscaped` |
+| `cmd/agentrt` refuses an insecure mode, a trigger or view, and a symbolic link with one sentence each, matched by `errors.Is`/`errors.As` | Verified | `TestOpen_InsecureFileModeRefusedWithOneSentence`, `TestOpen_TriggerCarryingDatabaseRefusedWithOneSentence`, `TestOpen_SymlinkRefusedWithOneSentence` |
+| The provider adapters follow no redirect, and the key never reaches the redirect's target | Verified | `providers` `TestClient_RefusesRedirects`, `anthropic` and `openai` `TestGenerate_RedirectIsRefusedAndTheKeyStaysHome`, `ollama` `TestGenerate_RedirectIsRefused` |
+| A key goes over plain http only to exactly `localhost` or a literal loopback address, and only over a connection whose dialled address is loopback | Verified | `TestLoopback_OnlyLocalhostAndLiteralLoopbackAddresses`, `TestCheckEndpoint_KeyOverPlainHTTPOnlyToLoopback`, `TestLoopbackOnly_RefusesAConnectionThatLeavesTheMachine`, `anthropic` and `openai` `TestNew_RefusesAKeyOverPlainHTTPToARemoteHost`, `openai` `TestNew_LoopbackIsExactlyLocalhostOrALiteralAddress` |
+| A reply whose token counts are negative, do not fit, are not integers, or claim more cached input than input is a `ServedError` with zero usage wrapping `ErrUnusableUsage` | Verified | `TestUsageCount_OnlyANonNegativeIntegerThatFits`, `TestCheckUsage_NegativeOrMoreCachedThanInputIsUnusable`, `TestGenerate_UnusableUsageIsChargedNothing` in each adapter |
+| The OpenAI and Anthropic `Config` and `Model` print, marshal, and log with the key redacted | Verified | `TestConfigAndModel_EncodeWithoutTheKey` in both |
+| The MCP streamable-HTTP client follows no redirect | Verified | `mcp` `TestHTTP_RedirectIsNotFollowed` |
+| `mcp.Load` refuses a server schema that reaches outside itself, and its checks fall inside `ConnectTimeout` | Verified | `TestLoad_RefusesASchemaThatReachesOutsideItself`, `TestLoad_TheChecksFallInsideTheConnectTimeout` |
+| MCP text a server chose is escaped in the report and in Pin's errors | Verified | `TestReport_StringEscapesWhatTheServerChose`, `TestPin_ErrorEscapesTheServersMessage` |
+| The MCP pin matches listing keys exactly, records only SSE events the SDK acts on, and keeps structured numbers past 2^53 | Verified | `TestPin_RawListingMatchesKeysExactly`, `TestMessageTap_SkipsEventsTheSDKIgnores`, `TestCall_StructuredContentKeepsItsNumbers` |
+| An MCP stdio server runs in its own process group, and `Close` kills its descendants; on Linux it is started with `Pdeathsig` | Verified | `mcp/proc_linux.go`, `TestStdio_CloseKillsTheServersDescendants` |
+| `examples/mcp` runs the pinned server with `node` from a local install, refuses a manifest or rules file others can write, and escapes the server's text | Verified | `TestServer_RunsThePinnedPackageWithNode`, `TestReadOwned_RefusesAFileOthersCanWrite`, `TestOneLine_EscapesWhatTheServerChose` |
+| CI checkouts do not persist credentials, every job runs `go mod verify`, and Dependabot proposes a version only after a cooldown | Implemented | `.github/workflows/ci.yml`, `.github/workflows/release-check.yml`, `.github/dependabot.yml` |
 
 ## Performance
 
@@ -200,7 +244,7 @@ See `docs/performance.md` for the numbers.
 | The agent and the policy get copies: neither reaches the driver's steps or the other's view | Verified | `TestDriver_ConsumersCannotCorruptEachOther` |
 | `render.Messages` output is byte-identical to the previous implementation; turns that share an allocation stay independent | Verified | `TestMessages_MatchesOracle`, `TestMessages_AppendingToATurnLeavesTheNextAlone` |
 | `view.Runs` reads pending approvals in one query and matches per-run summaries; `GetApproval` is one row and refuses another run's approval | Verified | `Store.PendingApprovalIDs`, `TestRuns_OneQueryMatchesPerRunSummaries` |
-| `show` reads the run, its steps, and its approvals once each | Implemented | `view.Detail`, `cmd/agentrt` `cmdShow` |
+| `show` reads one bounded page of the run's steps and approvals, and counts the rest | Verified | `view.DetailPage`, `cmd/agentrt` `cmdShow`, `TestRead_OnlyThePageIsReadFromAHugeDatabase` |
 
 ## Not implemented
 

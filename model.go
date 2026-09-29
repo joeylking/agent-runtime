@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/bits"
 	"net"
 	"sync"
 	"syscall"
@@ -58,7 +60,45 @@ type Usage struct {
 }
 
 func (u Usage) add(o Usage) Usage {
-	return Usage{InputTokens: u.InputTokens + o.InputTokens, OutputTokens: u.OutputTokens + o.OutputTokens, CachedInputTokens: u.CachedInputTokens + o.CachedInputTokens}
+	return Usage{InputTokens: addTokens(u.InputTokens, o.InputTokens), OutputTokens: addTokens(u.OutputTokens, o.OutputTokens), CachedInputTokens: addTokens(u.CachedInputTokens, o.CachedInputTokens)}
+}
+
+// usable reports why usage a provider reported cannot be charged: a
+// negative count, or more cached input than input. Charging it would lower
+// the run's totals and cost and so disarm the limits they are checked
+// against.
+func (u Usage) usable() error {
+	if u.InputTokens < 0 || u.OutputTokens < 0 || u.CachedInputTokens < 0 {
+		return fmt.Errorf("negative token counts (input %d, output %d, cached %d)", u.InputTokens, u.OutputTokens, u.CachedInputTokens)
+	}
+	if u.CachedInputTokens > u.InputTokens {
+		return fmt.Errorf("%d cached input tokens of %d input tokens", u.CachedInputTokens, u.InputTokens)
+	}
+	return nil
+}
+
+// addTokens and addMicros saturate rather than wrap, so no total a run
+// keeps can overflow into a negative that would pass every limit.
+func addTokens(a, b int) int {
+	s := a + b
+	switch {
+	case b > 0 && s < a:
+		return math.MaxInt
+	case b < 0 && s > a:
+		return math.MinInt
+	}
+	return s
+}
+
+func addMicros(a, b Micros) Micros {
+	s := a + b
+	switch {
+	case b > 0 && s < a:
+		return math.MaxInt64
+	case b < 0 && s > a:
+		return math.MinInt64
+	}
+	return s
 }
 
 // ModelResponse is one generation result.
@@ -90,6 +130,14 @@ type TransientError struct {
 func (e TransientError) Error() string { return "transient: " + e.Err.Error() }
 func (e TransientError) Unwrap() error { return e.Err }
 
+// ErrUnusableUsage marks usage a provider reported that cannot be charged:
+// a negative count, one too large to hold, a count that is not an integer,
+// or more cached input than input. A Model that finds such usage returns a
+// ServedError wrapping it; the accounting caller then charges the
+// conservative estimate, as it does for usage it finds unusable itself,
+// and the call fails as model_unavailable without a retry.
+var ErrUnusableUsage = errors.New("unusable usage")
+
 // ServedError is returned by a Model when the provider served the request,
 // and so billed it, but the response could not be used: it would not
 // decode, or carried a tool call whose arguments are not JSON. Usage is what
@@ -118,14 +166,34 @@ type Price struct {
 // one for paid ones, so consumers pass a table for every paid model.
 type PriceTable map[string]Price
 
+// cost prices usage, each part rounded down to a whole micro as it always
+// was. Counts and prices below zero count as zero and the arithmetic
+// saturates, so a cost is never negative and never wraps.
 func (p PriceTable) cost(model string, u Usage) Micros {
 	pr, ok := p[model]
 	if !ok {
 		return 0
 	}
-	return Micros(int64(u.InputTokens-u.CachedInputTokens)*int64(pr.InputPerMTok)/1e6 +
-		int64(u.CachedInputTokens)*int64(pr.CachedInputPerMTok)/1e6 +
-		int64(u.OutputTokens)*int64(pr.OutputPerMTok)/1e6)
+	return addMicros(addMicros(
+		perMTok(u.InputTokens-u.CachedInputTokens, pr.InputPerMTok),
+		perMTok(u.CachedInputTokens, pr.CachedInputPerMTok)),
+		perMTok(u.OutputTokens, pr.OutputPerMTok))
+}
+
+// perMTok is tokens at price per million tokens, in 128 bits.
+func perMTok(tokens int, price Micros) Micros {
+	if tokens <= 0 || price <= 0 {
+		return 0
+	}
+	hi, lo := bits.Mul64(uint64(tokens), uint64(price))
+	if hi >= 1e6 {
+		return math.MaxInt64
+	}
+	q, _ := bits.Div64(hi, lo, 1e6)
+	if q > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return Micros(q)
 }
 
 // ModelCallStatus is the outcome of one attempt.
@@ -310,10 +378,16 @@ func (c *caller) retryWait(ctx context.Context, run Run, backoff time.Duration, 
 func (c *caller) attempt(ctx context.Context, req ModelRequest, attempt int, timeout time.Duration) (_ ModelResponse, at time.Time, done bool, _ error) {
 	call := ModelCall{ID: c.d.newID(), RunID: c.runID, StepID: c.stepID, Attempt: attempt, Status: CallDispatched, Model: c.cfg.Model.Name(), DispatchedAt: c.d.now()}
 	if err := c.d.store.tx(ctx, c.d.observer, func(t *txn) error {
+		// A request is a side effect: it is sent only inside a live lease,
+		// by the wall clock as well as by owner.
+		t.lease = &c.d.terms
+		if err := t.requireLease(ctx, c.runID); err != nil {
+			return fmt.Errorf("%w: %w", ErrLeaseLost, err)
+		}
 		if err := t.insertModelCall(ctx, call); err != nil {
 			return err
 		}
-		return t.appendEvent(ctx, Event{RunID: c.runID, StepID: c.stepID, At: call.DispatchedAt, Type: EventModelDispatched, Payload: toJSON(map[string]any{"call_id": call.ID, "attempt": attempt, "model": call.Model})})
+		return t.emit(ctx, Event{RunID: c.runID, StepID: c.stepID, At: call.DispatchedAt, Type: EventModelDispatched}, map[string]any{"call_id": call.ID, "attempt": attempt, "model": call.Model})
 	}); err != nil {
 		return ModelResponse{}, time.Time{}, true, err
 	}
@@ -324,10 +398,39 @@ func (c *caller) attempt(ctx context.Context, req ModelRequest, attempt int, tim
 	defer rcancel()
 	call.CompletedAt = c.d.now()
 	call.Latency = call.CompletedAt.Sub(call.DispatchedAt)
+	estimate := func() {
+		call.Usage = Usage{InputTokens: EstimateInputTokens(req), OutputTokens: max(req.MaxOutputTokens, 0)}
+		call.Cost = c.cfg.Prices.cost(call.Model, call.Usage)
+	}
 	ambiguous := func() {
 		call.Status = CallAmbiguous
-		call.Usage = Usage{InputTokens: EstimateInputTokens(req), OutputTokens: req.MaxOutputTokens}
-		call.Cost = c.cfg.Prices.cost(call.Model, call.Usage)
+		estimate()
+	}
+	// Usage that cannot be charged is replaced by the conservative
+	// estimate, and the reply is not used: whoever reported it is not to
+	// be believed about the rest. It is not retried.
+	var bad error
+	var served ServedError
+	switch {
+	case gerr == nil:
+		bad = resp.Usage.usable()
+	case errors.As(gerr, &served):
+		bad = served.Usage.usable()
+		if bad == nil && errors.Is(gerr, ErrUnusableUsage) {
+			// The adapter found the usage unusable and reported none.
+			bad = served.Err
+		}
+	}
+	if bad != nil {
+		call.Status, call.Error = CallError, bad.Error()
+		if !errors.Is(bad, ErrUnusableUsage) {
+			call.Error = "unusable usage: " + bad.Error()
+		}
+		estimate()
+		if err := c.record(rctx, call); err != nil {
+			return ModelResponse{}, call.CompletedAt, true, err
+		}
+		return ModelResponse{}, call.CompletedAt, true, ErrModelUnavailable{Attempts: attempt, Last: fmt.Errorf("the provider reported unusable usage: %w", bad)}
 	}
 	if gerr == nil {
 		call.Status, call.Usage = CallOK, resp.Usage
@@ -341,7 +444,6 @@ func (c *caller) attempt(ctx context.Context, req ModelRequest, attempt int, tim
 		return resp, call.CompletedAt, true, nil
 	}
 	call.Error = gerr.Error()
-	var served ServedError
 	var tr TransientError
 	retry := false
 	var out error
@@ -399,15 +501,15 @@ func (c *caller) reserve(ctx context.Context, req ModelRequest) (Usage, Micros, 
 	}
 	run.ModelCalls += c.reservedCalls
 	run.Usage = run.Usage.add(c.reserved)
-	run.EstimatedCost += c.reservedCost
+	run.EstimatedCost = addMicros(run.EstimatedCost, c.reservedCost)
 	if err := c.checkLimits(run, req); err != nil {
 		return Usage{}, 0, err
 	}
-	est := Usage{InputTokens: EstimateInputTokens(req), OutputTokens: req.MaxOutputTokens}
+	est := Usage{InputTokens: EstimateInputTokens(req), OutputTokens: max(req.MaxOutputTokens, 0)}
 	cost := c.cfg.Prices.cost(c.cfg.Model.Name(), est)
 	c.reservedCalls++
 	c.reserved = c.reserved.add(est)
-	c.reservedCost += cost
+	c.reservedCost = addMicros(c.reservedCost, cost)
 	return est, cost, nil
 }
 
@@ -417,7 +519,7 @@ func (c *caller) release(est Usage, cost Micros) {
 	defer c.mu.Unlock()
 	c.reservedCalls--
 	c.reserved = c.reserved.add(Usage{InputTokens: -est.InputTokens, OutputTokens: -est.OutputTokens, CachedInputTokens: -est.CachedInputTokens})
-	c.reservedCost -= cost
+	c.reservedCost = addMicros(c.reservedCost, -cost)
 }
 
 // checkLimits enforces the call, token, and cost limits before dispatch.
@@ -440,15 +542,15 @@ func (c *caller) checkLimits(run Run, req ModelRequest) error {
 			return ErrLimit{Reason: ReasonLimitCost, Detail: uncapped}
 		}
 	}
-	est := Usage{InputTokens: EstimateInputTokens(req), OutputTokens: req.MaxOutputTokens}
+	est := Usage{InputTokens: EstimateInputTokens(req), OutputTokens: max(req.MaxOutputTokens, 0)}
 	if l.MaxTotalTokens > 0 {
-		projected := run.Usage.InputTokens + run.Usage.OutputTokens + est.InputTokens + est.OutputTokens
+		projected := addTokens(addTokens(run.Usage.InputTokens, run.Usage.OutputTokens), addTokens(est.InputTokens, est.OutputTokens))
 		if projected > l.MaxTotalTokens {
 			return ErrLimit{Reason: ReasonLimitTokens, Detail: fmt.Sprintf("projected %d tokens, limit %d", projected, l.MaxTotalTokens)}
 		}
 	}
 	if l.MaxEstimatedCost > 0 {
-		projected := run.EstimatedCost + c.cfg.Prices.cost(c.cfg.Model.Name(), est)
+		projected := addMicros(run.EstimatedCost, c.cfg.Prices.cost(c.cfg.Model.Name(), est))
 		if projected > l.MaxEstimatedCost {
 			return ErrLimit{Reason: ReasonLimitCost, Detail: fmt.Sprintf("projected cost %d micros, limit %d", projected, l.MaxEstimatedCost)}
 		}
@@ -477,8 +579,8 @@ func (c *caller) record(ctx context.Context, call ModelCall) error {
 		if call.Status != CallOK {
 			typ = EventModelFailed
 		}
-		return t.appendEvent(ctx, Event{RunID: c.runID, StepID: c.stepID, At: call.CompletedAt, Type: typ, Payload: toJSON(map[string]any{
+		return t.emit(ctx, Event{RunID: c.runID, StepID: c.stepID, At: call.CompletedAt, Type: typ}, map[string]any{
 			"call_id": call.ID, "attempt": call.Attempt, "status": call.Status, "model": call.Model, "usage": call.Usage, "cost_micros": call.Cost, "latency_ms": call.Latency.Milliseconds(), "error": call.Error,
-		})})
+		})
 	})
 }

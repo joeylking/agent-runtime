@@ -166,7 +166,7 @@ func TestResume_GrantedApprovalIsTheLatestInserted(t *testing.T) {
 		req := ToolRequest{RunID: "r1", StepID: "s0", Spec: publish.spec, Args: json.RawMessage(args)}
 		pd, _ := DefaultPolicy().Evaluate(ctx, req, RunView{})
 		a := Approval{ID: id, RunID: "r1", StepID: "s0", Kind: pd.Kind, Capability: pd.Capability, Presentation: pd.Presentation, Request: req, Status: ApprovalApproved, CreatedAt: at, DecidedAt: at}
-		a.Hash = approvalHash(a.Kind, a.Capability, a.Presentation, a.Request)
+		a.Hash, _ = approvalHash(a.Kind, a.Capability, a.Presentation, a.Request)
 		return a
 	}
 	if err := store.tx(ctx, nil, func(t *txn) error {

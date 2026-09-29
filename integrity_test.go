@@ -2,6 +2,7 @@ package agentrt_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -180,21 +181,53 @@ func TestDriver_UnusableJSONDecisionsAreRecordedInvalid(t *testing.T) {
 			t.Fatalf("step %d = %s %+v", i, st.Status, st.Observation)
 		}
 	}
-	var kept map[string]string
-	if err := json.Unmarshal(steps[0].Decision.Args, &kept); err != nil || kept["invalid_json"] != `{"n":` {
-		t.Fatalf("recorded args = %s", steps[0].Decision.Args)
+	if d := steps[0].Decision; d.InvalidArgs != `{"n":` || d.Args != nil || d.InvalidBase64 {
+		t.Fatalf("recorded decision = %+v", d)
 	}
-	if !strings.Contains(steps[1].Observation.Summary, "duplicate key") {
-		t.Fatalf("duplicate key summary = %q", steps[1].Observation.Summary)
+	if !strings.Contains(steps[1].Observation.Summary, "duplicate key") || steps[1].Decision.InvalidArgs != `{"n":1,"n":2}` {
+		t.Fatalf("duplicate key: %q, %+v", steps[1].Observation.Summary, steps[1].Decision)
 	}
-	if !strings.Contains(string(steps[2].Decision.Result), "invalid_json_base64") {
-		t.Fatalf("recorded result = %s", steps[2].Decision.Result)
+	if d := steps[2].Decision; !d.InvalidBase64 || d.InvalidResult != base64.StdEncoding.EncodeToString([]byte("\"\xff\"")) || d.Result != nil {
+		t.Fatalf("recorded result = %+v", d)
 	}
-	if !strings.Contains(steps[3].Observation.Summary, "unpaired surrogate") || !strings.Contains(string(steps[3].Decision.Args), "invalid_json") {
-		t.Fatalf("lone surrogate: %s, args %s", steps[3].Observation.Summary, steps[3].Decision.Args)
+	if !strings.Contains(steps[3].Observation.Summary, "unpaired surrogate") || steps[3].Decision.InvalidArgs != `{"s":"\ud800"}` {
+		t.Fatalf("lone surrogate: %s, %+v", steps[3].Observation.Summary, steps[3].Decision)
 	}
 	if len(read.calls) != 0 || len(note.calls) != 0 {
 		t.Fatal("an unusable request executed")
+	}
+}
+
+// A valid call whose arguments happen to spell the runtime's old wrapper
+// for unparseable ones is recorded as the valid call it is, and differs
+// in the record from a call that could not be parsed; an agent cannot set
+// the runtime's Invalid fields either.
+func TestDriver_InvalidArgumentsAreRecordedOutOfBand(t *testing.T) {
+	h := newHarness(t, ":memory:")
+	run := newTool("run", agentrt.LocalMutation, `{"type":"object"}`, func(context.Context, agentrt.ToolCall) (agentrt.ToolResult, error) {
+		return agentrt.ToolResult{Content: []byte(`{}`)}, nil
+	})
+	agent := &scripted.Agent{Decisions: []agentrt.Decision{
+		{Kind: agentrt.DecideToolCall, Tool: "run", Args: json.RawMessage(`{"cmd": oops`)},
+		{Kind: agentrt.DecideToolCall, Tool: "run", Args: json.RawMessage(`{"invalid_json":"{\"cmd\": oops"}`), InvalidArgs: "forged"},
+		scripted.Complete(`{}`),
+	}}
+	got, err := h.driver(agent, agentrt.DefaultPolicy(), run).Start(context.Background(), "g", limits(10, 5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireStatus(t, got, agentrt.StatusCompleted, agentrt.ReasonGoalCompleted)
+	var bad, valid string
+	h.store.DB().QueryRow(`SELECT decision_json FROM steps WHERE run_id = ? AND idx = 0`, got.ID).Scan(&bad)
+	h.store.DB().QueryRow(`SELECT decision_json FROM steps WHERE run_id = ? AND idx = 1`, got.ID).Scan(&valid)
+	if bad != `{"kind":"tool_call","tool":"run","invalid_args":"{\"cmd\": oops"}` {
+		t.Fatalf("unparseable call recorded as %s", bad)
+	}
+	if valid != `{"kind":"tool_call","tool":"run","args":{"invalid_json":"{\"cmd\": oops"}}` {
+		t.Fatalf("valid call recorded as %s", valid)
+	}
+	if len(run.calls) != 1 || string(run.calls[0].Args) != `{"invalid_json":"{\"cmd\": oops"}` {
+		t.Fatalf("calls = %+v", run.calls)
 	}
 }
 

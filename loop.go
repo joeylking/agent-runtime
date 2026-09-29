@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -35,6 +36,10 @@ func (d *Driver) loop(ctx context.Context, l *lease) (Run, error) {
 			if c, err = d.load(ctx, runID); err != nil {
 				return Run{}, err
 			}
+			if derr := decodeErrors(c.steps, c.approvals); derr != nil {
+				// A record that cannot be read is not continued from.
+				return d.failInternal(ctx, runID, running, derr)
+			}
 		}
 		n := len(c.steps)
 		steps := c.steps[:n:n]
@@ -61,7 +66,7 @@ func (d *Driver) loop(ctx context.Context, l *lease) (Run, error) {
 			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: ReasonLoopDetected,
 				detail: fmt.Sprintf("%s produced the same observation %d times in a row", sig.tool, n),
 				pre: func(t *txn) error {
-					return t.appendEvent(ctx, Event{RunID: runID, At: at, Type: EventLoopDetected, Payload: toJSON(map[string]any{"repeats": n, "tool": sig.tool, "args_hash": sig.args, "observation_hash": sig.obs})})
+					return t.emit(ctx, Event{RunID: runID, At: at, Type: EventLoopDetected}, map[string]any{"repeats": n, "tool": sig.tool, "args_hash": sig.args, "observation_hash": sig.obs})
 				}})
 		}
 
@@ -103,7 +108,8 @@ func (d *Driver) loop(ctx context.Context, l *lease) (Run, error) {
 
 		// The decision is recorded verbatim before validation so the audit log
 		// shows what the agent asked for even when the request was invalid.
-		// JSON that cannot be stored as JSON is kept as a string.
+		// JSON that cannot be stored as JSON is kept as a string beside it.
+		decision = blankAsAbsent(decision)
 		recorded := recordable(decision)
 		step.Decision = &recorded
 		if err := d.recordDecision(ctx, c, &step); err != nil {
@@ -111,7 +117,7 @@ func (d *Driver) loop(ctx context.Context, l *lease) (Run, error) {
 		}
 
 		if verr := d.validateDecision(decision); verr != nil {
-			obs := observation(ObserveInvalidDecision, map[string]any{"error": verr.Error()}, "invalid decision: "+verr.Error())
+			obs := observation(ObserveInvalidDecision, map[string]string{"error": verr.Error()}, "invalid decision: "+verr.Error())
 			if err := d.endStep(ctx, c, &step, StepFailed, &obs, verr.Error()); err != nil {
 				return d.lost(ctx, runID, err)
 			}
@@ -141,9 +147,13 @@ func (d *Driver) loop(ctx context.Context, l *lease) (Run, error) {
 // lost is how the loop answers a write that failed or a lease it no longer
 // holds. When an operator cancelled the run under it, the loop stops and
 // returns the run as it now is. Otherwise only another owner can have
-// moved the run, so the loop has lost its lease and says so; any other
-// failure is returned as it is.
+// moved the run, so the loop has lost its lease and says so. A value that
+// would not encode fails the run as internal_error; any other failure is
+// returned as it is.
 func (d *Driver) lost(ctx context.Context, runID string, err error) (Run, error) {
+	if errors.Is(err, errEncode) {
+		return d.failInternal(ctx, runID, running, err)
+	}
 	if !errors.Is(err, ErrRunState) && !errors.Is(err, ErrLeaseLost) {
 		return Run{}, err
 	}
@@ -162,24 +172,51 @@ func (d *Driver) lost(ctx context.Context, runID string, err error) (Run, error)
 	return Run{}, fmt.Errorf("%w: %w", ErrLeaseLost, err)
 }
 
+// blankAsAbsent treats arguments or a result that are only whitespace as
+// absent, which is what validation already took them for.
+func blankAsAbsent(dec Decision) Decision {
+	if len(dec.Args) > 0 && len(bytes.TrimSpace(dec.Args)) == 0 {
+		dec.Args = nil
+	}
+	if len(dec.Result) > 0 && len(bytes.TrimSpace(dec.Result)) == 0 {
+		dec.Result = nil
+	}
+	return dec
+}
+
 // recordable returns the decision as it is stored. Arguments or a result
 // that are not usable JSON, which would not survive storage as JSON, are
-// kept verbatim as a string under "invalid_json" (base64 under
-// "invalid_json_base64" when they are not even UTF-8); validation then
-// rejects the decision with the original bytes.
+// moved verbatim to InvalidArgs or InvalidResult, base64 when they are not
+// UTF-8, and Args or Result left empty, so the record of a decision that
+// could not be parsed never looks like one that could; validation then
+// rejects the decision with the original bytes. The Invalid fields are
+// the runtime's, so whatever an agent put there is dropped.
 func recordable(dec Decision) Decision {
-	if len(bytes.TrimSpace(dec.Args)) > 0 && checkJSON(dec.Args) != nil {
-		dec.Args = toJSON(rawField("invalid_json", dec.Args, map[string]any{}))
+	dec.InvalidArgs, dec.InvalidResult, dec.InvalidBase64 = "", "", false
+	badArgs := len(dec.Args) > 0 && checkJSON(dec.Args) != nil
+	badResult := len(dec.Result) > 0 && checkJSON(dec.Result) != nil
+	if !badArgs && !badResult {
+		return dec
 	}
-	if len(bytes.TrimSpace(dec.Result)) > 0 && checkJSON(dec.Result) != nil {
-		dec.Result = toJSON(rawField("invalid_json", dec.Result, map[string]any{}))
+	dec.InvalidBase64 = badArgs && !utf8.Valid(dec.Args) || badResult && !utf8.Valid(dec.Result)
+	keep := func(raw []byte) string {
+		if dec.InvalidBase64 {
+			return base64.StdEncoding.EncodeToString(raw)
+		}
+		return string(raw)
+	}
+	if badArgs {
+		dec.InvalidArgs, dec.Args = keep(dec.Args), nil
+	}
+	if badResult {
+		dec.InvalidResult, dec.Result = keep(dec.Result), nil
 	}
 	return dec
 }
 
 // rawField stores bytes that are not usable JSON in m under key, as a
 // string, or base64 under key+"_base64" when they are not UTF-8.
-func rawField(key string, raw []byte, m map[string]any) map[string]any {
+func rawField(key string, raw []byte, m map[string]string) map[string]string {
 	if utf8.Valid(raw) {
 		m[key] = string(raw)
 	} else {
@@ -308,6 +345,10 @@ func (d *Driver) apply(ctx context.Context, c *runCache, l *lease, run Run, step
 	// the race between two resumers, so its loser gets ErrRunState.
 	fail := func(err error) (bool, Run, error) {
 		if granted != nil {
+			if errors.Is(err, errEncode) {
+				r, err := d.failInternal(ctx, run.ID, from, err)
+				return true, r, err
+			}
 			return true, Run{}, err
 		}
 		r, err := d.lost(ctx, run.ID, err)
@@ -329,7 +370,7 @@ func (d *Driver) apply(ctx context.Context, c *runCache, l *lease, run Run, step
 		policyAt = d.now()
 	}
 	policyEvent := func(t *txn) error {
-		return t.appendEvent(ctx, Event{RunID: run.ID, StepID: step.ID, At: policyAt, Type: EventStepPolicy, Payload: toJSON(step.Policy)})
+		return t.emit(ctx, Event{RunID: run.ID, StepID: step.ID, At: policyAt, Type: EventStepPolicy}, step.Policy)
 	}
 	if cerr := checkPolicy(pd); cerr != nil {
 		step.Policy = &PolicyDecision{Outcome: pd.Outcome, Reason: pd.Reason, Kind: pd.Kind}
@@ -339,8 +380,12 @@ func (d *Driver) apply(ctx context.Context, c *runCache, l *lease, run Run, step
 	step.Policy = &pd
 
 	allowed := pd.Outcome == Allow
-	if pd.Outcome == RequireApproval && granted != nil && approvalHash(pd.Kind, pd.Capability, pd.Presentation, req) == granted.Hash {
-		allowed = true
+	if pd.Outcome == RequireApproval && granted != nil {
+		h, err := approvalHash(pd.Kind, pd.Capability, pd.Presentation, req)
+		if err != nil {
+			return fail(err)
+		}
+		allowed = h == granted.Hash
 	}
 	switch {
 	case allowed:
@@ -360,7 +405,13 @@ func (d *Driver) apply(ctx context.Context, c *runCache, l *lease, run Run, step
 		}
 		at := d.wall()
 		if err := d.write(ctx, c, func(t *txn) error {
-			if err := d.enter(ctx, t, run, granted, resumedAt); err != nil {
+			// In the loop the lease must be unexpired as well as held: a
+			// side effect starts only inside a live lease.
+			if granted == nil {
+				if err := t.requireLease(ctx, run.ID); err != nil {
+					return err
+				}
+			} else if err := d.enter(ctx, t, run, granted, resumedAt); err != nil {
 				return err
 			}
 			if err := t.updateStep(ctx, *step, fromStep); err != nil {
@@ -373,14 +424,14 @@ func (d *Driver) apply(ctx context.Context, c *runCache, l *lease, run Run, step
 			if granted != nil {
 				payload["approval_id"] = granted.ID
 			}
-			return t.appendEvent(ctx, Event{RunID: run.ID, StepID: step.ID, At: startAt, Type: EventStepToolStarted, Payload: toJSON(payload)})
+			return t.emit(ctx, Event{RunID: run.ID, StepID: step.ID, At: startAt, Type: EventStepToolStarted}, payload)
 		}); err != nil {
 			return fail(err)
 		}
 		l.start(at)
 		return d.runTool(ctx, c, run, step, req)
 	case pd.Outcome == Deny:
-		obs := observation(ObservePolicyDenied, map[string]any{"tool": req.Spec.Name, "reason": pd.Reason}, "denied"+suffix+": "+pd.Reason)
+		obs := observation(ObservePolicyDenied, map[string]string{"tool": req.Spec.Name, "reason": pd.Reason}, "denied"+suffix+": "+pd.Reason)
 		stepAt := d.now()
 		at := d.wall()
 		if err := d.write(ctx, c, func(t *txn) error {
@@ -397,7 +448,7 @@ func (d *Driver) apply(ctx context.Context, c *runCache, l *lease, run Run, step
 		l.start(at)
 		return false, Run{}, nil
 	case pd.Outcome == Abort:
-		obs := observation(ObservePolicyDenied, map[string]any{"tool": req.Spec.Name, "reason": pd.Reason}, "aborted"+suffix+": "+pd.Reason)
+		obs := observation(ObservePolicyDenied, map[string]string{"tool": req.Spec.Name, "reason": pd.Reason}, "aborted"+suffix+": "+pd.Reason)
 		return settle(ending{status: StatusFailed, reason: ReasonPolicyAbort, detail: pd.Reason, pre: policyEvent,
 			step: step, stepStatus: StepFailed, obs: &obs, stepDetail: obs.Summary})
 	case pd.Outcome == RequireApproval:
@@ -427,7 +478,7 @@ func (d *Driver) enter(ctx context.Context, t *txn, run Run, granted *Approval, 
 	if err := t.transition(ctx, run, StatusWaitingForApproval); err != nil {
 		return err
 	}
-	return t.appendEvent(ctx, Event{RunID: run.ID, StepID: granted.StepID, At: now, Type: EventRunResumed, Payload: toJSON(map[string]any{"approval_id": granted.ID})})
+	return t.emit(ctx, Event{RunID: run.ID, StepID: granted.StepID, At: now, Type: EventRunResumed}, map[string]any{"approval_id": granted.ID})
 }
 
 // runTool executes a request whose step is already recorded as executing,
@@ -458,6 +509,11 @@ func (d *Driver) runTool(ctx context.Context, c *runCache, run Run, step *Step, 
 		err = d.endStep(rctx, c, step, StepDone, &obs, "")
 	}
 	if err != nil {
+		if errors.Is(err, ErrRunState) {
+			// An operator's Cancel while the tool ran: its outcome still
+			// goes on the record, as a late event.
+			d.recordLate(rctx, step, obs)
+		}
 		r, err := d.lost(ctx, run.ID, err)
 		return true, r, err
 	}
@@ -480,7 +536,7 @@ func (d *Driver) execute(ctx context.Context, req ToolRequest) (obs Observation,
 	defer cancel()
 	defer func() {
 		if r := recover(); r != nil {
-			obs = observation(ObserveToolError, map[string]any{"tool": req.Spec.Name, "error": fmt.Sprint("panic: ", r)}, fmt.Sprintf("%s panicked", req.Spec.Name))
+			obs = observation(ObserveToolError, map[string]string{"tool": req.Spec.Name, "error": fmt.Sprint("panic: ", r)}, fmt.Sprintf("%s panicked", req.Spec.Name))
 			abort = nil
 		}
 	}()
@@ -488,26 +544,28 @@ func (d *Driver) execute(ctx context.Context, req ToolRequest) (obs Observation,
 	if err != nil {
 		var ab ErrAbortRun
 		if errors.As(err, &ab) {
-			return observation(ObserveToolError, map[string]any{"tool": req.Spec.Name, "error": ab.Detail, "failure": "abort"}, fmt.Sprintf("%s aborted the run: %s", req.Spec.Name, ab.Detail)), &ab
+			return observation(ObserveToolError, map[string]string{"tool": req.Spec.Name, "error": ab.Detail, "failure": "abort"}, fmt.Sprintf("%s aborted the run: %s", req.Spec.Name, ab.Detail)), &ab
 		}
 		if ctx.Err() != nil {
-			return observation(ObserveInterrupted, map[string]any{"tool": req.Spec.Name, "error": err.Error(), "failure": "cancelled"}, fmt.Sprintf("%s was cancelled and its outcome is unknown: %s", req.Spec.Name, err.Error())), nil
+			return observation(ObserveInterrupted, map[string]string{"tool": req.Spec.Name, "error": err.Error(), "failure": "cancelled"}, fmt.Sprintf("%s was cancelled and its outcome is unknown: %s", req.Spec.Name, err.Error())), nil
 		}
 		kind := "error"
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(tctx.Err(), context.DeadlineExceeded) {
 			kind = "timeout"
 		}
-		return observation(ObserveToolError, map[string]any{"tool": req.Spec.Name, "error": err.Error(), "failure": kind}, fmt.Sprintf("%s %s: %s", req.Spec.Name, kind, err.Error())), nil
+		return observation(ObserveToolError, map[string]string{"tool": req.Spec.Name, "error": err.Error(), "failure": kind}, fmt.Sprintf("%s %s: %s", req.Spec.Name, kind, err.Error())), nil
 	}
 	content := orEmptyObject(res.Content)
 	if cerr := checkJSON(content); cerr != nil {
 		msg := "content is not usable JSON: " + cerr.Error()
-		return observation(ObserveToolError, rawField("content", content, map[string]any{"tool": req.Spec.Name, "error": msg, "failure": "invalid_content"}), fmt.Sprintf("%s returned %s", req.Spec.Name, msg)), nil
+		return observation(ObserveToolError, rawField("content", content, map[string]string{"tool": req.Spec.Name, "error": msg, "failure": "invalid_content"}), fmt.Sprintf("%s returned %s", req.Spec.Name, msg)), nil
 	}
 	return Observation{Kind: ObserveToolResult, Content: content, Summary: res.Summary, ContentHash: contentHash(content)}, nil
 }
 
-func observation(kind ObservationKind, content any, summary string) Observation {
-	raw := toJSON(content)
+// observation builds a runtime observation. Its content is string fields
+// only, whose encoding cannot fail, so there is no error to substitute for.
+func observation(kind ObservationKind, content map[string]string, summary string) Observation {
+	raw, _ := json.Marshal(content)
 	return Observation{Kind: kind, Content: raw, Summary: summary, ContentHash: contentHash(raw)}
 }

@@ -155,13 +155,57 @@ func contentHash(raw json.RawMessage) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// maxJSONDepth is the deepest nesting of arrays and objects the runtime
+// accepts in JSON a consumer hands it. encoding/json refuses to decode, and
+// on Go 1.27 to encode, past 10000 levels, and the runtime stores and
+// hashes a consumer's value inside objects of its own, so a value that
+// passed a check at 10000 would fail once wrapped: unencodable on one Go
+// release and undecodable on another. 256 leaves that margin many times
+// over, is far past any tool's arguments or result, and bounds the
+// recursion of the canonical encoder and the schema validator.
+const maxJSONDepth = 256
+
+// checkDepth rejects JSON nested deeper than maxJSONDepth. It counts
+// brackets outside strings and needs no valid input, so it runs before
+// anything that recurses.
+func checkDepth(raw []byte) error {
+	depth, inString := 0, false
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if inString {
+			switch c {
+			case '\\':
+				i++
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '[', '{':
+			if depth++; depth > maxJSONDepth {
+				return fmt.Errorf("nested deeper than %d levels", maxJSONDepth)
+			}
+		case ']', '}':
+			depth--
+		}
+	}
+	return nil
+}
+
 // checkJSON is the boundary check for JSON a consumer hands the runtime:
-// decision arguments and results, tool content, and approval capabilities
-// and presentations. It requires exactly one well-formed value, valid
-// UTF-8 throughout, no escaped surrogate outside a pair, and no object
-// with a repeated key. The last three are accepted by encoding/json but
-// decoded lossily, which would let two different documents share a hash.
+// decision arguments and results, tool content, approval capabilities and
+// presentations, and a reconciliation's result. It requires exactly one
+// well-formed value nested no deeper than maxJSONDepth, valid UTF-8
+// throughout, no escaped surrogate outside a pair, and no object with a
+// repeated key. The last three are accepted by encoding/json but decoded
+// lossily, which would let two different documents share a hash.
 func checkJSON(raw json.RawMessage) error {
+	if err := checkDepth(raw); err != nil {
+		return err
+	}
 	if !utf8.Valid(raw) {
 		return errors.New("not valid UTF-8")
 	}

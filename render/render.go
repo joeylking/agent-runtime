@@ -83,9 +83,13 @@ const (
 	DefaultRecentResults = 6
 	// DefaultMaxContentBytes caps one rendered result.
 	DefaultMaxContentBytes = 24000
-	// ReasonBytes caps the reason Decide records from a model's text, so a
-	// long narration cannot dominate the next render.
+	// ReasonBytes caps the reason Decide records, the model's text and the
+	// note naming any tool uses not executed together, so a long narration
+	// cannot dominate the next render.
 	ReasonBytes = 500
+	// NameBytes caps each unexecuted tool use's name in that note: the
+	// names are the model's, and nothing else bounds them.
+	NameBytes = 64
 )
 
 // InterruptedText re-requests a tool whose outcome the interruption left
@@ -212,9 +216,27 @@ func synthesize(dst []agentrt.ContentBlock, st agentrt.Step, toolUseID string) (
 		if d.Reason != "" {
 			dst = append(dst, agentrt.ContentBlock{Type: "text", Text: d.Reason})
 		}
-		dst = append(dst, agentrt.ContentBlock{Type: "tool_use", ToolUseID: toolUseID, Name: d.Tool, Input: orEmptyObject(d.Args)})
+		dst = append(dst, agentrt.ContentBlock{Type: "tool_use", ToolUseID: toolUseID, Name: d.Tool, Input: Args(*d)})
 	}
 	return dst, dst[start:len(dst):len(dst)]
+}
+
+// Args is a recorded decision's arguments as a tool_use block carries
+// them: an empty object when there were none and, for arguments that were
+// not JSON, which the runtime records out of band in InvalidArgs, the
+// object {"invalid_json": ...} (or "invalid_json_base64") that earlier
+// releases stored in their place, so a rendered conversation, and every
+// replay key taken over one, is what it was.
+func Args(d agentrt.Decision) json.RawMessage {
+	if d.InvalidArgs == "" {
+		return orEmptyObject(d.Args)
+	}
+	key := "invalid_json"
+	if d.InvalidBase64 {
+		key += "_base64"
+	}
+	b, _ := json.Marshal(map[string]string{key: d.InvalidArgs}) // strings always encode
+	return b
 }
 
 // DefaultObservation renders what a step produced, or a nudge when there
@@ -278,10 +300,10 @@ const (
 // tool use become the deliberately invalid kinds agentrt.KindTruncated and
 // agentrt.KindNoToolCall: the driver records an invalid_decision
 // observation and Messages nudges on the next step, which costs one step
-// against the limits and never executes a partial tool call. The reason
-// recorded from the model's text is capped at ReasonBytes. Only the first
-// tool use executes; when there are more, the reason says how many were
-// not executed and names them.
+// against the limits and never executes a partial tool call. Only the
+// first tool use executes; when there are more, the reason says how many
+// were not executed and names them, each name capped at NameBytes. The
+// reason as composed is capped at ReasonBytes.
 func Decide(resp agentrt.ModelResponse) agentrt.Decision {
 	switch resp.StopReason {
 	case StopRefusal:
@@ -291,23 +313,46 @@ func Decide(resp agentrt.ModelResponse) agentrt.Decision {
 	case StopMaxTokens:
 		return agentrt.Decision{Kind: agentrt.KindTruncated, Reason: "the reply hit the output token cap; the tool call was not executed"}
 	}
-	text := Truncate(strings.TrimSpace(resp.Text), ReasonBytes)
+	text := strings.TrimSpace(resp.Text)
 	if len(resp.ToolUses) == 0 {
-		return agentrt.Decision{Kind: agentrt.KindNoToolCall, Reason: text}
+		return agentrt.Decision{Kind: agentrt.KindNoToolCall, Reason: Truncate(text, ReasonBytes)}
 	}
 	tu := resp.ToolUses[0]
+	reason := Truncate(text, ReasonBytes)
 	if rest := resp.ToolUses[1:]; len(rest) > 0 {
-		names := make([]string, len(rest))
-		for i, r := range rest {
-			names[i] = r.Name
-		}
-		note := fmt.Sprintf("[%d further tool call(s) not executed: %s]", len(rest), strings.Join(names, ", "))
+		// The note is composed first, bounded, and the text gets the rest
+		// of the cap, so the model is still told what did not run.
+		note := unexecuted(rest)
 		if text != "" {
 			note = " " + note
 		}
-		text += note
+		reason = Truncate(text, ReasonBytes-len(note)) + note
 	}
-	return agentrt.Decision{Kind: agentrt.DecideToolCall, Tool: tu.Name, Args: orEmptyObject(tu.Args), Reason: text}
+	return agentrt.Decision{Kind: agentrt.DecideToolCall, Tool: tu.Name, Args: orEmptyObject(tu.Args), Reason: reason}
+}
+
+// unexecuted names the tool uses not executed, each name capped at
+// NameBytes and the note at half of ReasonBytes; names that do not fit
+// are elided.
+func unexecuted(rest []agentrt.ToolUse) string {
+	head := fmt.Sprintf("[%d further tool call(s) not executed: ", len(rest))
+	budget := ReasonBytes/2 - len(head) - len(", …]")
+	var b strings.Builder
+	b.WriteString(head)
+	for i, r := range rest {
+		name := Truncate(r.Name, NameBytes)
+		sep := ""
+		if i > 0 {
+			sep = ", "
+		}
+		if b.Len()-len(head)+len(sep)+len(name) > budget {
+			b.WriteString(sep + "…")
+			break
+		}
+		b.WriteString(sep + name)
+	}
+	b.WriteString("]")
+	return b.String()
 }
 
 // Truncate shortens s to at most n bytes, the "…" that marks the cut

@@ -45,11 +45,7 @@ func (d *Driver) load(ctx context.Context, runID string) (*runCache, error) {
 	c := &runCache{approvals: approvals, version: make([]int, len(rows)), apprVersion: 1}
 	for i := range rows {
 		c.version[i] = 1
-		st, err := rows[i].decode(nil, nil)
-		if err != nil {
-			return nil, err
-		}
-		c.steps = append(c.steps, st)
+		c.steps = append(c.steps, rows[i].decode(nil, nil))
 	}
 	return c, nil
 }
@@ -92,8 +88,8 @@ func (c *runCache) putStep(r stepRow) {
 		c.stale = true
 		return
 	}
-	st, err := r.decode(&c.last, prev)
-	if err != nil {
+	st := r.decode(&c.last, prev)
+	if st.DecodeError != "" {
 		c.stale = true
 		return
 	}
@@ -107,8 +103,8 @@ func (c *runCache) putStep(r stepRow) {
 }
 
 func (c *runCache) putApproval(r approvalRow) {
-	a, err := r.decode()
-	if err != nil {
+	a := r.decode()
+	if a.DecodeError != "" {
 		c.stale = true
 		return
 	}
