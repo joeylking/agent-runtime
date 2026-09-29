@@ -64,6 +64,42 @@ for m in providers/ollama providers/anthropic providers/openai mcp examples/live
 done
 ```
 
+## Lint
+
+`gofmt`, [staticcheck](https://staticcheck.dev), and
+[govulncheck](https://golang.org/x/vuln/cmd/govulncheck) run in CI's `lint`
+job on the newest supported Go only, plus a tidy check on the core.
+Install the two tools at the versions CI pins (`.github/workflows/ci.yml`
+names the current ones):
+
+```sh
+go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
+go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+```
+
+The core, `GOWORK=off` so it is checked with only its own two dependencies:
+
+```sh
+gofmt -l .
+GOWORK=off go mod tidy -diff
+GOWORK=off staticcheck ./...
+GOWORK=off govulncheck ./...
+```
+
+`gofmt -l .` must print nothing; `go mod tidy -diff` must print nothing and
+exits non-zero when `go.mod` or `go.sum` would change.
+
+Each nested module, through the workspace (`staticcheck` and
+`govulncheck` only — a tidy check against the nested module's pinned core
+version belongs to the release check below, not here, because the
+workspace overrides that pin):
+
+```sh
+for m in providers/ollama providers/anthropic providers/openai mcp examples/live examples/mcp; do
+  (cd "$m" && staticcheck ./... && govulncheck ./...)
+done
+```
+
 The live tests are behind the `live` build tag: they call a local
 [Ollama](https://ollama.com) server holding `qwen3:30b-a3b`, so they are free
 but neither deterministic nor available in CI, and they skip when nothing
@@ -103,6 +139,44 @@ input schema, or to a provider adapter's request mapping needs the consumers'
 recordings re-recorded, in the consumer, before the change lands. A recording
 is only comparable within one commit. Identical requests replay in the order
 they were recorded, and re-recording a key replaces its whole sequence.
+
+## Releasing
+
+The core and each nested module tag independently
+(`v0.2.1`, `mcp/v0.1.1`, `providers/ollama/v0.1.1`, ...), and CI's
+`release-check` workflow exists because `go work` overriding every nested
+module's pinned core version, which is what makes day-to-day development
+across modules practical, also means ordinary CI never builds the
+dependency graph a consumer actually resolves. The order below exists so
+that graph is proven to build, with `GOWORK=off`, before anything is
+tagged:
+
+1. **Tag the core** only once CI is green on the exact commit being
+   tagged — not a later commit, and not a commit CI hasn't run against
+   at all.
+2. **Re-pin the nested modules** to the new core version (the `require`
+   line in each nested module's `go.mod`), run `go mod tidy` in each, and
+   push that as an ordinary commit.
+3. **Wait for both CI and the release check to go green** on that commit.
+   The release check does not trigger on an ordinary push (see the
+   comment at the top of `.github/workflows/release-check.yml`), so run it
+   with `workflow_dispatch` for this commit; it is what actually builds
+   each nested module against its newly pinned core release with
+   `GOWORK=off`, which `go work`-based CI cannot exercise.
+4. **Tag the nested modules**, now that both are green for that commit.
+5. **Re-pin the examples** (`examples/live`, `examples/mcp`) to the new
+   nested-module tags, tidy, and push.
+6. **Create a GitHub release for every tag** — the core's and each nested
+   module's. The changelog's `## [Unreleased]` section becomes that
+   release's dated section in `CHANGELOG.md`, and the GitHub release body
+   is that section's content; `## [Unreleased]` is then empty again for
+   the next cycle.
+
+A pushed tag is never moved, force-pushed, or re-pointed at a different
+commit, on the core or on a nested module: a consumer's `go.sum` pins the
+content a tag names, and moving it after the fact breaks that promise
+silently. A mistake in a tagged commit is fixed by tagging a new patch
+version, not by rewriting the old tag.
 
 ## Style
 

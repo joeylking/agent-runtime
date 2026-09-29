@@ -8,12 +8,22 @@ body:
         The event log is the explanation, so please bring it. If the bug is in a
         provider adapter or the MCP adapter, say which module: they version
         separately from the core.
-  - type: input
+  - type: textarea
     id: version
     attributes:
       label: Runtime version
-      description: The core module's version or commit, from `go list -m github.com/joeylking/agent-runtime`.
-      placeholder: v0.2.1
+      description: |
+        The output of `go list -m github.com/joeylking/agent-runtime` from your
+        module, plus the nested modules you use (`go list -m
+        github.com/joeylking/agent-runtime/mcp`,
+        `.../providers/ollama`, `.../providers/anthropic`,
+        `.../providers/openai`, as they apply). This asks for a command's
+        output rather than a version number so the form never needs editing
+        at release time.
+      placeholder: |
+        github.com/joeylking/agent-runtime v0.2.1
+        github.com/joeylking/agent-runtime/mcp v0.1.1
+      render: text
     validations:
       required: true
   - type: dropdown

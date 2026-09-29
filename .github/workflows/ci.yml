@@ -2,7 +2,26 @@ name: ci
 
 on:
   push:
+    branches: ["**"]
   pull_request:
+  # Catches dependency and toolchain drift (a new Go patch release, a
+  # transitive module picking up a vulnerability) on a repository that may
+  # go a while between commits.
+  schedule:
+    - cron: "17 6 * * 1"
+
+# Read-only by default; no job here needs to write to the repository or to
+# packages.
+permissions:
+  contents: read
+
+# One run per ref at a time. A branch's superseded push is cancelled, but a
+# tag is immutable once pushed (see release-check.yml and CONTRIBUTING.md)
+# and the default branch's history is what release decisions are read from,
+# so neither is ever cancelled mid-run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
 
 # The core module supports the current Go release and the one before it, so it
 # is built with both. GOTOOLCHAIN=local forbids a silent switch to a newer
@@ -14,11 +33,12 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         go-version: ["1.26.x", "1.27.x"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ matrix.go-version }}
       - run: go vet ./...
@@ -27,15 +47,44 @@ jobs:
         run: go run ./examples/scripted -db "$RUNNER_TEMP/example.db"
       - name: operator command
         run: |
+          set -e
           db="$RUNNER_TEMP/example.db"
+          missing="$RUNNER_TEMP/no-such.db"
+
+          # agentrt opens an existing database only; it must refuse a path
+          # that does not exist yet rather than create one there.
+          if go run ./cmd/agentrt -db "$missing" runs; then
+            echo "agentrt must refuse a missing database" >&2
+            exit 1
+          fi
+          if [ -e "$missing" ]; then
+            echo "agentrt must not have created $missing" >&2
+            exit 1
+          fi
+
           go run ./cmd/agentrt -db "$db" runs
           run=$(go run ./cmd/agentrt -db "$db" -json runs | jq -r '.[0].id')
           go run ./cmd/agentrt -db "$db" show "$run"
           go run ./cmd/agentrt -db "$db" events "$run" | tail -3
           go run ./cmd/agentrt -db "$db" -json events "$run" | jq -e -s 'length > 8' > /dev/null
-          # The example's run completed, so there is nothing left to decide.
+
+          # runs, show, and events open the database read-only, so they must
+          # still work when the file itself is not writable.
+          chmod 0444 "$db"
+          go run ./cmd/agentrt -db "$db" runs > /dev/null
+          chmod 0644 "$db"
+
+          # The scripted example's tools are read-only, local-mutation, or
+          # destructive, never remote-mutation, so its run leaves no pending
+          # approval and this fixture cannot reach the -approval/-yes gate
+          # itself. What it does show is that approve refuses to decide
+          # anything, with or without -yes, once there is nothing pending.
           if go run ./cmd/agentrt -db "$db" approve "$run"; then
-            echo "approving a completed run must fail" >&2
+            echo "approving a run with no pending approval must fail" >&2
+            exit 1
+          fi
+          if go run ./cmd/agentrt -db "$db" approve "$run" -yes; then
+            echo "approving a run with no pending approval must fail" >&2
             exit 1
           fi
 
@@ -43,18 +92,21 @@ jobs:
   # examples have their own go.mod files, so ./... in the root module does not
   # reach them. A workspace makes them resolve the in-tree core rather than a
   # published version. The live-tagged tests are not run: they need a local
-  # model server. Neither example is run either: examples/mcp needs Node and a
-  # model, so vetting and compiling it is all CI can do, which `go test` on a
-  # main package with no test files does.
-  #
-  providers:
+  # model server. Neither example's model path runs either: examples/mcp
+  # needs Node and a model, so vetting and compiling it is all CI can do,
+  # which `go test` on a main package with no test files does. What this job
+  # does not build is the dependency graph a consumer actually resolves, with
+  # every nested module pinned to its released core version instead of the
+  # in-tree one; release-check.yml builds that graph before a tag.
+  modules:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         go-version: ["1.26.x", "1.27.x"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ matrix.go-version }}
       - name: workspace
@@ -66,15 +118,38 @@ jobs:
             (cd "$m" && go vet ./... && go test -race -count=1 ./...)
           done
 
-  # Tests that need a subprocess or on-disk crash simulation are added under
-  # the "crash" build tag in later milestones. This job invokes them explicitly
-  # so they are never skipped silently by a tag mismatch. It currently runs the
-  # same suite because no tagged tests exist yet.
-  crash:
+  # Static analysis and the tidy check run once, on the newest supported Go,
+  # rather than per matrix cell: they check the source and the module files,
+  # not toolchain-version-dependent behaviour.
+  lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
-      - run: go test -tags crash -count=1 ./...
+          go-version: "1.27.x"
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "$out"
+            exit 1
+          fi
+      - name: install staticcheck and govulncheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - name: core tidy check
+        run: GOWORK=off go mod tidy -diff
+      - name: core static analysis
+        run: |
+          GOWORK=off staticcheck ./...
+          GOWORK=off govulncheck ./...
+      - name: workspace
+        run: go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./examples/live ./examples/mcp
+      - name: nested module static analysis
+        run: |
+          for m in providers/ollama providers/anthropic providers/openai mcp examples/live examples/mcp; do
+            echo "== $m"
+            (cd "$m" && staticcheck ./... && govulncheck ./...)
+          done

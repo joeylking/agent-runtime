@@ -1,0 +1,84 @@
+# Dependabot only bumps a version already required somewhere in a go.mod; it
+# never proposes a dependency nobody imports yet. The core module keeps
+# exactly two direct dependencies (a JSON Schema validator and SQLite, see
+# go.mod and CONTRIBUTING.md's "Module layout" section): a third is a design
+# decision an issue and a PR argue for, not something that arrives as a
+# version bump. Nested modules take on provider SDKs and the MCP SDK because
+# that is the whole reason they are separate modules.
+#
+# Each entry below is grouped so a week with several updates in the same
+# ecosystem and directory still opens at most one pull request, not one per
+# dependency.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      gomod:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "gomod"
+    directory: "/providers/ollama"
+    schedule:
+      interval: "weekly"
+    groups:
+      gomod:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "gomod"
+    directory: "/providers/anthropic"
+    schedule:
+      interval: "weekly"
+    groups:
+      gomod:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "gomod"
+    directory: "/providers/openai"
+    schedule:
+      interval: "weekly"
+    groups:
+      gomod:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "gomod"
+    directory: "/mcp"
+    schedule:
+      interval: "weekly"
+    groups:
+      gomod:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "gomod"
+    directory: "/examples/live"
+    schedule:
+      interval: "weekly"
+    groups:
+      gomod:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "gomod"
+    directory: "/examples/mcp"
+    schedule:
+      interval: "weekly"
+    groups:
+      gomod:
+        patterns:
+          - "*"

@@ -1,0 +1,63 @@
+name: release-check
+
+# ci.yml's "modules" job builds every nested module through a go.work
+# workspace so it resolves the in-tree core, which is what makes day-to-day
+# development across modules practical: on an ordinary commit, a nested
+# module may legitimately need core symbols newer than the release its
+# go.mod pins, because the core and the module are worked on together before
+# either is re-tagged. That means ci.yml never builds the dependency graph a
+# consumer actually resolves — go.mod's pinned github.com/joeylking/agent-runtime
+# version, not the workspace override.
+#
+# This workflow builds that graph, with GOWORK=off so nothing overrides the
+# pin. It does not run on every push, because "needs a newer core than it
+# pins" is the normal state of a module mid-development, not a bug; it runs
+# before a nested module is tagged, and a nested module is tagged only after
+# this workflow is green for the commit being tagged. See CONTRIBUTING.md's
+# release procedure.
+on:
+  push:
+    tags:
+      - "v*"
+      - "*/v*"
+  schedule:
+    - cron: "44 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  release-check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ["1.26.x", "1.27.x"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go-version }}
+      - name: install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - name: nested modules against their pinned core
+        run: |
+          for m in providers/ollama providers/anthropic providers/openai mcp examples/live examples/mcp; do
+            echo "== $m"
+            (
+              cd "$m"
+              GOWORK=off go mod tidy -diff
+              GOWORK=off go build ./...
+              GOWORK=off go vet ./...
+              GOWORK=off go test -race -count=1 ./...
+              GOWORK=off govulncheck ./...
+            )
+          done
