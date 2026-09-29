@@ -22,7 +22,12 @@
 //
 // The key goes only where it was meant to: OPENAI_API_KEY is read only for
 // OpenAI's own endpoint, never for a configured BaseURL, and New refuses to
-// send any key over plain http to a host that is not loopback.
+// send any key over plain http to a host that is not loopback, which is
+// exactly "localhost" or a literal loopback address, and then checks each
+// connection's address as it is made. No redirect is followed: a 3xx is a
+// permanent providers.StatusError naming only the host it pointed to. The
+// key is kept out of every encoding of a Config or a Model: fmt, JSON, and
+// log/slog all print it redacted.
 //
 // Parallel tool calls are turned off in the request, but a server may
 // ignore that. Every call is returned; the runtime executes the first and
@@ -35,9 +40,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
+	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 
@@ -64,12 +68,16 @@ type Config struct {
 	// BaseURL is empty or DefaultBaseURL, and no key otherwise: the
 	// environment's key is OpenAI's and is never sent to another server. An
 	// empty key is allowed, since a local server needs none. A key is
-	// refused over http unless the host is loopback.
+	// refused over http unless the host is loopback. A Config prints,
+	// marshals, and logs the key redacted, except as a field fmt cannot
+	// call a method on: an unexported field of a consumer's struct printed
+	// with %v shows it, so a consumer keeps a Config there out of print.
 	APIKey string
 	// HTTPClient overrides the client used for requests. The adapter uses a
-	// copy whose transport refuses a body over providers.MaxBodyBytes. Nil
-	// means a client with providers.DefaultTimeout, a backstop to the
-	// caller's context.
+	// copy whose transport refuses a body over providers.MaxBodyBytes and,
+	// unless the client has a CheckRedirect of its own, follows no
+	// redirect. Nil means a client with providers.DefaultTimeout, a backstop
+	// to the caller's context.
 	HTTPClient *http.Client
 }
 
@@ -82,6 +90,25 @@ func (c Config) String() string {
 // GoString redacts the key for %#v.
 func (c Config) GoString() string { return c.String() }
 
+// MarshalJSON redacts the key, so a Config encoded as JSON does not leak
+// it. HTTPClient, which JSON cannot hold, is true when one is set.
+func (c Config) MarshalJSON() ([]byte, error) {
+	type plain Config
+	p := struct {
+		plain
+		HTTPClient bool `json:",omitempty"`
+	}{plain(c), c.HTTPClient != nil}
+	if p.APIKey != "" {
+		p.APIKey = "[redacted]"
+	}
+	return json.Marshal(p)
+}
+
+// LogValue redacts the key for log/slog.
+func (c Config) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("model", c.Model), slog.String("name", c.Name), slog.String("base_url", c.BaseURL), slog.String("api_key", redact(c.APIKey)))
+}
+
 func redact(key string) string {
 	if key == "" {
 		return `""`
@@ -89,12 +116,33 @@ func redact(key string) string {
 	return "[redacted]"
 }
 
-// Model is one model on one OpenAI-compatible endpoint.
+// secret holds a key behind a closure, so that printing by reflection, which
+// is what fmt does with an unexported field, shows a function address and
+// never the key, and every method that can print it redacts.
+type secret func() string
+
+func newSecret(key string) secret { return func() string { return key } }
+
+func (s secret) reveal() string {
+	if s == nil {
+		return ""
+	}
+	return s()
+}
+
+func (s secret) String() string               { return redact(s.reveal()) }
+func (s secret) GoString() string             { return s.String() }
+func (s secret) Format(f fmt.State, _ rune)   { fmt.Fprint(f, s.String()) }
+func (s secret) MarshalJSON() ([]byte, error) { return json.Marshal(s.String()) }
+func (s secret) LogValue() slog.Value         { return slog.StringValue(s.String()) }
+
+// Model is one model on one OpenAI-compatible endpoint. It holds no copy of
+// the key as a string.
 type Model struct {
 	cfg    Config
 	name   string
 	base   string
-	key    string
+	key    secret
 	client *http.Client
 }
 
@@ -105,44 +153,44 @@ func New(cfg Config) (*Model, error) {
 	if cfg.Model == "" {
 		return nil, errors.New("openai: model is required")
 	}
-	m := &Model{cfg: cfg, name: cfg.Name, base: strings.TrimRight(cfg.BaseURL, "/"), key: cfg.APIKey, client: providers.Client(cfg.HTTPClient)}
+	key := cfg.APIKey
+	cfg.APIKey = ""
+	m := &Model{cfg: cfg, name: cfg.Name, base: strings.TrimRight(cfg.BaseURL, "/"), client: providers.Client(cfg.HTTPClient)}
 	if m.name == "" {
 		m.name = Name(cfg.Model)
 	}
 	if m.base == "" {
 		m.base = DefaultBaseURL
 	}
-	if m.key == "" && m.base == DefaultBaseURL {
-		m.key = os.Getenv("OPENAI_API_KEY")
+	if key == "" && m.base == DefaultBaseURL {
+		key = os.Getenv("OPENAI_API_KEY")
 	}
-	u, err := url.Parse(m.base)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("openai: base URL %q is not an http or https URL", m.base)
+	u, err := providers.CheckEndpoint("openai", m.base, key != "")
+	if err != nil {
+		return nil, err
 	}
-	if m.key != "" && u.Scheme == "http" && !loopback(u.Hostname()) {
-		return nil, fmt.Errorf("openai: refusing to send an API key over plain http to %s", u.Host)
+	if key != "" && u.Scheme == "http" {
+		m.client = providers.LoopbackOnly(m.client)
 	}
+	m.key = newSecret(key)
 	return m, nil
-}
-
-// loopback reports whether host names this machine, the one place a key may
-// travel unencrypted.
-func loopback(host string) bool {
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 // String redacts the key, so a Model that is logged or printed does not
 // leak it.
 func (m Model) String() string {
-	return fmt.Sprintf("openai.Model{Name:%q BaseURL:%q APIKey:%s}", m.name, m.base, redact(m.key))
+	return fmt.Sprintf("openai.Model{Name:%q BaseURL:%q APIKey:%s}", m.name, m.base, m.key)
 }
 
 // GoString redacts the key for %#v.
 func (m Model) GoString() string { return m.String() }
+
+// LogValue redacts the key for log/slog.
+func (m Model) LogValue() slog.Value { return slog.StringValue(m.String()) }
+
+// MarshalJSON encodes what String prints, so a Model encoded as JSON does
+// not leak the key.
+func (m Model) MarshalJSON() ([]byte, error) { return json.Marshal(m.String()) }
 
 // Name is what an adapter for model reports when Config.Name is unset, so
 // a consumer can key a price table or a recording directory before it
@@ -205,12 +253,40 @@ type chatRequest struct {
 // maxEcho bounds how much server or model text an error message repeats.
 const maxEcho = 512
 
+// usage is decoded from the reply on its own, count by count, so that a
+// count that does not fit is refused by name rather than failing the decode.
 type usage struct {
-	PromptTokens        int `json:"prompt_tokens"`
-	CompletionTokens    int `json:"completion_tokens"`
-	PromptTokensDetails struct {
-		CachedTokens int `json:"cached_tokens"`
+	PromptTokens        json.RawMessage `json:"prompt_tokens"`
+	CompletionTokens    json.RawMessage `json:"completion_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens json.RawMessage `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
+}
+
+// usageOf reads the usage a reply reports. Absent counts are zero; a count
+// that is not a non-negative integer that fits, or more cached input than
+// input, is an error wrapping providers.ErrUnusableUsage.
+func usageOf(raw []byte) (agentrt.Usage, error) {
+	var counts struct {
+		Usage *usage `json:"usage"`
+	}
+	if json.Unmarshal(raw, &counts) != nil || counts.Usage == nil {
+		return agentrt.Usage{}, nil
+	}
+	var u agentrt.Usage
+	var err error
+	if u.InputTokens, err = providers.UsageCount("usage.prompt_tokens", counts.Usage.PromptTokens); err != nil {
+		return agentrt.Usage{}, err
+	}
+	if u.OutputTokens, err = providers.UsageCount("usage.completion_tokens", counts.Usage.CompletionTokens); err != nil {
+		return agentrt.Usage{}, err
+	}
+	if d := counts.Usage.PromptTokensDetails; d != nil {
+		if u.CachedInputTokens, err = providers.UsageCount("usage.prompt_tokens_details.cached_tokens", d.CachedTokens); err != nil {
+			return agentrt.Usage{}, err
+		}
+	}
+	return u, providers.CheckUsage(u)
 }
 
 type chatResponse struct {
@@ -254,8 +330,8 @@ func (m *Model) Generate(ctx context.Context, req agentrt.ModelRequest) (agentrt
 		return agentrt.ModelResponse{}, err
 	}
 	hreq.Header.Set("Content-Type", "application/json")
-	if m.key != "" {
-		hreq.Header.Set("Authorization", "Bearer "+m.key)
+	if key := m.key.reveal(); key != "" {
+		hreq.Header.Set("Authorization", "Bearer "+key)
 	}
 	resp, err := m.client.Do(hreq)
 	if err != nil {
@@ -270,15 +346,12 @@ func (m *Model) Generate(ctx context.Context, req agentrt.ModelRequest) (agentrt
 		return agentrt.ModelResponse{}, err
 	}
 	// The usage is read on its own first, so a reply that is served but
-	// unusable is still charged what it reported.
-	var counts struct {
-		Usage usage `json:"usage"`
-	}
-	json.Unmarshal(raw, &counts)
-	used := agentrt.Usage{
-		InputTokens:       counts.Usage.PromptTokens,
-		OutputTokens:      counts.Usage.CompletionTokens,
-		CachedInputTokens: counts.Usage.PromptTokensDetails.CachedTokens,
+	// unusable is still charged what it reported. Usage that cannot be
+	// believed is charged nothing here, and the accounting caller charges
+	// its own estimate.
+	used, err := usageOf(raw)
+	if err != nil {
+		return agentrt.ModelResponse{}, agentrt.ServedError{Err: fmt.Errorf("openai: %w", err)}
 	}
 	served := func(err error) (agentrt.ModelResponse, error) {
 		return agentrt.ModelResponse{}, agentrt.ServedError{Usage: used, Err: err}

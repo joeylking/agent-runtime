@@ -16,6 +16,14 @@
 //
 //	go work init . ./examples/live ./examples/mcp ./mcp ./providers/anthropic ./providers/ollama ./providers/openai
 //
+// The filesystem server is pinned too, to an exact version and its integrity
+// hash in package.json and package-lock.json beside this file, so what runs
+// is what was reviewed rather than whatever the registry serves that day.
+// Install it once, from the repository root, without running any package's
+// install scripts:
+//
+//	(cd examples/mcp && npm ci --ignore-scripts)
+//
 // Then:
 //
 //	go run ./examples/mcp pin
@@ -23,14 +31,18 @@
 //	go run ./cmd/agentrt -db <path> approve <run>
 //	go run ./examples/mcp run -resume <run>
 //
-// It needs Node for `npx @modelcontextprotocol/server-filesystem` and a
-// local Ollama server. The sandbox, the manifest, and the database default
+// It needs Node, which runs the installed server as
+// `node examples/mcp/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js <sandbox>`,
+// and a local Ollama server. The sandbox, the manifest, and the database default
 // to fixed names under a per-user cache directory (os.UserCacheDir()/
 // agentrt, created 0700), so the four commands above address the same run
 // by default but another account on a shared machine cannot pre-create or
 // read any of the three the way it could a fixed name in the shared
 // temporary directory. rules.json is read from this directory, so both
-// commands are run from the repository root. The shipped rules.json
+// commands are run from the repository root. Whoever can write the manifest
+// or the rules chooses how every tool is classified, so run reads either
+// only when it is owned by the current user and writable by nobody else,
+// and refuses it otherwise, naming the path and its mode. The shipped rules.json
 // classifies the tools the server offered when it was written: a server
 // that offers a different set is pinned again and the rules edited, which
 // Load says in as many words rather than silently dropping a tool.
@@ -40,6 +52,9 @@
 // whatever state the last committed step left them, and, for run, once a run
 // has actually been recorded, the exact -resume command is printed on
 // stderr before the process exits non-zero.
+//
+// Everything the server chose, its tool names and descriptions and the text
+// of its errors, is escaped by trace.Sanitize before it is printed.
 package main
 
 import (
@@ -51,6 +66,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -108,7 +124,7 @@ func main() {
 	ctx, stop := signalContext(context.Background(), signal.Notify)
 	defer stop()
 	if err := dispatch(ctx, os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+		fmt.Fprintln(os.Stderr, "error:", trace.Sanitize(err.Error()))
 		os.Exit(1)
 	}
 }
@@ -208,20 +224,41 @@ func dispatch(ctx context.Context, args []string) error {
 	}
 }
 
-// server describes the stock filesystem server over stdio, rooted at the
-// sandbox and nowhere else. The name prefixes what the model sees.
-func server(dir string) mcp.Server {
+// serverEntry is the pinned filesystem server's entry point, as its own
+// package.json names it, relative to the repository root, where both
+// commands run. `npm ci --ignore-scripts` in this directory installs it.
+var serverEntry = filepath.Join("examples", "mcp", "node_modules", "@modelcontextprotocol", "server-filesystem", "dist", "index.js")
+
+// installHint is what to do when the pinned server is not installed.
+const installHint = "(cd examples/mcp && npm ci --ignore-scripts)"
+
+// server describes the pinned filesystem server over stdio, rooted at the
+// sandbox and nowhere else, run by node from the installed package: nothing
+// is fetched when it starts. The name prefixes what the model sees.
+func server(entry, dir string) mcp.Server {
 	return mcp.Server{
 		Name:    "fs",
-		Command: []string{"npx", "-y", "@modelcontextprotocol/server-filesystem", dir},
-		// npx may still be fetching the package on a first run, which can
-		// take far longer than a live server ever should to answer; a much
-		// shorter bound would make the common first run fail. The session
+		Command: []string{"node", entry, dir},
+		// Node starts the installed server in well under a second; the
+		// bound is for a loaded machine, not for a download. The session
 		// itself is not shortened by this once connecting, initializing, and
 		// the first listing are done.
-		ConnectTimeout: 2 * time.Minute,
+		ConnectTimeout: 30 * time.Second,
 		DefaultTimeout: 5 * time.Second,
 	}
+}
+
+// installedServer returns the absolute path of the pinned server's entry
+// point, or says how to install it.
+func installedServer() (string, error) {
+	entry, err := filepath.Abs(serverEntry)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(entry); err != nil {
+		return "", fmt.Errorf("the pinned filesystem server is not installed at %s: run %s from the repository root", entry, installHint)
+	}
+	return entry, nil
 }
 
 // pin starts the server, records what it presents, and prints one line per
@@ -231,10 +268,14 @@ func pin(ctx context.Context, dir, manifestPath string) error {
 	if err := sandbox(dir); err != nil {
 		return err
 	}
-	// Connecting, initializing, and this listing are bounded by
-	// server(dir)'s ConnectTimeout, not by ctx directly; ctx only lets
-	// Ctrl-C cut the wait short.
-	m, err := mcp.Pin(ctx, server(dir))
+	entry, err := installedServer()
+	if err != nil {
+		return err
+	}
+	// Connecting, initializing, and this listing are bounded by the
+	// server's ConnectTimeout, not by ctx directly; ctx only lets Ctrl-C cut
+	// the wait short.
+	m, err := mcp.Pin(ctx, server(entry, dir))
 	if err != nil {
 		return err
 	}
@@ -248,7 +289,7 @@ func pin(ctx context.Context, dir, manifestPath string) error {
 	fmt.Printf("sandbox:  %s\nmanifest: %s\n\n%d tools, with the server's own hints, which classify nothing:\n\n", dir, manifestPath, len(m.Tools))
 	for _, name := range sortedTools(m.Tools) {
 		t := m.Tools[name]
-		fmt.Printf("  %-28s %-26s %s\n", name, hints(t), oneLine(t.Description, 72))
+		fmt.Printf("  %-28s %-26s %s\n", trace.Sanitize(name), hints(t), oneLine(t.Description, 72))
 	}
 	fmt.Printf("\nclassify them in rules.json, then: go run ./examples/mcp run -dir %s -manifest %s\n", dir, manifestPath)
 	return nil
@@ -297,6 +338,10 @@ func run(ctx context.Context, cfg config) error {
 	if err != nil {
 		return err
 	}
+	entry, err := installedServer()
+	if err != nil {
+		return err
+	}
 	m, err := ollama.New(ollama.Config{Model: modelID(cfg.model), Think: true})
 	if err != nil {
 		return err
@@ -305,21 +350,18 @@ func run(ctx context.Context, cfg config) error {
 	if _, err := providers.PriceFor(prices, m.Name()); err != nil {
 		return err
 	}
+	// OpenStore creates the database and its WAL files owner-only.
 	store, err := agentrt.OpenStore(cfg.db)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	if cfg.db != ":memory:" {
-		if err := os.Chmod(cfg.db, 0o600); err != nil {
-			return err
-		}
-	}
 
-	// Connecting, initializing, and the first listing are bounded by
-	// server(cfg.dir)'s ConnectTimeout, not by ctx directly; the session
-	// Load returns is not shortened by it, and lives as long as the run.
-	tools, report, err := mcp.Load(ctx, server(cfg.dir), manifest, rules)
+	// Connecting, initializing, the first listing, and Load's checks are
+	// bounded by the server's ConnectTimeout, not by ctx directly; the
+	// session Load returns is not shortened by it, and lives as long as the
+	// run.
+	tools, report, err := mcp.Load(ctx, server(entry, cfg.dir), manifest, rules)
 	if err != nil {
 		if report != nil {
 			fmt.Print(report)
@@ -379,7 +421,7 @@ func printOutcome(r agentrt.Run, cfg config, store *agentrt.Store) {
 		fmt.Printf(" (%s)", r.Reason)
 	}
 	fmt.Printf(" steps=%d calls=%d tokens=%d/%d result=%s\n",
-		r.StepCount, r.ModelCalls, r.Usage.InputTokens, r.Usage.OutputTokens, r.Result)
+		r.StepCount, r.ModelCalls, r.Usage.InputTokens, r.Usage.OutputTokens, trace.Sanitize(string(r.Result)))
 	if r.Status != agentrt.StatusWaitingForApproval {
 		fmt.Printf("\nthe audit trail:\n  go run ./cmd/agentrt -db %s events %s\n", cfg.db, r.ID)
 		return
@@ -390,7 +432,7 @@ func printOutcome(r agentrt.Run, cfg config, store *agentrt.Store) {
 	}
 	for _, a := range approvals {
 		if a.Status == agentrt.ApprovalPending {
-			fmt.Printf("\nwaiting for approval %s: %s\n  %s\n", a.ID, a.Kind, a.Presentation)
+			fmt.Printf("\nwaiting for approval %s: %s\n  %s\n", a.ID, a.Kind, trace.Sanitize(string(a.Presentation)))
 		}
 	}
 	fmt.Printf("\ngrant it, then continue the run:\n  go run ./cmd/agentrt -db %s approve %s\n  go run ./examples/mcp run -dir %s -manifest %s -rules %s -db %s -resume %s\n",
@@ -413,9 +455,12 @@ func sandbox(dir string) error {
 }
 
 func readManifest(path string) (*mcp.Manifest, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
+	raw, err := readOwned(path)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("manifest: %w (run `go run ./examples/mcp pin` first)", err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("manifest: %w", err)
 	}
 	var m mcp.Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
@@ -441,7 +486,7 @@ type rule struct {
 // readRules converts the operator's file to mcp.Rules. A tool that is not in
 // the file has no rule and is not registered, which is how the file says no.
 func readRules(path string) (mcp.Rules, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := readOwned(path)
 	if err != nil {
 		return nil, fmt.Errorf("rules: %w", err)
 	}
@@ -566,10 +611,35 @@ func (t terminal) Call(_ context.Context, call agentrt.ToolCall) (agentrt.ToolRe
 	return agentrt.ToolResult{Content: call.Args, Summary: fmt.Sprintf("wrote %s, %d bytes of summary", args.NotesPath, len(args.Summary))}, nil
 }
 
-// oneLine collapses whitespace and cuts to n bytes, so a tool description or
-// a file preview is one aligned line.
+// readOwned reads a file that decides what the run may do, the manifest or
+// the rules, only when the current user owns it and neither its group nor
+// anyone else can write it: whoever can write either chooses how every tool
+// is classified. The checks are made on the open file, so the file read is
+// the file checked.
+func readOwned(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	if err := ownedPrivately(path, info); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(f)
+}
+
+// oneLine collapses whitespace, escapes what a terminal would act on, and
+// cuts to n bytes, so a tool description or a file preview is one aligned
+// line.
 func oneLine(s string, n int) string {
-	return render.Truncate(strings.Join(strings.Fields(s), " "), n)
+	return render.Truncate(trace.Sanitize(strings.Join(strings.Fields(s), " ")), n)
 }
 
 func indent(s string) string {

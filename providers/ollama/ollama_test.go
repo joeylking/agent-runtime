@@ -293,3 +293,38 @@ func TestFree_PricesTheReportedName(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestGenerate_UnusableUsageIsChargedNothing: counts a server reports are
+// believed only when they are non-negative integers that fit; otherwise the
+// reply is a served error with zero usage, and the accounting caller charges
+// its own estimate.
+func TestGenerate_UnusableUsageIsChargedNothing(t *testing.T) {
+	for body, field := range map[string]string{
+		`{"message":{"role":"assistant","content":"ok"},"prompt_eval_count":-100000000,"eval_count":2}`:           "prompt_eval_count",
+		`{"message":{"role":"assistant","content":"ok"},"prompt_eval_count":7,"eval_count":99999999999999999999}`: "eval_count",
+		`{"message":{"role":"assistant","content":"ok"},"prompt_eval_count":7.5,"eval_count":2}`:                  "prompt_eval_count",
+	} {
+		m := server(t, func(w http.ResponseWriter, _ map[string]any) { io.WriteString(w, body) })
+		_, err := m.Generate(context.Background(), agentrt.ModelRequest{})
+		var served agentrt.ServedError
+		if !errors.As(err, &served) || served.Usage != (agentrt.Usage{}) || !errors.Is(err, providers.ErrUnusableUsage) || !strings.Contains(err.Error(), field) {
+			t.Errorf("%s: err = %#v, want a served error with zero usage naming %s", body, err, field)
+		}
+	}
+}
+
+func TestGenerate_RedirectIsRefused(t *testing.T) {
+	var reached int
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached++ }))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusPermanentRedirect)
+	}))
+	defer origin.Close()
+	_, err := newModel(t, ollama.Config{Model: "m", Host: origin.URL}).Generate(context.Background(), agentrt.ModelRequest{})
+	var se providers.StatusError
+	var tr agentrt.TransientError
+	if !errors.As(err, &se) || errors.As(err, &tr) || se.Status != 308 || reached != 0 {
+		t.Fatalf("err = %#v, target reached %d times; want a permanent StatusError and no second request", err, reached)
+	}
+}

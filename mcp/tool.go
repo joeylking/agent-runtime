@@ -63,14 +63,15 @@ func (t *tool) Call(ctx context.Context, call agentrt.ToolCall) (agentrt.ToolRes
 	// caller that is not the driver, such as a test or an operator probe.
 	ctx, cancel := context.WithTimeout(ctx, t.spec.Timeout)
 	defer cancel()
+	ctx, slot := withCallSlot(ctx)
 	res, err := t.conn.session.CallTool(ctx, &sdk.CallToolParams{Name: t.remote, Arguments: args})
 	if err != nil {
-		return agentrt.ToolResult{}, fmt.Errorf("mcp: server %q: tool %q: %w", t.conn.server, t.remote, err)
+		return agentrt.ToolResult{}, fmt.Errorf("mcp: server %q: tool %q: %w", t.conn.server, t.remote, sanitized{err})
 	}
 	if res.NeedsInput() {
 		return agentrt.ToolResult{}, fmt.Errorf("%s: the server asked for more input, which this adapter does not support", t.spec.Name)
 	}
-	c := t.content(res)
+	c := t.content(res, slot.raw())
 	summary := fmt.Sprintf("%s/%s: %d bytes", t.conn.server, t.remote, len(c.raw))
 	if c.truncated {
 		summary += ", truncated"
@@ -101,10 +102,15 @@ type content struct {
 // here. Structured content that does not fit is never cut, which would make
 // an object a string: it is dropped for the text blocks, and the summary
 // says so.
-func (t *tool) content(res *sdk.CallToolResult) content {
+//
+// Structured content is recorded from the result's raw bytes when they
+// were captured, re-encoded the way a pinned schema is, so a number float64
+// cannot hold, such as an id past 2^53, is recorded as the server sent it
+// and not rounded; every other number is written exactly as before.
+func (t *tool) content(res *sdk.CallToolResult, result json.RawMessage) content {
 	var dropped int
 	if res.StructuredContent != nil {
-		if raw, err := marshalCanonical(res.StructuredContent); err == nil {
+		if raw, err := structured(res, result); err == nil {
 			if len(raw) <= t.maxContent {
 				return content{raw: raw, text: string(raw)}
 			}
@@ -117,6 +123,20 @@ func (t *tool) content(res *sdk.CallToolResult) content {
 	}
 	raw, text, truncated := capText(text, t.maxContent)
 	return content{raw: raw, text: text, truncated: truncated || dropped > 0, dropped: dropped}
+}
+
+// structured encodes a result's structured content: from the raw result's
+// "structuredContent", matched exactly as the SDK matches it, when the raw
+// result was captured and carries it, and from the SDK's decoded value
+// otherwise.
+func structured(res *sdk.CallToolResult, result json.RawMessage) (json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if len(result) > 0 && json.Unmarshal(result, &fields) == nil {
+		if raw, ok := fields["structuredContent"]; ok && string(bytes.TrimSpace(raw)) != "null" {
+			return canonicalSchema(raw)
+		}
+	}
+	return marshalCanonical(res.StructuredContent)
 }
 
 func joinContent(blocks []sdk.Content) string {

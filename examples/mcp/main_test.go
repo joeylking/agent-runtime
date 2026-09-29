@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -173,14 +176,109 @@ func TestNewRunID_LooksLikeTheDriversOwn(t *testing.T) {
 }
 
 // TestServer_SetsAConnectTimeoutExplicitly guards against the default
-// silently doing the job: pin and run must each ask for one, long enough for
-// npx to fetch the package on a first run.
+// silently doing the job: pin and run must each ask for one.
 func TestServer_SetsAConnectTimeoutExplicitly(t *testing.T) {
-	s := server(t.TempDir())
+	s := server("index.js", t.TempDir())
 	if s.ConnectTimeout <= 0 {
 		t.Fatal("server() must set ConnectTimeout explicitly, not rely on the default")
 	}
-	if s.ConnectTimeout < 30*time.Second {
-		t.Fatalf("ConnectTimeout = %s, want it generous enough for npx's first fetch", s.ConnectTimeout)
+}
+
+// TestServer_RunsThePinnedPackageWithNode: the example ran
+// `npx -y @modelcontextprotocol/server-filesystem`, which executes whatever
+// the registry serves that day. It now runs the installed entry point of the
+// exact version package-lock.json pins, and nothing fetches at start.
+func TestServer_RunsThePinnedPackageWithNode(t *testing.T) {
+	dir := t.TempDir()
+	s := server("/abs/index.js", dir)
+	if want := []string{"node", "/abs/index.js", dir}; !slices.Equal(s.Command, want) {
+		t.Fatalf("Command = %q, want %q", s.Command, want)
+	}
+	if filepath.ToSlash(serverEntry) != "examples/mcp/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js" {
+		t.Fatalf("serverEntry = %s", serverEntry)
+	}
+	var pkg struct {
+		Dependencies map[string]string `json:"dependencies"`
+	}
+	var lock struct {
+		LockfileVersion int `json:"lockfileVersion"`
+		Packages        map[string]struct {
+			Version   string `json:"version"`
+			Integrity string `json:"integrity"`
+		} `json:"packages"`
+	}
+	for file, v := range map[string]any{"package.json": &pkg, "package-lock.json": &lock} {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, v); err != nil {
+			t.Fatalf("%s: %v", file, err)
+		}
+	}
+	version := pkg.Dependencies["@modelcontextprotocol/server-filesystem"]
+	if !regexp.MustCompile(`^\d+\.\d+\.\d+$`).MatchString(version) {
+		t.Fatalf("package.json pins %q, want an exact version", version)
+	}
+	locked := lock.Packages["node_modules/@modelcontextprotocol/server-filesystem"]
+	if locked.Version != version || !strings.HasPrefix(locked.Integrity, "sha512-") {
+		t.Fatalf("package-lock.json has %+v, want version %s with its sha512 integrity", locked, version)
+	}
+	for name, p := range lock.Packages {
+		if name != "" && p.Integrity == "" {
+			t.Errorf("package-lock.json: %s has no integrity hash", name)
+		}
+	}
+	// From this directory the root-relative entry point is not there, and
+	// the error says how to install it.
+	if _, err := installedServer(); err == nil || !strings.Contains(err.Error(), "npm ci --ignore-scripts") {
+		t.Fatalf("installedServer = %v, want the install command", err)
+	}
+}
+
+// TestReadOwned_RefusesAFileOthersCanWrite: whoever can write the manifest
+// or the rules chooses how every tool is classified, so neither is read when
+// its group or anyone else can write it.
+func TestReadOwned_RefusesAFileOthersCanWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file modes only")
+	}
+	dir := t.TempDir()
+	rules := filepath.Join(dir, "rules.json")
+	manifest := filepath.Join(dir, "manifest.json")
+	os.WriteFile(rules, []byte(`{"read_file":{"side_effect":"read_only"}}`), 0o600)
+	os.WriteFile(manifest, []byte(`{"server":"fs","tools":{}}`), 0o600)
+	for _, mode := range []os.FileMode{0o600, 0o644, 0o444} {
+		os.Chmod(rules, mode)
+		os.Chmod(manifest, mode)
+		if _, err := readRules(rules); err != nil {
+			t.Errorf("rules at %o: %v", mode, err)
+		}
+		if _, err := readManifest(manifest); err != nil {
+			t.Errorf("manifest at %o: %v", mode, err)
+		}
+	}
+	for _, mode := range []os.FileMode{0o620, 0o602, 0o666} {
+		os.Chmod(rules, mode)
+		os.Chmod(manifest, mode)
+		if _, err := readRules(rules); err == nil || !strings.Contains(err.Error(), rules) || !strings.Contains(err.Error(), mode.String()) {
+			t.Errorf("rules at %o: %v, want a refusal naming the path and the mode", mode, err)
+		}
+		if _, err := readManifest(manifest); err == nil || !strings.Contains(err.Error(), manifest) {
+			t.Errorf("manifest at %o: %v, want a refusal naming the path", mode, err)
+		}
+	}
+	// The shipped rules must pass the check as a checkout leaves them.
+	if _, err := readRules("rules.json"); err != nil {
+		t.Errorf("the shipped rules.json: %v", err)
+	}
+}
+
+// TestOneLine_EscapesWhatTheServerChose: the pin listing printed a server's
+// descriptions raw, so an escape sequence in one could rewrite the terminal.
+func TestOneLine_EscapesWhatTheServerChose(t *testing.T) {
+	got := oneLine("d\x1b]8;;http://evil.example\x07click\x1b]8;;\x07 \x1b[2K\rfs: registered shell", 200)
+	if strings.ContainsAny(got, "\x1b\x07\r") {
+		t.Fatalf("oneLine = %q, want the controls escaped", got)
 	}
 }

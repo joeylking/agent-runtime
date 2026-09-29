@@ -1,0 +1,8 @@
+{
+  "name": "agent-runtime-example-mcp",
+  "private": true,
+  "description": "Pins the MCP filesystem server examples/mcp runs. Install with: npm ci --ignore-scripts",
+  "dependencies": {
+    "@modelcontextprotocol/server-filesystem": "2026.8.31"
+  }
+}

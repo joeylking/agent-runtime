@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -633,5 +634,132 @@ func TestStrict_CaseworkSchemasAreByteIdentical(t *testing.T) {
 	json.Unmarshal(body, &sent)
 	if !bytes.Equal(sent.Tools, golden) {
 		t.Fatalf("strict tools changed:\n%s\nwant\n%s", sent.Tools, golden)
+	}
+}
+
+// TestGenerate_RedirectIsRefusedAndTheKeyStaysHome: net/http strips
+// Authorization on a cross-host redirect but not x-api-key, and the sweep saw
+// the key and the whole prompt follow a 307 to another host, and follow an
+// https endpoint's redirect to plain http.
+func TestGenerate_RedirectIsRefusedAndTheKeyStaysHome(t *testing.T) {
+	var leaked []string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked = append(leaked, r.Host+" x-api-key="+r.Header.Get("X-Api-Key"))
+	}))
+	defer target.Close()
+	elsewhere := strings.Replace(target.URL, "127.0.0.1", "localhost", 1)
+	redirect := func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere+r.URL.Path+"?k=v", http.StatusTemporaryRedirect)
+	}
+	plain := httptest.NewServer(http.HandlerFunc(redirect))
+	defer plain.Close()
+	secure := httptest.NewTLSServer(http.HandlerFunc(redirect))
+	defer secure.Close()
+	for _, origin := range []struct {
+		url    string
+		client *http.Client
+	}{{plain.URL, nil}, {secure.URL, secure.Client()}} {
+		m, err := anthropic.New(anthropic.Config{Model: "claude-opus-5", APIKey: "sk-FAKE-NOT-A-KEY", BaseURL: origin.url + "/", HTTPClient: origin.client})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = m.Generate(context.Background(), userRequest())
+		var se providers.StatusError
+		var tr agentrt.TransientError
+		if !errors.As(err, &se) || errors.As(err, &tr) || se.Status != 307 || !strings.Contains(err.Error(), "redirects are not followed") {
+			t.Fatalf("%s: err = %#v, want a permanent StatusError", origin.url, err)
+		}
+		if host := strings.TrimPrefix(elsewhere, "http://"); !strings.Contains(err.Error(), host) || strings.Contains(err.Error(), "k=v") {
+			t.Fatalf("err = %q, want the Location host and nothing more of it", err)
+		}
+	}
+	if len(leaked) > 0 {
+		t.Fatalf("the redirect was followed: %v", leaked)
+	}
+}
+
+func TestNew_RefusesAKeyOverPlainHTTPToARemoteHost(t *testing.T) {
+	for _, base := range []string{"http://gateway.example.net/", "http://LOCALHOST/", "http://127.1/", "http://user@127.0.0.1/", "ftp://127.0.0.1/", "gateway.example.net"} {
+		if _, err := anthropic.New(anthropic.Config{Model: "claude-opus-5", APIKey: "sk-x", BaseURL: base}); err == nil {
+			t.Errorf("%s: accepted", base)
+		}
+	}
+	for _, base := range []string{"http://127.0.0.1:9/", "http://localhost:9/", "http://[::1]:9/", "https://gateway.example.net/"} {
+		if _, err := anthropic.New(anthropic.Config{Model: "claude-opus-5", APIKey: "sk-x", BaseURL: base}); err != nil {
+			t.Errorf("%s: %v", base, err)
+		}
+	}
+}
+
+// TestGenerate_UnusableUsageIsChargedNothing: a hostile endpoint's negative
+// or overflowing counts made the run's cost negative and disabled its limits.
+// Such usage is not believed: the reply is a served error with zero usage,
+// and the accounting caller charges its own estimate.
+func TestGenerate_UnusableUsageIsChargedNothing(t *testing.T) {
+	const reply = `{"id":"m","type":"message","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","stop_sequence":null,"content":[{"type":"text","text":"ok"}],"usage":%s}`
+	for usage, field := range map[string]string{
+		`{"input_tokens":-100000000,"output_tokens":1000}`:                                                            "usage.input_tokens",
+		`{"input_tokens":1,"output_tokens":-1}`:                                                                       "usage.output_tokens",
+		`{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":-5}`:                                           "usage.cache_read_input_tokens",
+		`{"input_tokens":1,"output_tokens":1,"cache_creation":{"ephemeral_1h_input_tokens":-5}}`:                      "ephemeral_1h_input_tokens",
+		`{"input_tokens":99999999999999999999,"output_tokens":1}`:                                                     "usage.input_tokens",
+		`{"input_tokens":9223372036854775807,"output_tokens":1000,"cache_creation_input_tokens":9223372036854775807}`: "overflow",
+		`{"input_tokens":9223372036854775807,"output_tokens":1,"cache_read_input_tokens":1}`:                          "overflows",
+		`{"input_tokens":1.5,"output_tokens":1}`:                                                                      "usage.input_tokens",
+	} {
+		f := &fake{responses: []response{{200, fmt.Sprintf(reply, usage)}}}
+		_, err := newModel(t, f, anthropic.Config{}).Generate(context.Background(), userRequest())
+		var served agentrt.ServedError
+		if !errors.As(err, &served) || served.Usage != (agentrt.Usage{}) || !errors.Is(err, providers.ErrUnusableUsage) || !strings.Contains(err.Error(), field) {
+			t.Errorf("usage %s: err = %#v, want a served error with zero usage naming %s", usage, err, field)
+		}
+	}
+}
+
+type holder struct {
+	name  string
+	model anthropic.Model
+}
+
+// TestConfigAndModel_EncodeWithoutTheKey covers every route the sweep's
+// printkey probe used: json.Marshal and log/slog printed the key, and so did
+// %+v of a struct holding a Model in an unexported field.
+func TestConfigAndModel_EncodeWithoutTheKey(t *testing.T) {
+	const key = "sk-FAKE-ANTHROPIC-KEY"
+	cfg := anthropic.Config{Model: "claude-opus-5", APIKey: key}
+	m, err := anthropic.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, v := range []any{cfg, &cfg, *m, m} {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("json.Marshal(%T): %v", v, err)
+		}
+		out = append(out, string(b))
+		var logged strings.Builder
+		slog.New(slog.NewTextHandler(&logged, nil)).Info("cfg", "v", v)
+		slog.New(slog.NewJSONHandler(&logged, nil)).Info("cfg", "v", v)
+		out = append(out, logged.String())
+	}
+	for _, format := range []string{"%v", "%+v", "%#v"} {
+		out = append(out, fmt.Sprintf(format, holder{name: "x", model: *m}), fmt.Sprintf(format, struct{ M anthropic.Model }{*m}))
+	}
+	for _, o := range out {
+		if strings.Contains(o, key) {
+			t.Errorf("the key leaked: %.300s", o)
+		}
+	}
+	if b, _ := json.Marshal(cfg); !strings.Contains(string(b), `"APIKey":"[redacted]"`) || !strings.Contains(string(b), `"Model":"claude-opus-5"`) {
+		t.Errorf("json.Marshal(Config) = %s, want the fields with the key redacted", b)
+	}
+	withClient := cfg
+	withClient.HTTPClient = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return nil }}
+	if b, err := json.Marshal(withClient); err != nil || strings.Contains(string(b), key) || !strings.Contains(string(b), `"HTTPClient":true`) {
+		t.Errorf("json.Marshal(Config with a client) = %s, %v", b, err)
+	}
+	if s := m.String(); !strings.Contains(s, "APIKey:[redacted]") {
+		t.Errorf("String() = %s, want it to say a key is set", s)
 	}
 }

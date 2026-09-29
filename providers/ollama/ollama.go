@@ -15,10 +15,17 @@
 // error field, is an agentrt.ServedError with whatever usage the reply
 // reported.
 //
+// A reply whose token counts are negative, do not fit, or are not integers
+// is an agentrt.ServedError with zero usage naming the count, so the
+// accounting caller charges its own estimate rather than a count it cannot
+// believe.
+//
 // A request has no deadline of its own: the caller's context is what bounds
 // it, and providers.DefaultTimeout (15 minutes) is only a backstop for a
 // context with none. A response body over providers.MaxBodyBytes (16 MiB)
-// fails the read rather than being read in full.
+// fails the read rather than being read in full. No redirect is followed: a
+// 3xx is a permanent providers.StatusError naming only the host it pointed
+// to.
 //
 // Host resolves the server once, at New: the configured Host, then
 // OLLAMA_HOST, then DefaultHost; nothing else is read from the environment.
@@ -71,9 +78,10 @@ type Config struct {
 	// NumCtx is the requested context window. Zero means DefaultNumCtx.
 	NumCtx int
 	// HTTPClient overrides the client used for requests. The adapter uses a
-	// copy whose transport refuses a body over providers.MaxBodyBytes. Nil
-	// means a client with providers.DefaultTimeout, a backstop to the
-	// caller's context.
+	// copy whose transport refuses a body over providers.MaxBodyBytes and,
+	// unless the client has a CheckRedirect of its own, follows no
+	// redirect. Nil means a client with providers.DefaultTimeout, a backstop
+	// to the caller's context.
 	HTTPClient *http.Client
 }
 
@@ -197,18 +205,36 @@ type chatRequest struct {
 const maxEcho = 512
 
 // usage is the part of a reply decoded before the rest, so that it survives
-// a reply that does not otherwise decode.
+// a reply that does not otherwise decode, count by count, so that a count
+// that does not fit is refused by name rather than failing the decode.
 type usage struct {
-	PromptEvalCount int `json:"prompt_eval_count"`
-	EvalCount       int `json:"eval_count"`
+	PromptEvalCount json.RawMessage `json:"prompt_eval_count"`
+	EvalCount       json.RawMessage `json:"eval_count"`
+}
+
+// usageOf reads the usage a reply reports. Absent counts are zero; a count
+// that is not a non-negative integer that fits is an error wrapping
+// providers.ErrUnusableUsage.
+func usageOf(raw []byte) (agentrt.Usage, error) {
+	var counts usage
+	if json.Unmarshal(raw, &counts) != nil {
+		return agentrt.Usage{}, nil
+	}
+	var u agentrt.Usage
+	var err error
+	if u.InputTokens, err = providers.UsageCount("prompt_eval_count", counts.PromptEvalCount); err != nil {
+		return agentrt.Usage{}, err
+	}
+	if u.OutputTokens, err = providers.UsageCount("eval_count", counts.EvalCount); err != nil {
+		return agentrt.Usage{}, err
+	}
+	return u, providers.CheckUsage(u)
 }
 
 type chatResponse struct {
-	Message         message `json:"message"`
-	DoneReason      string  `json:"done_reason"`
-	PromptEvalCount int     `json:"prompt_eval_count"`
-	EvalCount       int     `json:"eval_count"`
-	Error           string  `json:"error"`
+	Message    message `json:"message"`
+	DoneReason string  `json:"done_reason"`
+	Error      string  `json:"error"`
 }
 
 // Generate implements agentrt.Model.
@@ -252,10 +278,13 @@ func (m *Model) Generate(ctx context.Context, req agentrt.ModelRequest) (agentrt
 		return agentrt.ModelResponse{}, err
 	}
 	// The usage is read on its own first, so a reply that is served but
-	// unusable is still charged what it reported.
-	var counts usage
-	json.Unmarshal(raw, &counts)
-	used := agentrt.Usage{InputTokens: counts.PromptEvalCount, OutputTokens: counts.EvalCount}
+	// unusable is still charged what it reported. Usage that cannot be
+	// believed is charged nothing here, and the accounting caller charges
+	// its own estimate.
+	used, err := usageOf(raw)
+	if err != nil {
+		return agentrt.ModelResponse{}, agentrt.ServedError{Err: fmt.Errorf("ollama: %w", err)}
+	}
 	var out chatResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return agentrt.ModelResponse{}, agentrt.ServedError{Usage: used, Err: fmt.Errorf("ollama: decode: %w", err)}

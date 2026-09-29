@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -371,5 +372,123 @@ func TestFree_PricesTheReportedName(t *testing.T) {
 	}
 	if _, err := providers.PriceFor(prices, "gpt-oss:20b"); err == nil {
 		t.Fatal("the bare model id must not be priced")
+	}
+}
+
+// TestGenerate_RedirectIsRefusedAndTheKeyStaysHome: net/http keeps
+// Authorization on a redirect to the same host name on another port, and
+// the sweep saw the bearer key arrive there. No redirect is followed now.
+func TestGenerate_RedirectIsRefusedAndTheKeyStaysHome(t *testing.T) {
+	var leaked []string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked = append(leaked, r.Host+" authorization="+r.Header.Get("Authorization"))
+	}))
+	defer target.Close()
+	for _, to := range []string{target.URL, strings.Replace(target.URL, "127.0.0.1", "localhost", 1)} {
+		origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, to+r.URL.Path+"?token=abc", http.StatusTemporaryRedirect)
+		}))
+		m := newModel(t, openai.Config{Model: "x", BaseURL: origin.URL + "/v1", APIKey: "sk-FAKE-NOT-A-KEY"})
+		_, err := m.Generate(context.Background(), agentrt.ModelRequest{})
+		origin.Close()
+		var se providers.StatusError
+		var tr agentrt.TransientError
+		if !errors.As(err, &se) || errors.As(err, &tr) || se.Status != 307 || !strings.Contains(err.Error(), "redirects are not followed") {
+			t.Fatalf("redirect to %s: err = %#v, want a permanent StatusError", to, err)
+		}
+		if strings.Contains(err.Error(), "sk-FAKE") || strings.Contains(err.Error(), "token=") {
+			t.Fatalf("err = %q repeats the key or the redirect's query", err)
+		}
+	}
+	if len(leaked) > 0 {
+		t.Fatalf("the redirect was followed: %v", leaked)
+	}
+}
+
+func TestNew_LoopbackIsExactlyLocalhostOrALiteralAddress(t *testing.T) {
+	for _, base := range []string{"http://LOCALHOST/v1", "http://localhost./v1", "http://foo.localhost/v1", "http://127.1/v1", "http://evil.example@127.0.0.1/v1"} {
+		if _, err := openai.New(openai.Config{Model: "x", BaseURL: base, APIKey: "sk-x"}); err == nil {
+			t.Errorf("%s: a key over http was accepted", base)
+		}
+	}
+	for _, base := range []string{"http://[::ffff:127.0.0.1]:1/v1", "http://127.0.0.2:1/v1"} {
+		if _, err := openai.New(openai.Config{Model: "x", BaseURL: base, APIKey: "sk-x"}); err != nil {
+			t.Errorf("%s: %v", base, err)
+		}
+	}
+}
+
+// TestGenerate_UnusableUsageIsChargedNothing: a hostile endpoint that
+// reports negative, overflowing, or more-cached-than-input counts drove the
+// run's cost below zero and disabled its limits. Such usage is not believed:
+// the reply is a served error with zero usage, and the accounting caller
+// charges its own estimate.
+func TestGenerate_UnusableUsageIsChargedNothing(t *testing.T) {
+	const reply = `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":%s}`
+	for usage, field := range map[string]string{
+		`{"prompt_tokens":-100000000,"completion_tokens":10}`:                                     "prompt_tokens",
+		`{"prompt_tokens":10,"completion_tokens":-1}`:                                             "completion_tokens",
+		`{"prompt_tokens":99999999999999999999,"completion_tokens":1}`:                            "prompt_tokens",
+		`{"prompt_tokens":10.5,"completion_tokens":1}`:                                            "prompt_tokens",
+		`{"prompt_tokens":10,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":11}}`: "cached input tokens 11 exceed",
+		`{"prompt_tokens":10,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":-5}}`: "cached_tokens",
+	} {
+		m := server(t, func(w http.ResponseWriter, _ map[string]any, _ *http.Request) { fmt.Fprintf(w, reply, usage) })
+		_, err := m.Generate(context.Background(), agentrt.ModelRequest{})
+		var served agentrt.ServedError
+		if !errors.As(err, &served) || served.Usage != (agentrt.Usage{}) || !errors.Is(err, providers.ErrUnusableUsage) || !strings.Contains(err.Error(), field) {
+			t.Errorf("usage %s: err = %#v, want a served error with zero usage naming %s", usage, err, field)
+		}
+	}
+	m := server(t, func(w http.ResponseWriter, _ map[string]any, _ *http.Request) {
+		fmt.Fprintf(w, reply, `{"prompt_tokens":10,"completion_tokens":1}`)
+	})
+	if resp, err := m.Generate(context.Background(), agentrt.ModelRequest{}); err != nil || resp.Usage != (agentrt.Usage{InputTokens: 10, OutputTokens: 1}) {
+		t.Fatalf("honest usage: %+v, %v", resp.Usage, err)
+	}
+}
+
+type holder struct {
+	name  string
+	model openai.Model
+}
+
+// TestConfigAndModel_EncodeWithoutTheKey covers every route the sweep's
+// printkey probe used: json.Marshal and log/slog printed the key, and so did
+// %+v of a struct holding a Model in an unexported field.
+func TestConfigAndModel_EncodeWithoutTheKey(t *testing.T) {
+	const key = "sk-FAKE-OPENAI-KEY"
+	cfg := openai.Config{Model: "m", APIKey: key}
+	m, err := openai.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, v := range []any{cfg, &cfg, *m, m} {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("json.Marshal(%T): %v", v, err)
+		}
+		out = append(out, string(b))
+		var logged strings.Builder
+		slog.New(slog.NewTextHandler(&logged, nil)).Info("cfg", "v", v)
+		slog.New(slog.NewJSONHandler(&logged, nil)).Info("cfg", "v", v)
+		out = append(out, logged.String())
+	}
+	for _, format := range []string{"%v", "%+v", "%#v"} {
+		out = append(out, fmt.Sprintf(format, holder{name: "x", model: *m}), fmt.Sprintf(format, struct{ M openai.Model }{*m}))
+	}
+	for _, o := range out {
+		if strings.Contains(o, key) {
+			t.Errorf("the key leaked: %s", o)
+		}
+	}
+	if b, _ := json.Marshal(cfg); !strings.Contains(string(b), `"APIKey":"[redacted]"`) || !strings.Contains(string(b), `"Model":"m"`) {
+		t.Errorf("json.Marshal(Config) = %s, want the fields with the key redacted", b)
+	}
+	withClient := cfg
+	withClient.HTTPClient = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return nil }}
+	if b, err := json.Marshal(withClient); err != nil || strings.Contains(string(b), key) || !strings.Contains(string(b), `"HTTPClient":true`) {
+		t.Errorf("json.Marshal(Config with a client) = %s, %v", b, err)
 	}
 }

@@ -33,6 +33,10 @@ func TestMain(m *testing.M) {
 		childServer(false)
 	case "die-on-list":
 		childServer(true)
+	case "grandparent":
+		grandparent()
+	case "grandchild":
+		grandchild()
 	}
 	os.Exit(0)
 }
@@ -308,7 +312,7 @@ func TestMessageTap_RecordsJSONAndSSEResults(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		rec.sent(msg)
+		rec.sent(context.Background(), msg)
 		tap := &messageTap{inner: io.NopCloser(strings.NewReader(body.text)), rec: rec, sse: body.sse}
 		// One byte a read, so every line and event boundary falls between
 		// reads.

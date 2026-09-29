@@ -12,6 +12,7 @@ import (
 	"time"
 
 	agentrt "github.com/joeylking/agent-runtime"
+	"github.com/joeylking/agent-runtime/trace"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -113,24 +114,29 @@ type Refusal struct {
 }
 
 // String renders the report as one line per tool, for a consumer that logs
-// what it loaded.
+// what it loaded. Every name and reason is escaped by trace.Sanitize, since
+// a server chooses its tool names and much of a refusal's text, and a name
+// that carries a newline or a terminal escape could otherwise print a line
+// of its own, such as a registration that never happened.
 func (r *Report) String() string {
 	var b strings.Builder
+	san := trace.Sanitize
+	server := san(r.Server)
 	for _, reg := range r.Registered {
-		fmt.Fprintf(&b, "%s: registered %s as %s (%s)", r.Server, reg.Tool, reg.Name, reg.SideEffect)
+		fmt.Fprintf(&b, "%s: registered %s as %s (%s)", server, san(reg.Tool), san(reg.Name), san(string(reg.SideEffect)))
 		if reg.HintMismatch != "" {
-			fmt.Fprintf(&b, " [hint mismatch allowed: %s]", reg.HintMismatch)
+			fmt.Fprintf(&b, " [hint mismatch allowed: %s]", san(reg.HintMismatch))
 		}
 		b.WriteString("\n")
 	}
 	for _, ref := range r.Refused {
-		fmt.Fprintf(&b, "%s: refused %s: %s\n", r.Server, ref.Tool, ref.Reason)
+		fmt.Fprintf(&b, "%s: refused %s: %s\n", server, san(ref.Tool), san(ref.Reason))
 	}
 	for _, name := range r.Unclassified {
-		fmt.Fprintf(&b, "%s: unclassified %s: no rule\n", r.Server, name)
+		fmt.Fprintf(&b, "%s: unclassified %s: no rule\n", server, san(name))
 	}
 	for _, name := range r.Unpinned {
-		fmt.Fprintf(&b, "%s: unpinned %s: not in the manifest\n", r.Server, name)
+		fmt.Fprintf(&b, "%s: unpinned %s: not in the manifest\n", server, san(name))
 	}
 	return b.String()
 }
@@ -157,19 +163,56 @@ func Load(ctx context.Context, server Server, manifest *Manifest, rules Rules) (
 	if err != nil {
 		return nil, nil, err
 	}
-	defer checker.close()
 
+	// One deadline bounds the whole of Load: connecting, the listing, and
+	// every check after it, the schema compile included.
 	pctx, cancel := context.WithTimeout(ctx, server.connectTimeout())
 	defer cancel()
 	conn, err := connect(pctx, server)
 	if err != nil {
+		checker.close()
 		return nil, nil, err
 	}
 	live, err := conn.listTools(pctx)
 	if err != nil {
+		checker.close()
 		return nil, nil, err
 	}
 
+	type outcome struct {
+		tools []agentrt.Tool
+		rep   *Report
+	}
+	done := make(chan outcome, 1)
+	hook := loadHook
+	go func() {
+		defer checker.close()
+		tools, rep := register(server, conn, manifest, rules, live, checker, hook)
+		done <- outcome{tools, rep}
+	}()
+	var o outcome
+	select {
+	case o = <-done:
+	case <-pctx.Done():
+		// The checks cannot be interrupted; they finish on their own, and
+		// close the checker when they do, against a closed connection.
+		conn.Close()
+		if ctx.Err() != nil {
+			return nil, nil, fmt.Errorf("mcp: server %q: load: %w", server.Name, ctx.Err())
+		}
+		return nil, nil, fmt.Errorf("mcp: server %q: load: timed out after %s", server.Name, server.connectTimeout())
+	}
+	if len(o.tools) == 0 {
+		conn.Close()
+		o.rep.Connection = nil
+		return nil, o.rep, fmt.Errorf("mcp: server %q: no tool registered", server.Name)
+	}
+	return o.tools, o.rep, nil
+}
+
+// register decides every pinned tool against the live listing and the
+// rules, and returns the tools that registered and the report.
+func register(server Server, conn *Connection, manifest *Manifest, rules Rules, live map[string]liveTool, checker *specChecker, hook func()) ([]agentrt.Tool, *Report) {
 	rep := &Report{Server: server.Name, Connection: conn}
 	for _, name := range sortedKeys(live) {
 		if _, ok := manifest.Tools[name]; !ok {
@@ -184,6 +227,9 @@ func Load(ctx context.Context, server Server, manifest *Manifest, rules Rules) (
 			rep.Unclassified = append(rep.Unclassified, name)
 			continue
 		}
+		if hook != nil {
+			hook()
+		}
 		t, reg, err := build(server, conn, manifest.Tools[name], rule, live[name], checker)
 		if err != nil {
 			rep.Refused = append(rep.Refused, Refusal{Tool: name, Reason: err.Error()})
@@ -197,13 +243,12 @@ func Load(ctx context.Context, server Server, manifest *Manifest, rules Rules) (
 		tools = append(tools, t)
 		rep.Registered = append(rep.Registered, reg)
 	}
-	if len(tools) == 0 {
-		conn.Close()
-		rep.Connection = nil
-		return nil, rep, fmt.Errorf("mcp: server %q: no tool registered", server.Name)
-	}
-	return tools, rep, nil
+	return tools, rep
 }
+
+// loadHook, when set, runs before each tool is built. Only the tests set it,
+// to make Load's checks slow.
+var loadHook func()
 
 // build checks one pinned tool against the live server and the operator's
 // rule, and returns the tool the runtime will register. Every failure is the
@@ -245,6 +290,9 @@ func build(server Server, conn *Connection, pinned PinnedTool, rule Rule, found 
 		return nil, none, fmt.Errorf("the name %q does not match %s", name, namePattern)
 	}
 	if err := objectSchema(pinned.InputSchema); err != nil {
+		return nil, none, err
+	}
+	if err := selfContained(pinned.InputSchema); err != nil {
 		return nil, none, err
 	}
 	hidden := make([]string, 0, len(rule.Deny)+len(rule.Fixed))
@@ -317,6 +365,84 @@ func objectSchema(raw json.RawMessage) error {
 		return errors.New(`the input schema is not an object schema ("type":"object")`)
 	}
 	return nil
+}
+
+// selfContained refuses a schema the compiler could resolve against anything
+// but itself: a "$ref", "$dynamicRef", or "$recursiveRef" that is not a
+// fragment of this document, an "$id" that is neither a fragment nor a
+// well-known draft URI, or a "$schema" that is not a well-known draft URI,
+// found anywhere in the document, values such as default and examples
+// included, since this package does not decide which of a server's objects
+// the compiler reads as schemas. A server-supplied schema that could fetch a
+// URL or read a file when compiled is refused before the compiler sees it.
+// Under draft-04, whose base-changing keyword is "id", an "id" that names a
+// scheme or a host is refused the same way.
+func selfContained(raw json.RawMessage) error {
+	var doc any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&doc); err != nil {
+		return errors.New("the input schema is not JSON")
+	}
+	draft4 := false
+	if root, ok := doc.(map[string]any); ok {
+		if s, ok := root["$schema"].(string); ok && strings.Contains(s, "draft-04") {
+			draft4 = true
+		}
+	}
+	var walk func(v any, at string) error
+	walk = func(v any, at string) error {
+		switch x := v.(type) {
+		case map[string]any:
+			for _, k := range sortedKeys(x) {
+				val := x[k]
+				if s, ok := val.(string); ok {
+					var bad bool
+					switch k {
+					case "$ref", "$dynamicRef", "$recursiveRef":
+						bad = !strings.HasPrefix(s, "#")
+					case "$id":
+						bad = !strings.HasPrefix(s, "#") && !wellKnownDraft(s)
+					case "$schema":
+						bad = !wellKnownDraft(s)
+					case "id":
+						bad = draft4 && !strings.HasPrefix(s, "#") && (strings.Contains(s, ":") || strings.HasPrefix(s, "//"))
+					}
+					if bad {
+						return fmt.Errorf("the input schema's %s at %s is %q, which could make the schema compiler read outside it", k, at, s)
+					}
+				}
+				if err := walk(val, at+"/"+k); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for i, e := range x {
+				if err := walk(e, fmt.Sprintf("%s/%d", at, i)); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return walk(doc, "#")
+}
+
+// wellKnownDraft reports whether uri names one of the JSON Schema
+// metaschemas the compiler carries, so naming it fetches nothing.
+func wellKnownDraft(uri string) bool {
+	rest, ok := strings.CutPrefix(uri, "https://")
+	if !ok {
+		if rest, ok = strings.CutPrefix(uri, "http://"); !ok {
+			return false
+		}
+	}
+	switch strings.TrimSuffix(rest, "#") {
+	case "json-schema.org/draft-04/schema", "json-schema.org/draft-06/schema", "json-schema.org/draft-07/schema",
+		"json-schema.org/draft/2019-09/schema", "json-schema.org/draft/2020-12/schema", "json-schema.org/schema":
+		return true
+	}
+	return false
 }
 
 // combinators are the top-level keywords whose subschemas can constrain a

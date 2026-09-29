@@ -60,8 +60,9 @@ func TestDefaultDBPath_IsFixedUnderTheCacheDirectory(t *testing.T) {
 }
 
 // TestRun_CreatesTheDatabaseFile0600 checks the non-model part of `go run
-// ./examples/live`: the database file it creates must not be
-// group/world-readable, whatever the umask.
+// ./examples/live`: the database it opens, WAL files included, must not be
+// group/world-readable, whatever the umask. The example no longer chmods
+// the file after opening it: OpenStore creates it owner-only.
 func TestRun_CreatesTheDatabaseFile0600(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX file modes only")
@@ -71,16 +72,18 @@ func TestRun_CreatesTheDatabaseFile0600(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store.Close()
-	if err := os.Chmod(path, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("db file mode = %o, want 0600", perm)
+	defer store.Close()
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		info, err := os.Stat(p)
+		if os.IsNotExist(err) && p != path {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			t.Fatalf("%s mode = %o, want owner-only", p, perm)
+		}
 	}
 }
 

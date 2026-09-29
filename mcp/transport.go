@@ -143,26 +143,60 @@ func (t *stderrTail) annotate(ctx context.Context, err error) error {
 }
 
 // listRecorder keeps the raw result of every tools/list response on one
-// connection, matched to its request by JSON-RPC id. The SDK hands the
-// client a decoded schema whose numbers are float64s; the pin needs the
-// bytes the server sent.
+// connection, matched to its request by JSON-RPC id, and the raw result of
+// every tools/call whose context carries a callSlot. The SDK hands the
+// client decoded values whose numbers are float64s; the pin, and a recorded
+// structured result, need the bytes the server sent.
 type listRecorder struct {
 	mu      sync.Mutex
 	pending map[any]bool
+	calls   map[any]*callSlot
 	results []json.RawMessage
 }
 
-func (r *listRecorder) sent(msg jsonrpc.Message) {
+// callSlot receives the raw result of one tools/call. Call puts it in the
+// context it calls the SDK with, and the recorder finds it there when the
+// request is written, which is the only point at which the call's JSON-RPC
+// id is visible.
+type callSlot struct {
+	mu     sync.Mutex
+	result json.RawMessage
+}
+
+type callSlotKey struct{}
+
+func withCallSlot(ctx context.Context) (context.Context, *callSlot) {
+	slot := &callSlot{}
+	return context.WithValue(ctx, callSlotKey{}, slot), slot
+}
+
+func (s *callSlot) raw() json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.result
+}
+
+func (r *listRecorder) sent(ctx context.Context, msg jsonrpc.Message) {
 	req, ok := msg.(*jsonrpc.Request)
-	if !ok || req.Method != "tools/list" || !req.ID.IsValid() {
+	if !ok || !req.ID.IsValid() {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.pending == nil {
-		r.pending = map[any]bool{}
+	switch req.Method {
+	case "tools/list":
+		if r.pending == nil {
+			r.pending = map[any]bool{}
+		}
+		r.pending[req.ID.Raw()] = true
+	case "tools/call":
+		if slot, ok := ctx.Value(callSlotKey{}).(*callSlot); ok {
+			if r.calls == nil {
+				r.calls = map[any]*callSlot{}
+			}
+			r.calls[req.ID.Raw()] = slot
+		}
 	}
-	r.pending[req.ID.Raw()] = true
 }
 
 func (r *listRecorder) received(msg jsonrpc.Message) {
@@ -172,6 +206,15 @@ func (r *listRecorder) received(msg jsonrpc.Message) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if slot, ok := r.calls[resp.ID.Raw()]; ok {
+		delete(r.calls, resp.ID.Raw())
+		if resp.Error == nil {
+			slot.mu.Lock()
+			slot.result = bytes.Clone(resp.Result)
+			slot.mu.Unlock()
+		}
+		return
+	}
 	if !r.pending[resp.ID.Raw()] {
 		return
 	}
@@ -220,18 +263,25 @@ func (c *recordingConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 }
 
 func (c *recordingConn) Write(ctx context.Context, msg jsonrpc.Message) error {
-	c.rec.sent(msg)
+	c.rec.sent(ctx, msg)
 	return c.Connection.Write(ctx, msg)
 }
 
 // httpClient is the client a streamable HTTP connection uses: a copy of the
 // operator's, or a fresh one, never http.DefaultClient, with its transport
 // wrapped so every response body is capped and tools/list results are
-// recorded. The operator's client is not modified.
+// recorded. The operator's client is not modified. Unless it has a
+// CheckRedirect of its own, no redirect is followed: an operator's
+// credential rides in a header their RoundTripper adds to every request,
+// including one to wherever a 307 points, so a followed redirect hands the
+// session and the token to another host.
 func httpClient(base *http.Client, rec *listRecorder) *http.Client {
 	var c http.Client
 	if base != nil {
 		c = *base
+	}
+	if c.CheckRedirect == nil {
+		c.CheckRedirect = refuseRedirects
 	}
 	inner := c.Transport
 	if inner == nil {
@@ -240,6 +290,8 @@ func httpClient(base *http.Client, rec *listRecorder) *http.Client {
 	c.Transport = &limitedTransport{inner: inner, limit: MaxResponseBodyBytes, rec: rec}
 	return &c
 }
+
+func refuseRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 // limitedTransport caps each response body at limit bytes and, given a
 // recorder, shows it the JSON-RPC messages that pass.
@@ -255,7 +307,7 @@ func (t *limitedTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 			raw, _ := io.ReadAll(io.LimitReader(body, MaxResponseBodyBytes))
 			body.Close()
 			if msg, err := jsonrpc.DecodeMessage(raw); err == nil {
-				t.rec.sent(msg)
+				t.rec.sent(req.Context(), msg)
 			}
 		}
 	}
@@ -313,7 +365,9 @@ func (b *limitedBody) Close() error { return b.inner.Close() }
 // messageTap shows a recorder each JSON-RPC message in a response body as
 // the SDK reads it: the whole body for application/json, each event's data
 // for an SSE stream. A message is recorded before the read that completes it
-// returns, so it is on record before the SDK can act on it.
+// returns, so it is on record before the SDK can act on it. An SSE event is
+// recorded only when the SDK would act on it too: one whose event name is
+// empty or "message".
 type messageTap struct {
 	inner  io.ReadCloser
 	rec    *listRecorder
@@ -321,6 +375,7 @@ type messageTap struct {
 	buf    []byte // the whole body, or the SSE line in progress
 	data   []byte // the SSE event's data so far
 	isData bool
+	event  string // the SSE event's name so far
 }
 
 func (m *messageTap) Read(p []byte) (int, error) {
@@ -355,10 +410,15 @@ func (m *messageTap) lines(eof bool) {
 
 func (m *messageTap) line(line []byte) {
 	if len(line) == 0 {
-		if m.isData {
+		if m.isData && (m.event == "" || m.event == "message") {
 			m.message(m.data)
 		}
-		m.data, m.isData = nil, false
+		m.data, m.isData, m.event = nil, false, ""
+		return
+	}
+	if name, ok := bytes.CutPrefix(line, []byte("event:")); ok {
+		// The SDK trims the name the same way before it compares it.
+		m.event = strings.TrimSpace(string(name))
 		return
 	}
 	value, ok := bytes.CutPrefix(line, []byte("data:"))

@@ -16,16 +16,39 @@
 // Load and tools/list_changed notifications are ignored; a changed server is
 // seen at the next Load. Annotations and output schemas are outside the
 // hashes: annotations are recorded and can only refuse a registration, and
-// an output schema is not checked at all. A stdio server is third-party code
-// running as this process's user; the minimal environment it is given keeps
-// the operator's credentials out of it, and nothing else about the host is
-// sandboxed.
+// an output schema is not checked at all. Load also refuses a pinned schema
+// that could make the schema compiler look outside the document: a "$ref"
+// that is not a fragment, or an "$id" or "$schema" that is not a well-known
+// draft URI, anywhere in it.
 //
-// A stdio server does not inherit this process's environment: it gets PATH,
-// HOME, and TMPDIR (the Windows equivalents on Windows), then every name
-// Server.InheritEnv lists, taken from this process, then Server.Env as
-// written. A server that needs a credential is given that one variable
-// through Env or InheritEnv and nothing else.
+// A stdio server is third-party code running as this process's user, with
+// everything that user can reach. It does not inherit this process's
+// environment: it gets PATH, HOME, and TMPDIR (the Windows equivalents on
+// Windows), then every name Server.InheritEnv lists, taken from this
+// process, then Server.Env as written. Only variables are withheld that way.
+// The credential files under HOME, such as ~/.aws, ~/.ssh, or a token cache,
+// and any directory on PATH the user can write, remain as reachable to the
+// server as to the operator, and nothing about the host is sandboxed. A
+// server that needs a credential is given that one variable through Env or
+// InheritEnv and nothing else.
+//
+// A stdio server is started in a process group of its own, so a terminal's
+// Ctrl-C reaches this process rather than the server, and Connection.Close
+// kills the whole group once the SDK's own shutdown (close stdin, wait,
+// SIGTERM, SIGKILL) has run, so a descendant, such as the node process a
+// launcher script starts, does not outlive the session. On Linux the server is also killed if
+// this process dies first; its own descendants are not, unless they watch
+// for it. On other systems a server outlives a crash of this process until
+// it reads the end of its stdin. On Windows no group is made, and Close ends
+// only the server itself.
+//
+// The SDK reads the MCPGODEBUG environment variable once, when the program
+// starts, to switch some of its behaviour back to older releases'; it is
+// this process's variable, and a stdio server never receives it unless named.
+// Nor does a stdio server receive HTTP_PROXY, HTTPS_PROXY, or NO_PROXY
+// unless they are named, while this process's own HTTP clients, a
+// streamable HTTP connection's included, honour all three through
+// http.ProxyFromEnvironment unless Server.HTTPClient says otherwise.
 //
 // Connecting, the initialize handshake, and the first tool listing are
 // bounded together by Server.ConnectTimeout (default 30s), so a server that
@@ -34,7 +57,17 @@
 // further bounded by MaxToolPages and MaxTools, so a server that pages
 // forever or offers an unbounded tool set fails the listing rather than
 // holding the client, and a streamable HTTP response over
-// MaxResponseBodyBytes fails the same way.
+// MaxResponseBodyBytes fails the same way. Load's own checks, the schema
+// compile included, fall inside the same bound.
+//
+// A streamable HTTP connection follows no redirect unless Server.HTTPClient
+// has a CheckRedirect of its own: a credential its RoundTripper adds would
+// otherwise go wherever a 3xx points, and the session with it.
+//
+// Text a server chose, such as a tool name, a description, or an error
+// message, is escaped by trace.Sanitize wherever this package puts it in
+// text for an operator's terminal: Report.String and the errors of Pin and
+// Load. The Report's fields and the Manifest keep the values as received.
 //
 // Resources, prompts, sampling, elicitation, and the server side of MCP are
 // out of scope, and a call the server answers with an input request fails.
@@ -53,6 +86,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/joeylking/agent-runtime/trace"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -104,7 +138,9 @@ type Server struct {
 	// client used to reach it. The client is copied, never modified, and
 	// its transport is wrapped so that no response body exceeds
 	// MaxResponseBodyBytes; with no HTTPClient a fresh client is used, not
-	// http.DefaultClient. The standalone SSE stream a server could push
+	// http.DefaultClient. No redirect is followed unless the client has a
+	// CheckRedirect of its own, and then where it sends a credential is the
+	// operator's responsibility. The standalone SSE stream a server could push
 	// notifications on is not opened, since nothing here listens to them.
 	Endpoint   string
 	HTTPClient *http.Client
@@ -166,17 +202,19 @@ func (s Server) connectTimeout() time.Duration {
 	return DefaultConnectTimeout
 }
 
-// newTransport returns the transport, the stderr tail when one is kept, and
-// what to run once the SDK has started the server or failed to.
-func (s Server) newTransport(rec *listRecorder) (sdk.Transport, *stderrTail, func(), error) {
+// newTransport returns the transport, the stderr tail when one is kept, what
+// to run once the SDK has started the server or failed to, and a stdio
+// server's command, whose process group Close kills.
+func (s Server) newTransport(rec *listRecorder) (sdk.Transport, *stderrTail, func(), *exec.Cmd, error) {
 	switch {
 	case s.transport != nil:
-		return &recordingTransport{inner: s.transport, rec: rec}, nil, func() {}, nil
+		return &recordingTransport{inner: s.transport, rec: rec}, nil, func() {}, nil, nil
 	case len(s.Command) > 0:
 		// Deliberately not CommandContext: the subprocess belongs to the
 		// connection, not to the context that opened it, and Close stops it.
 		cmd := exec.Command(s.Command[0], s.Command[1:]...)
 		cmd.Env = childEnv(runtime.GOOS, s.InheritEnv, s.Env, os.LookupEnv)
+		contain(cmd)
 		var tail *stderrTail
 		started := func() {}
 		if s.Stderr != nil {
@@ -184,19 +222,19 @@ func (s Server) newTransport(rec *listRecorder) (sdk.Transport, *stderrTail, fun
 		} else {
 			t, w, err := newStderrTail()
 			if err != nil {
-				return nil, nil, nil, fmt.Errorf("mcp: server %q: stderr: %w", s.Name, err)
+				return nil, nil, nil, nil, fmt.Errorf("mcp: server %q: stderr: %w", s.Name, err)
 			}
 			// The child holds its own copy of w once started; closing ours
 			// is what lets the tail see the end of the stream.
 			tail, cmd.Stderr, started = t, w, func() { w.Close() }
 		}
-		return &recordingTransport{inner: &sdk.CommandTransport{Command: cmd}, rec: rec}, tail, started, nil
+		return &recordingTransport{inner: &sdk.CommandTransport{Command: cmd}, rec: rec}, tail, started, cmd, nil
 	default:
 		return &sdk.StreamableClientTransport{
 			Endpoint:             s.Endpoint,
 			HTTPClient:           httpClient(s.HTTPClient, rec),
 			DisableStandaloneSSE: true,
-		}, nil, func() {}, nil
+		}, nil, func() {}, nil, nil
 	}
 }
 
@@ -209,12 +247,20 @@ type Connection struct {
 	rec            *listRecorder
 	stderr         *stderrTail
 	connectTimeout time.Duration
+	cmd            *exec.Cmd
 }
 
-// Close ends the session, and with it a stdio server's subprocess. Close is
-// safe to call more than once and from more than one goroutine, including
-// while a call is in flight, because sdk.ClientSession.Close is.
-func (c *Connection) Close() error { return c.session.Close() }
+// Close ends the session, and with it a stdio server's subprocess: after the
+// SDK's own shutdown sequence, whatever is left of the server's process
+// group is killed, descendants included. Close is safe to call more than
+// once and from more than one goroutine, including while a call is in
+// flight, because sdk.ClientSession.Close is and killing a group that is
+// gone does nothing.
+func (c *Connection) Close() error {
+	err := c.session.Close()
+	killGroup(c.cmd)
+	return err
+}
 
 // stderrWait bounds how long a failure waits for a dead server's stderr.
 const stderrWait = 2 * time.Second
@@ -228,16 +274,17 @@ func connect(ctx context.Context, s Server) (*Connection, error) {
 		MultiRoundTrip: &sdk.MultiRoundTripOptions{Disabled: true},
 	})
 	rec := &listRecorder{}
-	transport, tail, started, err := s.newTransport(rec)
+	transport, tail, started, cmd, err := s.newTransport(rec)
 	if err != nil {
 		return nil, err
 	}
 	session, err := client.Connect(ctx, transport, nil)
 	started()
 	if err != nil {
+		killGroup(cmd)
 		return nil, phaseErr(s.Name, "connect", s.connectTimeout(), tail, err)
 	}
-	return &Connection{server: s.Name, session: session, rec: rec, stderr: tail, connectTimeout: s.connectTimeout()}, nil
+	return &Connection{server: s.Name, session: session, rec: rec, stderr: tail, connectTimeout: s.connectTimeout(), cmd: cmd}, nil
 }
 
 // phaseErr reports the failure of one bounded step of connecting: connect
@@ -246,8 +293,11 @@ func connect(ctx context.Context, s Server) (*Connection, error) {
 // it, the error names the step and its bound rather than repeating
 // "context deadline exceeded"; a stdio server's stderr tail is appended once
 // its end of the pipe closes or stderrWait passes.
+//
+// What the server said, in an error message or on stderr, is escaped by
+// trace.Sanitize, so it cannot rewrite the operator's terminal.
 func phaseErr(server, step string, timeout time.Duration, tail *stderrTail, err error) error {
-	msg := fmt.Errorf("mcp: server %q: %s: %w", server, step, err)
+	msg := fmt.Errorf("mcp: server %q: %s: %w", server, step, sanitized{err})
 	if errors.Is(err, context.DeadlineExceeded) {
 		msg = fmt.Errorf("mcp: server %q: %s: timed out after %s", server, step, timeout)
 	}
@@ -255,6 +305,13 @@ func phaseErr(server, step string, timeout time.Duration, tail *stderrTail, err 
 	defer cancel()
 	return tail.annotate(wait, msg)
 }
+
+// sanitized is an error whose text is escaped by trace.Sanitize, and which
+// still unwraps to the error it escapes.
+type sanitized struct{ err error }
+
+func (s sanitized) Error() string { return trace.Sanitize(s.err.Error()) }
+func (s sanitized) Unwrap() error { return s.err }
 
 // liveTool is one tool as the server listed it: the SDK's decoding for the
 // description and annotations, and the canonical schema made from the bytes
@@ -327,17 +384,23 @@ func (c *Connection) listPages(ctx context.Context) (map[string]liveTool, error)
 }
 
 // rawTools maps each tool in one raw tools/list result to its input schema
-// as sent. Keys are matched exactly, as the SDK matches them, and a name
-// listed twice on the page is an error.
+// as sent. Keys are matched exactly, as the SDK matches them, at every
+// level: encoding/json would match a struct field case-insensitively, and
+// then a page carrying both "tools" and "Tools" would pin one list while the
+// SDK registered the other. A name listed twice on the page is an error.
 func rawTools(result json.RawMessage) (map[string]json.RawMessage, error) {
-	var page struct {
-		Tools []map[string]json.RawMessage `json:"tools"`
-	}
+	var page map[string]json.RawMessage
 	if err := json.Unmarshal(result, &page); err != nil {
 		return nil, fmt.Errorf("the raw tools/list result: %w", err)
 	}
-	out := make(map[string]json.RawMessage, len(page.Tools))
-	for _, t := range page.Tools {
+	var tools []map[string]json.RawMessage
+	if raw, ok := page["tools"]; ok {
+		if err := json.Unmarshal(raw, &tools); err != nil {
+			return nil, fmt.Errorf("the raw tools/list result: %w", err)
+		}
+	}
+	out := make(map[string]json.RawMessage, len(tools))
+	for _, t := range tools {
 		var name string
 		if err := json.Unmarshal(t["name"], &name); err != nil {
 			continue // the SDK drops it too, and a tool it kept must be here

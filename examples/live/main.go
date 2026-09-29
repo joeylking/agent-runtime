@@ -88,7 +88,8 @@ func main() {
 	ctx, stop := signalContext(context.Background(), signal.Notify)
 	defer stop()
 	if err := run(ctx, *dbPath, *modelName, *baseURL, *resume); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+		// A provider's error can repeat what the server sent.
+		fmt.Fprintln(os.Stderr, "error:", trace.Sanitize(err.Error()))
 		os.Exit(1)
 	}
 }
@@ -168,16 +169,12 @@ func run(ctx context.Context, dbPath, modelName, baseURL, resumeID string) error
 	if _, err := providers.PriceFor(prices, model.Name()); err != nil {
 		return err
 	}
+	// OpenStore creates the database and its WAL files owner-only.
 	store, err := agentrt.OpenStore(dbPath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	if dbPath != ":memory:" {
-		if err := os.Chmod(dbPath, 0o600); err != nil {
-			return err
-		}
-	}
 
 	c := &counter{}
 	driver, err := agentrt.NewDriver(agentrt.Config{
@@ -229,7 +226,7 @@ func report(r agentrt.Run, dbPath string, store *agentrt.Store) {
 		fmt.Printf(" (%s)", r.Reason)
 	}
 	fmt.Printf(" steps=%d calls=%d tokens=%d/%d result=%s\n",
-		r.StepCount, r.ModelCalls, r.Usage.InputTokens, r.Usage.OutputTokens, r.Result)
+		r.StepCount, r.ModelCalls, r.Usage.InputTokens, r.Usage.OutputTokens, trace.Sanitize(string(r.Result)))
 	if r.Status != agentrt.StatusWaitingForApproval {
 		return
 	}
@@ -239,7 +236,7 @@ func report(r agentrt.Run, dbPath string, store *agentrt.Store) {
 	}
 	for _, a := range approvals {
 		if a.Status == agentrt.ApprovalPending {
-			fmt.Printf("\nwaiting for approval %s: %s\n  %s\n", a.ID, a.Kind, a.Presentation)
+			fmt.Printf("\nwaiting for approval %s: %s\n  %s\n", a.ID, a.Kind, trace.Sanitize(string(a.Presentation)))
 		}
 	}
 	fmt.Printf("\ngrant it, then continue the run:\n  go run ./cmd/agentrt -db %s approve %s\n  go run ./examples/live -db %s -resume %s\n", dbPath, r.ID, dbPath, r.ID)

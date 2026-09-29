@@ -77,16 +77,12 @@ func defaultDBPath() (string, error) {
 }
 
 func run(dbPath string) error {
+	// OpenStore creates the database and its WAL files owner-only.
 	store, err := agentrt.OpenStore(dbPath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	if dbPath != ":memory:" {
-		if err := os.Chmod(dbPath, 0o600); err != nil {
-			return err
-		}
-	}
 
 	c := &counter{}
 	tools := []agentrt.Tool{

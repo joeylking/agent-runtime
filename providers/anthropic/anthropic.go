@@ -18,10 +18,22 @@
 //     write and 2 for a one-hour write; cache reads are reported as
 //     CachedInputTokens and priced at the cached rate.
 //   - A reply the API served but that does not decode is an
-//     agentrt.ServedError carrying whatever usage it reported.
+//     agentrt.ServedError carrying whatever usage it reported. A reply
+//     whose usage cannot be believed, because a count is negative, not an
+//     integer, or too large to hold once folded, is an agentrt.ServedError
+//     with zero usage naming the count, so the accounting caller charges
+//     its own estimate.
 //   - Parallel tool use is disabled in the request. Should a reply carry
 //     several tool uses anyway, every one is returned; the runtime executes
 //     the first and records that the others were dropped.
+//
+// No redirect is followed: net/http would forward the x-api-key header to
+// any host a 3xx names. A 3xx is a permanent providers.StatusError naming
+// only the host it pointed to. A key is refused over plain http unless the
+// host is exactly "localhost" or a literal loopback address, and each such
+// connection's address is checked as it is made. The key is kept out of
+// every encoding of a Config or a Model: fmt, JSON, and log/slog all print
+// it redacted.
 //
 // Nothing is taken from the environment but the key. The SDK's own
 // environment chain (ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, profiles,
@@ -50,8 +62,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	sdk "github.com/anthropics/anthropic-sdk-go"
@@ -109,11 +124,16 @@ type Config struct {
 	// and that consumer prices the model itself.
 	Name string
 	// APIKey is the credential. Empty means ANTHROPIC_API_KEY, and New
-	// fails when that is empty too. No other credential source is read.
+	// fails when that is empty too. No other credential source is read. A
+	// Config prints, marshals, and logs the key redacted, except as a field
+	// fmt cannot call a method on: an unexported field of a consumer's
+	// struct printed with %v shows it, so a consumer keeps a Config there
+	// out of print.
 	APIKey string
 	// BaseURL overrides the API endpoint, which is how the tests point the
 	// adapter at a fake. Empty means DefaultBaseURL; ANTHROPIC_BASE_URL is
-	// not read.
+	// not read. It must be an http or https URL, and plain http only to a
+	// loopback host, since the key travels with every request.
 	BaseURL string
 	// Effort is the output_config effort. Empty leaves the API default.
 	Effort string
@@ -131,20 +151,42 @@ type Config struct {
 	// message verbatim. Empty means DefaultRawAssistantBlock.
 	RawAssistantBlock string
 	// HTTPClient overrides the client the SDK uses. The adapter uses a copy
-	// whose transport refuses a body over providers.MaxBodyBytes. Nil means
-	// a client with providers.DefaultTimeout, a backstop to the caller's
-	// context.
+	// whose transport refuses a body over providers.MaxBodyBytes and,
+	// unless the client has a CheckRedirect of its own, follows no
+	// redirect. Nil means a client with providers.DefaultTimeout, a
+	// backstop to the caller's context.
 	HTTPClient *http.Client
 }
 
 // String redacts the key, so a Config that is logged or printed does not
 // leak it.
-func (c Config) String() string {
-	return fmt.Sprintf("anthropic.Config{Model:%q Name:%q BaseURL:%q APIKey:%s}", c.Model, c.Name, c.BaseURL, redact(c.APIKey))
+func (c Config) String() string { return c.format(redact(c.APIKey)) }
+
+func (c Config) format(key string) string {
+	return fmt.Sprintf("anthropic.Config{Model:%q Name:%q BaseURL:%q APIKey:%s}", c.Model, c.Name, c.BaseURL, key)
 }
 
 // GoString redacts the key for %#v.
 func (c Config) GoString() string { return c.String() }
+
+// MarshalJSON redacts the key, so a Config encoded as JSON does not leak
+// it. HTTPClient, which JSON cannot hold, is true when one is set.
+func (c Config) MarshalJSON() ([]byte, error) {
+	type plain Config
+	p := struct {
+		plain
+		HTTPClient bool `json:",omitempty"`
+	}{plain(c), c.HTTPClient != nil}
+	if p.APIKey != "" {
+		p.APIKey = "[redacted]"
+	}
+	return json.Marshal(p)
+}
+
+// LogValue redacts the key for log/slog.
+func (c Config) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("model", c.Model), slog.String("name", c.Name), slog.String("base_url", c.BaseURL), slog.String("api_key", redact(c.APIKey)))
+}
 
 func redact(key string) string {
 	if key == "" {
@@ -153,29 +195,63 @@ func redact(key string) string {
 	return "[redacted]"
 }
 
-// Model is one Claude model.
+// secret holds a key behind a closure, so that printing by reflection, which
+// is what fmt does with an unexported field, shows a function address and
+// never the key, and every method that can print it redacts.
+type secret func() string
+
+func newSecret(key string) secret { return func() string { return key } }
+
+func (s secret) reveal() string {
+	if s == nil {
+		return ""
+	}
+	return s()
+}
+
+func (s secret) String() string               { return redact(s.reveal()) }
+func (s secret) GoString() string             { return s.String() }
+func (s secret) Format(f fmt.State, _ rune)   { fmt.Fprint(f, s.String()) }
+func (s secret) MarshalJSON() ([]byte, error) { return json.Marshal(s.String()) }
+func (s secret) LogValue() slog.Value         { return slog.StringValue(s.String()) }
+
+// Model is one Claude model. It holds no copy of the key as a string: the
+// SDK client keeps it inside its own options, and the Model only knows
+// whether there is one.
 type Model struct {
 	cfg    Config
 	name   string
+	key    secret
 	client sdk.Client
 }
 
 // String redacts the key, so a Model that is logged or printed does not
 // leak it.
 func (m Model) String() string {
-	return fmt.Sprintf("anthropic.Model{Name:%q Config:%s}", m.name, m.cfg)
+	return fmt.Sprintf("anthropic.Model{Name:%q Config:%s}", m.name, m.cfg.format(m.key.String()))
 }
 
 // GoString redacts the key for %#v.
 func (m Model) GoString() string { return m.String() }
 
+// LogValue redacts the key for log/slog.
+func (m Model) LogValue() slog.Value { return slog.StringValue(m.String()) }
+
+// MarshalJSON encodes what String prints, so a Model encoded as JSON does
+// not leak the key.
+func (m Model) MarshalJSON() ([]byte, error) { return json.Marshal(m.String()) }
+
 // New builds the adapter. It refuses an empty model id, a model Prices
 // does not hold when Config.Name is unset, an output cap too large to
-// serve without streaming, and a configuration with no key.
+// serve without streaming, a configuration with no key, and a BaseURL that
+// is not http or https or would carry the key over plain http to a host
+// that is not loopback.
 func New(cfg Config) (*Model, error) {
 	if cfg.Model == "" {
 		return nil, errors.New("anthropic: model is required")
 	}
+	key := cfg.APIKey
+	cfg.APIKey = ""
 	m := &Model{cfg: cfg, name: cfg.Name}
 	if m.name == "" {
 		m.name = Name(cfg.Model)
@@ -192,22 +268,31 @@ func New(cfg Config) (*Model, error) {
 	if m.cfg.RawAssistantBlock == "" {
 		m.cfg.RawAssistantBlock = DefaultRawAssistantBlock
 	}
-	if m.cfg.APIKey == "" {
-		m.cfg.APIKey = os.Getenv("ANTHROPIC_API_KEY")
+	if key == "" {
+		key = os.Getenv("ANTHROPIC_API_KEY")
 	}
-	if m.cfg.APIKey == "" {
+	if key == "" {
 		return nil, errors.New("anthropic: no API key: set Config.APIKey or ANTHROPIC_API_KEY")
 	}
 	if m.cfg.BaseURL == "" {
 		m.cfg.BaseURL = DefaultBaseURL
 	}
+	u, err := providers.CheckEndpoint("anthropic", m.cfg.BaseURL, true)
+	if err != nil {
+		return nil, err
+	}
+	client := providers.Client(cfg.HTTPClient)
+	if u.Scheme == "http" {
+		client = providers.LoopbackOnly(client)
+	}
+	m.key = newSecret(key)
 	m.client = sdk.NewClient(
 		// Nothing but the key comes from the environment, and the key is
 		// resolved above.
 		option.WithoutEnvironmentDefaults(),
 		option.WithBaseURL(m.cfg.BaseURL),
-		option.WithAPIKey(m.cfg.APIKey),
-		option.WithHTTPClient(providers.Client(cfg.HTTPClient)),
+		option.WithAPIKey(key),
+		option.WithHTTPClient(client),
 		// Retries are the accounting caller's, so the SDK does none.
 		option.WithMaxRetries(0),
 	)
@@ -248,20 +333,25 @@ func (m *Model) Generate(ctx context.Context, req agentrt.ModelRequest) (agentrt
 	// The body is taken raw and decoded here, so that the usage of a reply
 	// that does not decode is still read.
 	var body []byte
-	if _, err := m.client.Messages.New(ctx, params, option.WithResponseBodyInto(&body)); err != nil {
+	var httpResp *http.Response
+	if _, err := m.client.Messages.New(ctx, params, option.WithResponseBodyInto(&body), option.WithResponseInto(&httpResp)); err != nil {
 		return agentrt.ModelResponse{}, classify(err)
 	}
-	var counts struct {
-		Usage sdk.Usage `json:"usage"`
+	// The SDK treats a 3xx, which the client does not follow, as success.
+	if httpResp != nil && (httpResp.StatusCode < 200 || httpResp.StatusCode > 299) {
+		return agentrt.ModelResponse{}, providers.ClassifyResponse("anthropic", httpResp, body)
 	}
-	json.Unmarshal(body, &counts)
+	used, err := usageOf(body)
+	if err != nil {
+		return agentrt.ModelResponse{}, agentrt.ServedError{Err: fmt.Errorf("anthropic: %w", err)}
+	}
 	var resp sdk.Message
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return agentrt.ModelResponse{}, agentrt.ServedError{Usage: foldUsage(counts.Usage), Err: fmt.Errorf("anthropic: decode: %w", err)}
+		return agentrt.ModelResponse{}, agentrt.ServedError{Usage: used, Err: fmt.Errorf("anthropic: decode: %w", err)}
 	}
 	out := agentrt.ModelResponse{
 		StopReason: string(resp.StopReason),
-		Usage:      foldUsage(resp.Usage),
+		Usage:      used,
 		Raw:        json.RawMessage(resp.RawJSON()),
 	}
 	var text strings.Builder
@@ -288,22 +378,83 @@ func (m *Model) Generate(ctx context.Context, req agentrt.ModelRequest) (agentrt
 	return out, nil
 }
 
+// usage is the part of a reply read before the rest, count by count, so
+// that a count that does not fit is refused by name rather than failing
+// the decode or wrapping around.
+type usage struct {
+	InputTokens              json.RawMessage `json:"input_tokens"`
+	OutputTokens             json.RawMessage `json:"output_tokens"`
+	CacheReadInputTokens     json.RawMessage `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens json.RawMessage `json:"cache_creation_input_tokens"`
+	CacheCreation            *struct {
+		Ephemeral1hInputTokens json.RawMessage `json:"ephemeral_1h_input_tokens"`
+	} `json:"cache_creation"`
+}
+
+// usageOf reads and folds the usage a reply reports. Absent counts are
+// zero; a count that is not a non-negative integer that fits, or a fold
+// that would overflow, is an error wrapping providers.ErrUnusableUsage.
+func usageOf(body []byte) (agentrt.Usage, error) {
+	var reply struct {
+		Usage *usage `json:"usage"`
+	}
+	if json.Unmarshal(body, &reply) != nil || reply.Usage == nil {
+		return agentrt.Usage{}, nil
+	}
+	u := reply.Usage
+	var hourRaw json.RawMessage
+	if u.CacheCreation != nil {
+		hourRaw = u.CacheCreation.Ephemeral1hInputTokens
+	}
+	var counts [5]int64
+	for i, f := range []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{"usage.input_tokens", u.InputTokens},
+		{"usage.output_tokens", u.OutputTokens},
+		{"usage.cache_read_input_tokens", u.CacheReadInputTokens},
+		{"usage.cache_creation_input_tokens", u.CacheCreationInputTokens},
+		{"usage.cache_creation.ephemeral_1h_input_tokens", hourRaw},
+	} {
+		n, err := providers.UsageCount(f.name, f.raw)
+		if err != nil {
+			return agentrt.Usage{}, err
+		}
+		counts[i] = int64(n)
+	}
+	folded, err := foldUsage(counts[0], counts[1], counts[2], counts[3], counts[4])
+	if err != nil {
+		return agentrt.Usage{}, err
+	}
+	return folded, providers.CheckUsage(folded)
+}
+
 // foldUsage maps the provider's usage onto the runtime's three counters.
 // Cache writes have no counter of their own, so they are charged as input
 // at the multiple they are billed at: 2 for a one-hour write and 1.25,
 // rounded up, for a five-minute write. A write the response does not break
-// down by duration is charged at 1.25.
-func foldUsage(u sdk.Usage) agentrt.Usage {
-	hour := u.CacheCreation.Ephemeral1hInputTokens
-	short := u.CacheCreationInputTokens - hour
-	if short < 0 {
-		short = 0
+// down by duration is charged at 1.25. Every count is non-negative, and the
+// sum is computed in int64 and refused rather than wrapped when it does not
+// fit an int.
+func foldUsage(input, output, read, creation, hour int64) (agentrt.Usage, error) {
+	short := max(creation-hour, 0)
+	parts := []int64{input, read, 0, 0}
+	if short > (math.MaxInt64-3)/5 || hour > math.MaxInt64/2 {
+		return agentrt.Usage{}, fmt.Errorf("%w: usage: cache writes of %d tokens overflow", providers.ErrUnusableUsage, creation)
 	}
-	return agentrt.Usage{
-		InputTokens:       int(u.InputTokens + u.CacheReadInputTokens + (short*5+3)/4 + hour*2),
-		CachedInputTokens: int(u.CacheReadInputTokens),
-		OutputTokens:      int(u.OutputTokens),
+	parts[2], parts[3] = (short*5+3)/4, hour*2
+	var total int64
+	for _, p := range parts {
+		if total > math.MaxInt64-p {
+			return agentrt.Usage{}, fmt.Errorf("%w: usage: the folded input count overflows", providers.ErrUnusableUsage)
+		}
+		total += p
 	}
+	if strconv.IntSize == 32 && total > math.MaxInt32 {
+		return agentrt.Usage{}, fmt.Errorf("%w: usage: the folded input count %d does not fit an int", providers.ErrUnusableUsage, total)
+	}
+	return agentrt.Usage{InputTokens: int(total), CachedInputTokens: int(read), OutputTokens: int(output)}, nil
 }
 
 func (m *Model) params(req agentrt.ModelRequest) (sdk.MessageNewParams, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -272,5 +273,159 @@ func TestSynthesizeToolUseID_UniquePerIndex(t *testing.T) {
 			t.Fatalf("duplicate id %q", id)
 		}
 		seen[id] = true
+	}
+}
+
+// TestClient_RefusesRedirects: net/http forwards a custom key header such as
+// x-api-key to any host a 307 names, and Authorization to the same host name
+// on another port or over plain http. The sweep saw both keys arrive at the
+// redirect's target with the whole prompt.
+func TestClient_RefusesRedirects(t *testing.T) {
+	var reached int
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached++ }))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/v1/steal?key=sk-FAKE", http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, origin.URL, strings.NewReader("the prompt"))
+	req.Header.Set("X-Api-Key", "sk-FAKE-NOT-A-KEY")
+	resp, err := providers.Client(nil).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTemporaryRedirect || reached != 0 {
+		t.Fatalf("status %d, target reached %d times; want the 307 itself and no second request", resp.StatusCode, reached)
+	}
+	err = providers.ClassifyResponse("anthropic", resp, []byte("body with sk-FAKE"))
+	var se providers.StatusError
+	var tr agentrt.TransientError
+	if !errors.As(err, &se) || errors.As(err, &tr) || se.Status != 307 {
+		t.Fatalf("err = %#v, want a permanent StatusError", err)
+	}
+	host := strings.TrimPrefix(target.URL, "http://")
+	if !strings.Contains(err.Error(), "redirects are not followed") || !strings.Contains(err.Error(), host) ||
+		strings.Contains(err.Error(), "steal") || strings.Contains(err.Error(), "sk-FAKE") {
+		t.Fatalf("err = %q, want the refusal naming only the Location host", err)
+	}
+	if err := providers.ClassifyStatus("ollama", 302, []byte("x")); !errors.As(err, &se) || errors.As(err, &tr) {
+		t.Fatalf("ClassifyStatus 302 = %#v, want permanent", err)
+	}
+
+	// A caller who decides about redirects keeps the decision.
+	mine := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return nil }}
+	resp, err = providers.Client(mine).Get(origin.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if reached != 1 {
+		t.Fatalf("the caller's own CheckRedirect was not kept: target reached %d times", reached)
+	}
+}
+
+func TestLoopback_OnlyLocalhostAndLiteralLoopbackAddresses(t *testing.T) {
+	for host, want := range map[string]bool{
+		"localhost": true, "127.0.0.1": true, "127.0.0.2": true, "::1": true, "::ffff:127.0.0.1": true,
+		"LOCALHOST": false, "localhost.": false, "foo.localhost": false, "127.1": false, "2130706433": false,
+		"0177.0.0.1": false, "0.0.0.0": false, "127.0.0.1.nip.io": false, "evil.example": false, "": false, "fe80::1%lo0": false,
+	} {
+		if got := providers.Loopback(host); got != want {
+			t.Errorf("Loopback(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
+func TestCheckEndpoint_KeyOverPlainHTTPOnlyToLoopback(t *testing.T) {
+	for _, tc := range []struct {
+		base string
+		key  bool
+		ok   bool
+	}{
+		{"https://api.example.com/", true, true},
+		{"http://127.0.0.1:8080/v1", true, true},
+		{"http://localhost/v1", true, true},
+		{"http://[::1]/v1", true, true},
+		{"http://gateway.example.net/", false, true},
+		{"http://gateway.example.net/", true, false},
+		{"http://LOCALHOST/v1", true, false},
+		{"http://127.0.0.1.nip.io/v1", true, false},
+		{"HTTP://evil.example/v1", true, false},
+		{"http://evil.example@127.0.0.1/v1", true, false},
+		{"ftp://127.0.0.1/", false, false},
+		{"https:///v1", false, false},
+	} {
+		_, err := providers.CheckEndpoint("p", tc.base, tc.key)
+		if (err == nil) != tc.ok {
+			t.Errorf("CheckEndpoint(%q, key=%v) = %v, want ok=%v", tc.base, tc.key, err, tc.ok)
+		}
+	}
+}
+
+// remoteConn is a connection that claims to have reached addr, which is how a
+// resolver that maps "localhost" elsewhere looks from the dialler.
+type remoteConn struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (c remoteConn) RemoteAddr() net.Addr { return c.addr }
+
+func TestLoopbackOnly_RefusesAConnectionThatLeavesTheMachine(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits++ }))
+	defer srv.Close()
+
+	resp, err := providers.LoopbackOnly(providers.Client(nil)).Get(srv.URL)
+	if err != nil {
+		t.Fatalf("a loopback server was refused: %v", err)
+	}
+	resp.Body.Close()
+
+	elsewhere := &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := (&net.Dialer{}).DialContext(ctx, network, strings.TrimPrefix(srv.URL, "http://"))
+		if err != nil {
+			return nil, err
+		}
+		return remoteConn{c, &net.TCPAddr{IP: net.ParseIP("192.0.2.7"), Port: 80}}, nil
+	}}
+	mine := &http.Client{Transport: elsewhere}
+	_, err = providers.LoopbackOnly(providers.Client(mine)).Get("http://localhost/v1")
+	if !errors.Is(err, providers.ErrNotLoopback) || hits != 1 {
+		t.Fatalf("err = %v, hits %d; want ErrNotLoopback and no request sent", err, hits)
+	}
+	var tr agentrt.TransientError
+	if c := providers.ClassifyTransport(err); errors.As(c, &tr) {
+		t.Fatalf("a refused dial is retried: %v", c)
+	}
+	if elsewhere.DialContext == nil || mine.Transport != elsewhere {
+		t.Fatal("the caller's transport was modified")
+	}
+}
+
+func TestUsageCount_OnlyANonNegativeIntegerThatFits(t *testing.T) {
+	for raw, want := range map[string]int{"": 0, "null": 0, "0": 0, "17": 17, " 9223372036854775807 ": 1<<63 - 1} {
+		if got, err := providers.UsageCount("input_tokens", json.RawMessage(raw)); err != nil || got != want {
+			t.Errorf("UsageCount(%q) = %d, %v; want %d", raw, got, err, want)
+		}
+	}
+	for _, raw := range []string{"-1", "9223372036854775808", "1e3", "1.5", `"12"`, "true", "{}", "+1"} {
+		_, err := providers.UsageCount("input_tokens", json.RawMessage(raw))
+		if !errors.Is(err, providers.ErrUnusableUsage) || !strings.Contains(err.Error(), "input_tokens") {
+			t.Errorf("UsageCount(%q) = %v, want an unusable-usage error naming the field", raw, err)
+		}
+	}
+}
+
+func TestCheckUsage_NegativeOrMoreCachedThanInputIsUnusable(t *testing.T) {
+	if err := providers.CheckUsage(agentrt.Usage{InputTokens: 10, CachedInputTokens: 10, OutputTokens: 1}); err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range []agentrt.Usage{{InputTokens: -1}, {OutputTokens: -1}, {InputTokens: 1, CachedInputTokens: -1}, {InputTokens: 1, CachedInputTokens: 2}} {
+		if err := providers.CheckUsage(u); !errors.Is(err, providers.ErrUnusableUsage) {
+			t.Errorf("CheckUsage(%+v) = %v", u, err)
+		}
 	}
 }
