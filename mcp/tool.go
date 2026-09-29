@@ -12,9 +12,14 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// truncationMarker ends content that hit the cap. The cap applies to the
-// content itself, so the marker is what exceeds it.
+// truncationMarker ends text that hit the cap. The cap counts it: recorded
+// content, marker and JSON escaping included, is never longer than the cap,
+// except that a cap too small to hold the marker is raised to hold it.
 const truncationMarker = "\n[truncated]"
+
+// structuredDropped stands in for oversized structured content when the
+// server sent no text to fall back to.
+const structuredDropped = "[structured content dropped: too large]"
 
 // tool is one server tool as the runtime sees it. It is unexported because a
 // consumer only ever receives it as an agentrt.Tool.
@@ -44,6 +49,13 @@ func (t *tool) Call(ctx context.Context, call agentrt.ToolCall) (agentrt.ToolRes
 			return agentrt.ToolResult{}, fmt.Errorf("%s: parameter %q is denied by the operator", t.spec.Name, name)
 		}
 	}
+	// A fixed value never overrides one the model sent: the approval would
+	// show one value and the server receive another.
+	for name := range t.fixed {
+		if _, ok := args[name]; ok {
+			return agentrt.ToolResult{}, fmt.Errorf("%s: parameter %q is fixed by the operator", t.spec.Name, name)
+		}
+	}
 	for name, value := range t.fixed {
 		args[name] = value
 	}
@@ -58,38 +70,53 @@ func (t *tool) Call(ctx context.Context, call agentrt.ToolCall) (agentrt.ToolRes
 	if res.NeedsInput() {
 		return agentrt.ToolResult{}, fmt.Errorf("%s: the server asked for more input, which this adapter does not support", t.spec.Name)
 	}
-	content, text, truncated := t.content(res)
-	summary := fmt.Sprintf("%s/%s: %d bytes", t.conn.server, t.remote, len(content))
-	if truncated {
+	c := t.content(res)
+	summary := fmt.Sprintf("%s/%s: %d bytes", t.conn.server, t.remote, len(c.raw))
+	if c.truncated {
 		summary += ", truncated"
 	}
-	if res.IsError {
-		return agentrt.ToolResult{}, fmt.Errorf("%s, error: %s", summary, text)
+	if c.dropped > 0 {
+		summary += fmt.Sprintf(", structured content of %d bytes dropped for the text", c.dropped)
 	}
-	return agentrt.ToolResult{Content: content, Summary: summary}, nil
+	if res.IsError {
+		return agentrt.ToolResult{}, fmt.Errorf("%s, error: %s", summary, c.text)
+	}
+	return agentrt.ToolResult{Content: c.raw, Summary: summary}, nil
+}
+
+// content is a result as the runtime records it. raw is the recorded JSON
+// and every byte count is its length; text is what an isError result says;
+// dropped is the encoded size of structured content left out.
+type content struct {
+	raw       json.RawMessage
+	text      string
+	truncated bool
+	dropped   int
 }
 
 // content maps a result to the JSON the runtime records. Structured content
-// is the result when the server sent it; otherwise the text blocks are joined
-// and a block that is not text becomes a placeholder, because base64 image
-// data is not something to put in front of the model here. The text is
-// returned too, for the message an isError result becomes.
-func (t *tool) content(res *sdk.CallToolResult) (json.RawMessage, string, bool) {
+// is the result when the server sent it and it fits; otherwise the text
+// blocks are joined and a block that is not text becomes a placeholder,
+// because base64 image data is not something to put in front of the model
+// here. Structured content that does not fit is never cut, which would make
+// an object a string: it is dropped for the text blocks, and the summary
+// says so.
+func (t *tool) content(res *sdk.CallToolResult) content {
+	var dropped int
 	if res.StructuredContent != nil {
 		if raw, err := marshalCanonical(res.StructuredContent); err == nil {
 			if len(raw) <= t.maxContent {
-				return raw, string(raw), false
+				return content{raw: raw, text: string(raw)}
 			}
-			cut := truncate(string(raw), t.maxContent)
-			return jsonString(cut), cut, true
+			dropped = len(raw)
 		}
 	}
 	text := joinContent(res.Content)
-	truncated := len(text) > t.maxContent
-	if truncated {
-		text = truncate(text, t.maxContent)
+	if dropped > 0 && text == "" {
+		text = structuredDropped
 	}
-	return jsonString(text), text, truncated
+	raw, text, truncated := capText(text, t.maxContent)
+	return content{raw: raw, text: text, truncated: truncated || dropped > 0, dropped: dropped}
 }
 
 func joinContent(blocks []sdk.Content) string {
@@ -130,16 +157,47 @@ func arguments(raw json.RawMessage) (map[string]json.RawMessage, error) {
 	return args, nil
 }
 
-// truncate cuts s to max bytes on a rune boundary and marks the cut.
-func truncate(s string, max int) string {
-	if max > len(s) {
-		max = len(s)
+// capText encodes s as a JSON string of at most max bytes. When it does not
+// fit, the longest prefix that does not split a rune and still fits with the
+// marker is kept, so the recorded bytes, escaping and marker included, never
+// exceed max.
+func capText(s string, max int) (json.RawMessage, string, bool) {
+	if raw := jsonString(s); len(raw) <= max {
+		return raw, s, false
 	}
-	cut := s[:max]
-	for len(cut) > 0 && !utf8.ValidString(cut) {
-		cut = cut[:len(cut)-1]
+	if least := len(jsonString(truncationMarker)); max < least {
+		max = least
 	}
-	return cut + truncationMarker
+	fits := func(i int) bool { return len(jsonString(s[:cutAt(s, i)]+truncationMarker)) <= max }
+	// The encoded length only grows with the prefix, and no prefix longer
+	// than max bytes encodes to max bytes or fewer.
+	lo, hi := 0, min(len(s), max)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if fits(mid) {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	cut := s[:cutAt(s, lo)] + truncationMarker
+	return jsonString(cut), cut, true
+}
+
+// cutAt moves i back to the start of a valid rune that i would split. Bytes
+// that are not valid UTF-8 are encoded one at a time, so a cut between them
+// splits nothing.
+func cutAt(s string, i int) int {
+	for j := i; j >= 0 && j >= i-utf8.UTFMax && j < len(s); j-- {
+		if !utf8.RuneStart(s[j]) {
+			continue
+		}
+		if r, size := utf8.DecodeRuneInString(s[j:]); (r != utf8.RuneError || size > 1) && j+size > i {
+			return j
+		}
+		return i
+	}
+	return i
 }
 
 func jsonString(s string) json.RawMessage {

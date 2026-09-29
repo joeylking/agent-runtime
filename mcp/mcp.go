@@ -10,29 +10,48 @@
 // description is model input, so a changed description is an injection vector
 // rather than a cosmetic edit.
 //
+// What the pin does not protect: it covers what a server presents, not what
+// it does, so a server that behaves differently after Load, or differently
+// from what its description says, is not caught. The tool set is fixed at
+// Load and tools/list_changed notifications are ignored; a changed server is
+// seen at the next Load. Annotations and output schemas are outside the
+// hashes: annotations are recorded and can only refuse a registration, and
+// an output schema is not checked at all. A stdio server is third-party code
+// running as this process's user; the minimal environment it is given keeps
+// the operator's credentials out of it, and nothing else about the host is
+// sandboxed.
+//
 // Resources, prompts, sampling, elicitation, and the server side of MCP are
 // out of scope, and a call the server answers with an input request fails.
 package mcp
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
+	"runtime"
 	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// DefaultMaxContentBytes caps one result's content when a Server names no
-// limit of its own.
+// DefaultMaxContentBytes caps one result's recorded content when a Server
+// names no limit of its own.
 const DefaultMaxContentBytes = 64 << 10
+
+// MaxToolPages and MaxTools bound one tool listing, so a server that pages
+// forever or offers an unbounded tool set fails the listing instead of
+// holding the client.
+const (
+	MaxToolPages = 100
+	MaxTools     = 1000
+)
 
 // clientName and clientVersion identify this adapter to a server.
 const (
@@ -46,17 +65,34 @@ type Server struct {
 	// Name is required. It prefixes the names the model sees and names the
 	// manifest, so tools from two servers cannot collide.
 	Name string
-	// Command is a stdio server's argv and Env its environment; a nil Env
-	// inherits this process's. Exactly one of Command or Endpoint is set.
+	// Command is a stdio server's argv. Exactly one of Command or Endpoint
+	// is set.
 	Command []string
-	Env     []string
-	// Endpoint is a streamable HTTP server's URL, and HTTPClient overrides
-	// the client used to reach it.
+	// A stdio server does not inherit this process's environment. It gets
+	// PATH, HOME, and TMPDIR (on Windows PATH, PATHEXT, SystemRoot,
+	// SystemDrive, ComSpec, TEMP, TMP, USERPROFILE, APPDATA, LOCALAPPDATA,
+	// and HOME) when they are set here, then every variable InheritEnv names
+	// that is set here, then Env, entries of the form NAME=value. A later
+	// entry replaces an earlier one of the same name. A server that needs a
+	// token is handed that token and no other.
+	Env        []string
+	InheritEnv []string
+	// Stderr receives a stdio server's stderr. When it is nil the last
+	// StderrTailBytes are kept and added to a failed connect or tool
+	// listing.
+	Stderr io.Writer
+	// Endpoint is a streamable HTTP server's URL, and HTTPClient is the
+	// client used to reach it. The client is copied, never modified, and
+	// its transport is wrapped so that no response body exceeds
+	// MaxResponseBodyBytes; with no HTTPClient a fresh client is used, not
+	// http.DefaultClient. The standalone SSE stream a server could push
+	// notifications on is not opened, since nothing here listens to them.
 	Endpoint   string
 	HTTPClient *http.Client
 	// DefaultTimeout bounds a call for a Rule that names no timeout.
 	DefaultTimeout time.Duration
-	// MaxContentBytes caps one result's content. Zero means
+	// MaxContentBytes caps one result's recorded content: the JSON the
+	// runtime records, truncation marker included. Zero means
 	// DefaultMaxContentBytes.
 	MaxContentBytes int
 	// Logger, when set, receives the MCP client's own logging.
@@ -71,6 +107,9 @@ type Server struct {
 func (s Server) validate() error {
 	if s.Name == "" {
 		return errors.New("mcp: server name is required")
+	}
+	if err := validateEnv(s.Name, s.InheritEnv, s.Env); err != nil {
+		return err
 	}
 	if s.transport != nil {
 		return nil
@@ -91,18 +130,37 @@ func (s Server) contentCap() int {
 	return DefaultMaxContentBytes
 }
 
-func (s Server) newTransport() sdk.Transport {
+// newTransport returns the transport, the stderr tail when one is kept, and
+// what to run once the SDK has started the server or failed to.
+func (s Server) newTransport(rec *listRecorder) (sdk.Transport, *stderrTail, func(), error) {
 	switch {
 	case s.transport != nil:
-		return s.transport
+		return &recordingTransport{inner: s.transport, rec: rec}, nil, func() {}, nil
 	case len(s.Command) > 0:
 		// Deliberately not CommandContext: the subprocess belongs to the
 		// connection, not to the context that opened it, and Close stops it.
 		cmd := exec.Command(s.Command[0], s.Command[1:]...)
-		cmd.Env = s.Env
-		return &sdk.CommandTransport{Command: cmd}
+		cmd.Env = childEnv(runtime.GOOS, s.InheritEnv, s.Env, os.LookupEnv)
+		var tail *stderrTail
+		started := func() {}
+		if s.Stderr != nil {
+			cmd.Stderr = s.Stderr
+		} else {
+			t, w, err := newStderrTail()
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("mcp: server %q: stderr: %w", s.Name, err)
+			}
+			// The child holds its own copy of w once started; closing ours
+			// is what lets the tail see the end of the stream.
+			tail, cmd.Stderr, started = t, w, func() { w.Close() }
+		}
+		return &recordingTransport{inner: &sdk.CommandTransport{Command: cmd}, rec: rec}, tail, started, nil
 	default:
-		return &sdk.StreamableClientTransport{Endpoint: s.Endpoint, HTTPClient: s.HTTPClient}
+		return &sdk.StreamableClientTransport{
+			Endpoint:             s.Endpoint,
+			HTTPClient:           httpClient(s.HTTPClient, rec),
+			DisableStandaloneSSE: true,
+		}, nil, func() {}, nil
 	}
 }
 
@@ -112,10 +170,15 @@ func (s Server) newTransport() sdk.Transport {
 type Connection struct {
 	server  string
 	session *sdk.ClientSession
+	rec     *listRecorder
+	stderr  *stderrTail
 }
 
 // Close ends the session, and with it a stdio server's subprocess.
 func (c *Connection) Close() error { return c.session.Close() }
+
+// stderrWait bounds how long a failure waits for a dead server's stderr.
+const stderrWait = 2 * time.Second
 
 func connect(ctx context.Context, s Server) (*Connection, error) {
 	client := sdk.NewClient(&sdk.Implementation{Name: clientName, Version: clientVersion}, &sdk.ClientOptions{
@@ -125,20 +188,113 @@ func connect(ctx context.Context, s Server) (*Connection, error) {
 		// become an observation the agent can read.
 		MultiRoundTrip: &sdk.MultiRoundTripOptions{Disabled: true},
 	})
-	session, err := client.Connect(ctx, s.newTransport(), nil)
+	rec := &listRecorder{}
+	transport, tail, started, err := s.newTransport(rec)
 	if err != nil {
-		return nil, fmt.Errorf("mcp: server %q: connect: %w", s.Name, err)
+		return nil, err
 	}
-	return &Connection{server: s.Name, session: session}, nil
+	session, err := client.Connect(ctx, transport, nil)
+	started()
+	if err != nil {
+		wait, cancel := context.WithTimeout(context.Background(), stderrWait)
+		defer cancel()
+		return nil, tail.annotate(wait, fmt.Errorf("mcp: server %q: connect: %w", s.Name, err))
+	}
+	return &Connection{server: s.Name, session: session, rec: rec, stderr: tail}, nil
 }
 
-func (c *Connection) listTools(ctx context.Context) (map[string]*sdk.Tool, error) {
-	out := map[string]*sdk.Tool{}
-	for t, err := range c.session.Tools(ctx, nil) {
-		if err != nil {
-			return nil, fmt.Errorf("mcp: server %q: list tools: %w", c.server, err)
+// liveTool is one tool as the server listed it: the SDK's decoding for the
+// description and annotations, and the canonical schema made from the bytes
+// the server sent.
+type liveTool struct {
+	tool   *sdk.Tool
+	schema json.RawMessage
+}
+
+// listTools lists every page of the server's tools. A failure closes the
+// connection, so that a stdio server's stderr can be read in full.
+func (c *Connection) listTools(ctx context.Context) (map[string]liveTool, error) {
+	out, err := c.listPages(ctx)
+	if err != nil {
+		c.Close()
+		wait, cancel := context.WithTimeout(context.Background(), stderrWait)
+		defer cancel()
+		return nil, c.stderr.annotate(wait, fmt.Errorf("mcp: server %q: list tools: %w", c.server, err))
+	}
+	return out, nil
+}
+
+func (c *Connection) listPages(ctx context.Context) (map[string]liveTool, error) {
+	out := map[string]liveTool{}
+	seen := map[string]bool{}
+	cursor := ""
+	for page := 0; ; page++ {
+		if page == MaxToolPages {
+			return nil, fmt.Errorf("more than %d pages", MaxToolPages)
 		}
-		out[t.Name] = t
+		c.rec.take()
+		res, err := c.session.ListTools(ctx, &sdk.ListToolsParams{Cursor: cursor})
+		if err != nil {
+			return nil, err
+		}
+		results := c.rec.take()
+		if len(results) != 1 {
+			return nil, errors.New("the raw tools/list result was not captured")
+		}
+		raw, err := rawTools(results[0])
+		if err != nil {
+			return nil, err
+		}
+		for name := range raw {
+			if _, dup := out[name]; dup {
+				return nil, fmt.Errorf("the server lists tool %q twice", name)
+			}
+		}
+		if len(out)+len(raw) > MaxTools {
+			return nil, fmt.Errorf("more than %d tools", MaxTools)
+		}
+		for _, t := range res.Tools {
+			schema, ok := raw[t.Name]
+			if !ok {
+				return nil, fmt.Errorf("tool %q is missing from the raw listing", t.Name)
+			}
+			canon, err := canonicalSchema(schema)
+			if err != nil {
+				return nil, fmt.Errorf("tool %q: input schema: %w", t.Name, err)
+			}
+			out[t.Name] = liveTool{tool: t, schema: canon}
+		}
+		if res.NextCursor == "" {
+			return out, nil
+		}
+		if seen[res.NextCursor] {
+			return nil, fmt.Errorf("the cursor %q repeats", res.NextCursor)
+		}
+		seen[res.NextCursor] = true
+		cursor = res.NextCursor
+	}
+}
+
+// rawTools maps each tool in one raw tools/list result to its input schema
+// as sent. Keys are matched exactly, as the SDK matches them, and a name
+// listed twice on the page is an error.
+func rawTools(result json.RawMessage) (map[string]json.RawMessage, error) {
+	var page struct {
+		Tools []map[string]json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(result, &page); err != nil {
+		return nil, fmt.Errorf("the raw tools/list result: %w", err)
+	}
+	out := make(map[string]json.RawMessage, len(page.Tools))
+	for _, t := range page.Tools {
+		var name string
+		if err := json.Unmarshal(t["name"], &name); err != nil {
+			continue // the SDK drops it too, and a tool it kept must be here
+		}
+		if _, dup := out[name]; dup {
+			return nil, fmt.Errorf("the server lists tool %q twice", name)
+		}
+		out[name] = t["inputSchema"]
 	}
 	return out, nil
 }
@@ -162,13 +318,14 @@ type PinnedTool struct {
 	DescriptionHash string          `json:"description_hash"`
 	// Annotations are the server's own hints, recorded as received and nil
 	// when it sent none. They are never trusted: they can only contradict an
-	// operator's classification, never relax it.
+	// operator's classification, never relax it. They are outside the
+	// hashes, so a change to them alone does not refuse a tool.
 	Annotations *sdk.ToolAnnotations `json:"annotations,omitempty"`
 }
 
 // Pin connects to the server, lists its tools, and records what each one
 // presents. The operator reviews the manifest, stores it, and Load refuses
-// anything that has changed since.
+// anything that has changed since. A listing that names a tool twice fails.
 func Pin(ctx context.Context, server Server) (*Manifest, error) {
 	if err := server.validate(); err != nil {
 		return nil, err
@@ -184,60 +341,14 @@ func Pin(ctx context.Context, server Server) (*Manifest, error) {
 	}
 	m := &Manifest{Server: server.Name, PinnedAt: time.Now().UTC(), Tools: make(map[string]PinnedTool, len(live))}
 	for name, t := range live {
-		schema, err := canonical(t.InputSchema)
-		if err != nil {
-			return nil, fmt.Errorf("mcp: server %q: tool %q: input schema: %w", server.Name, name, err)
-		}
 		m.Tools[name] = PinnedTool{
 			Name:            name,
-			Description:     t.Description,
-			InputSchema:     schema,
-			SchemaHash:      hashBytes(schema),
-			DescriptionHash: hashString(t.Description),
-			Annotations:     t.Annotations,
+			Description:     t.tool.Description,
+			InputSchema:     t.schema,
+			SchemaHash:      hashBytes(t.schema),
+			DescriptionHash: hashString(t.tool.Description),
+			Annotations:     t.tool.Annotations,
 		}
 	}
 	return m, nil
-}
-
-// canonical re-encodes a value as JSON with sorted keys, no insignificant
-// whitespace, and no HTML escaping, so that equal documents hash equally. The
-// runtime hashes the same way; its own helper is not exported.
-func canonical(v any) (json.RawMessage, error) {
-	b, err := marshalCanonical(v)
-	if err != nil {
-		return nil, err
-	}
-	var doc any
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.UseNumber()
-	if err := dec.Decode(&doc); err != nil {
-		return nil, err
-	}
-	return marshalCanonical(doc)
-}
-
-func marshalCanonical(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
-}
-
-func hashBytes(raw []byte) string {
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
-}
-
-// hashString hashes a string through its JSON form, so descriptions and
-// schemas are hashed over the same representation.
-func hashString(s string) string {
-	b, err := marshalCanonical(s)
-	if err != nil {
-		b = []byte(s)
-	}
-	return hashBytes(b)
 }

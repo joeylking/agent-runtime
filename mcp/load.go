@@ -37,10 +37,17 @@ type Rule struct {
 	// schema it is shown and a call that carries one anyway fails.
 	Deny []string
 	// Fixed names parameters the operator sets. They are removed from the
-	// schema the model sees and injected into every call. A fixed value is
+	// schema the model sees and injected into every call, and a call that
+	// carries one anyway fails rather than being overridden. A fixed value is
 	// operator configuration rather than part of the request, so it sits
 	// outside the approval hash on purpose: the approval binds what the model
 	// asked for, and the operator already knows their own configuration.
+	//
+	// A Deny or Fixed name must be a top-level property of the pinned input
+	// schema. The tool is refused when anything but properties and required
+	// refers to it (allOf, anyOf, oneOf, not, if, then, else,
+	// dependentRequired, dependentSchemas, dependencies, $defs, definitions)
+	// and whenever the schema has patternProperties.
 	Fixed map[string]json.RawMessage
 	// Rename is the name the model sees instead of "<server>_<tool>".
 	Rename string
@@ -158,19 +165,18 @@ func Load(ctx context.Context, server Server, manifest *Manifest, rules Rules) (
 	}
 	live, err := conn.listTools(ctx)
 	if err != nil {
-		conn.Close()
 		return nil, nil, err
 	}
 
 	rep := &Report{Server: server.Name, Connection: conn}
-	for _, name := range sortedNames(live) {
+	for _, name := range sortedKeys(live) {
 		if _, ok := manifest.Tools[name]; !ok {
 			rep.Unpinned = append(rep.Unpinned, name)
 		}
 	}
 	var tools []agentrt.Tool
 	taken := map[string]string{}
-	for _, name := range sortedTools(manifest.Tools) {
+	for _, name := range sortedKeys(manifest.Tools) {
 		rule, ok := rules[name]
 		if !ok {
 			rep.Unclassified = append(rep.Unclassified, name)
@@ -201,16 +207,13 @@ func Load(ctx context.Context, server Server, manifest *Manifest, rules Rules) (
 // rule, and returns the tool the runtime will register. Every failure is the
 // reason the report gives, so the checks read in the order an operator would
 // ask them.
-func build(server Server, conn *Connection, pinned PinnedTool, rule Rule, live *sdk.Tool, checker *specChecker) (agentrt.Tool, Registration, error) {
+func build(server Server, conn *Connection, pinned PinnedTool, rule Rule, found liveTool, checker *specChecker) (agentrt.Tool, Registration, error) {
 	var none Registration
+	live := found.tool
 	if live == nil {
 		return nil, none, errors.New("the server no longer offers it")
 	}
-	schema, err := canonical(live.InputSchema)
-	if err != nil {
-		return nil, none, fmt.Errorf("the server's input schema is not JSON: %v", err)
-	}
-	if hashBytes(schema) != pinned.SchemaHash {
+	if hashBytes(found.schema) != pinned.SchemaHash {
 		return nil, none, errors.New("the input schema changed since the pin")
 	}
 	if hashString(live.Description) != pinned.DescriptionHash {
@@ -244,11 +247,14 @@ func build(server Server, conn *Connection, pinned PinnedTool, rule Rule, live *
 	}
 	hidden := make([]string, 0, len(rule.Deny)+len(rule.Fixed))
 	hidden = append(hidden, rule.Deny...)
-	for param, value := range rule.Fixed {
-		if !json.Valid(value) {
+	for _, param := range sortedKeys(rule.Fixed) {
+		if !json.Valid(rule.Fixed[param]) {
 			return nil, none, fmt.Errorf("the fixed value for %q is not valid JSON", param)
 		}
 		hidden = append(hidden, param)
+	}
+	if err := hideable(pinned.InputSchema, hidden); err != nil {
+		return nil, none, err
 	}
 	restricted, err := restrict(pinned.InputSchema, hidden)
 	if err != nil {
@@ -309,6 +315,81 @@ func objectSchema(raw json.RawMessage) error {
 		return errors.New(`the input schema is not an object schema ("type":"object")`)
 	}
 	return nil
+}
+
+// combinators are the top-level keywords whose subschemas can constrain a
+// top-level property other than through properties and required, so hiding
+// a property they mention would leave the model a schema that still demands
+// it, or forbids it, where it cannot see. $defs and definitions are included
+// because a $ref can reach them. patternProperties is refused whenever a name
+// is hidden, not only when a pattern matches it: the schema's patterns are
+// ECMA-262, not RE2, and a pattern this package misreads must not let a
+// constraint through.
+var combinators = []string{
+	"allOf", "anyOf", "oneOf", "not", "if", "then", "else",
+	"dependentRequired", "dependentSchemas", "dependencies",
+	"$defs", "definitions",
+}
+
+// hideable refuses a Deny or Fixed name the model could not have been
+// shown, and a schema whose other keywords mention a hidden name. A tool is
+// refused rather than partly rewritten: removing a name from properties and
+// required is the only rewrite, and it is only sound when nothing else
+// refers to the name. Mentioning is any object key or string value equal to
+// the name anywhere under one of the combinators, which covers required
+// lists, properties keys, and dependentRequired keys and values, and errs on
+// the side of refusing.
+func hideable(schema json.RawMessage, hidden []string) error {
+	if len(hidden) == 0 {
+		return nil
+	}
+	var doc map[string]any
+	dec := json.NewDecoder(bytes.NewReader(schema))
+	dec.UseNumber()
+	if err := dec.Decode(&doc); err != nil {
+		return fmt.Errorf("the input schema cannot be restricted: %v", err)
+	}
+	props, _ := doc["properties"].(map[string]any)
+	for _, name := range hidden {
+		if _, ok := props[name]; !ok {
+			return fmt.Errorf("the rule hides %q, which is not a top-level property of the input schema", name)
+		}
+	}
+	if _, ok := doc["patternProperties"]; ok {
+		return errors.New("the rule hides parameters and the input schema has patternProperties, which could still match them")
+	}
+	for _, key := range combinators {
+		sub, ok := doc[key]
+		if !ok {
+			continue
+		}
+		for _, name := range hidden {
+			if mentions(sub, name) {
+				return fmt.Errorf("the rule hides %q and the input schema's %s mentions it", name, key)
+			}
+		}
+	}
+	return nil
+}
+
+func mentions(v any, name string) bool {
+	switch x := v.(type) {
+	case string:
+		return x == name
+	case map[string]any:
+		for k, e := range x {
+			if k == name || mentions(e, name) {
+				return true
+			}
+		}
+	case []any:
+		for _, e := range x {
+			if mentions(e, name) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // restrict removes the operator's denied and fixed parameters from the schema
@@ -383,18 +464,9 @@ func (unusedAgent) Decide(context.Context, agentrt.StepInput) (agentrt.Decision,
 	return agentrt.Decision{}, errors.New("mcp: the schema check driver never runs")
 }
 
-func sortedNames(tools map[string]*sdk.Tool) []string {
-	names := make([]string, 0, len(tools))
-	for name := range tools {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-func sortedTools(tools map[string]PinnedTool) []string {
-	names := make([]string, 0, len(tools))
-	for name := range tools {
+func sortedKeys[V any](m map[string]V) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
 		names = append(names, name)
 	}
 	sort.Strings(names)

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	agentrt "github.com/joeylking/agent-runtime"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -161,12 +163,242 @@ func TestCall_OversizedContentIsTruncated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("call: %v", err)
 	}
+	// Two quotes and the marker's 13 encoded bytes leave 49 for the text.
 	got := text(t, res.Content)
-	if got != strings.Repeat("x", 64)+truncationMarker {
-		t.Errorf("content = %q, want 64 bytes and the marker", got)
+	if len(res.Content) != 64 || got != strings.Repeat("x", 49)+truncationMarker {
+		t.Errorf("content = %s (%d bytes), want 64 recorded bytes ending in the marker", res.Content, len(res.Content))
 	}
-	if !strings.Contains(res.Summary, "truncated") {
-		t.Errorf("summary = %q, want it to say so", res.Summary)
+	if res.Summary != "fs/read_file: 64 bytes, truncated" {
+		t.Errorf("summary = %q, want the recorded size and the truncation", res.Summary)
+	}
+}
+
+// TestCall_CapCountsEncodedBytes is the audit's probe: a control character
+// is one byte of text and six of JSON, and the cap is on the JSON.
+func TestCall_CapCountsEncodedBytes(t *testing.T) {
+	f := newFake(t)
+	f.add("ctl", "Control characters.", readSchema, nil, textHandler(strings.Repeat("\x01", 100)))
+	f.add("runes", "Multibyte text.", readSchema, nil, textHandler(strings.Repeat("世", 100)))
+	f.add("fits", "Exactly the cap.", readSchema, nil, textHandler(strings.Repeat("\x01", 16)))
+	m := mustPin(t, f)
+	server := f.server()
+	server.MaxContentBytes = 100
+	tools, rep, err := Load(context.Background(), server, m, Rules{
+		"ctl":   {SideEffect: agentrt.ReadOnly},
+		"runes": {SideEffect: agentrt.ReadOnly},
+		"fits":  {SideEffect: agentrt.ReadOnly},
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer rep.Connection.Close()
+
+	for _, tl := range tools {
+		res, err := call(t, tl, `{"path":"a"}`)
+		if err != nil {
+			t.Fatalf("%s: %v", tl.Spec().Name, err)
+		}
+		if len(res.Content) > 100 {
+			t.Errorf("%s: %d recorded bytes, cap 100", tl.Spec().Name, len(res.Content))
+		}
+		if want := fmt.Sprintf(": %d bytes", len(res.Content)); !strings.Contains(res.Summary, want) {
+			t.Errorf("%s: summary %q, want the recorded size", tl.Spec().Name, res.Summary)
+		}
+		got := text(t, res.Content)
+		switch tl.Spec().Name {
+		case "fs_fits":
+			if got != strings.Repeat("\x01", 16) || strings.Contains(res.Summary, "truncated") {
+				t.Errorf("fits: %q %q, want 98 bytes kept whole", got, res.Summary)
+			}
+		case "fs_runes":
+			if !utf8.ValidString(got) || !strings.HasSuffix(got, truncationMarker) {
+				t.Errorf("runes: %q, want whole runes and the marker", got)
+			}
+		default:
+			if !strings.HasSuffix(got, truncationMarker) || !strings.Contains(res.Summary, "truncated") {
+				t.Errorf("%s: %q %q, want it marked", tl.Spec().Name, got, res.Summary)
+			}
+		}
+	}
+}
+
+func TestCapText_NeverExceedsTheCap(t *testing.T) {
+	inputs := []string{
+		strings.Repeat("a", 300),
+		strings.Repeat("\x01", 300),
+		strings.Repeat("é", 300),
+		strings.Repeat("\"\\\n", 300),
+		strings.Repeat("\u2028", 300),
+		strings.Repeat("\xff", 300),
+		strings.Repeat("😀a\x00", 300),
+	}
+	least := len(jsonString(truncationMarker))
+	for _, in := range inputs {
+		for max := 0; max < 200; max++ {
+			raw, _, truncated := capText(in, max)
+			if limit := maxInt(max, least); len(raw) > limit {
+				t.Fatalf("%q cap %d: %d bytes", in[:8], max, len(raw))
+			}
+			if !truncated || !json.Valid(raw) {
+				t.Fatalf("%q cap %d: truncated %v, valid %v", in[:8], max, truncated, json.Valid(raw))
+			}
+			var s string
+			_ = json.Unmarshal(raw, &s)
+			if !strings.HasSuffix(s, truncationMarker) {
+				t.Fatalf("%q cap %d: %q has no marker", in[:8], max, s)
+			}
+			// The longest fitting prefix: one more rune would not fit.
+			kept := strings.TrimSuffix(s, truncationMarker)
+			if len(kept) < len(in) && utf8.ValidString(in) {
+				_, size := utf8.DecodeRuneInString(in[len(kept):])
+				if next := jsonString(in[:len(kept)+size] + truncationMarker); len(next) <= max {
+					t.Fatalf("%q cap %d: kept %d bytes, %d more would fit", in[:8], max, len(kept), size)
+				}
+			}
+		}
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// TestCall_OversizedStructuredContentFallsBackToText is the audit's probe:
+// structured content cut to fit became a JSON string. It now stays an
+// object when it fits and is replaced by the text blocks when it does not,
+// and the summary says which.
+func TestCall_OversizedStructuredContentFallsBackToText(t *testing.T) {
+	f := newFake(t)
+	big := map[string]any{"k": strings.Repeat("x", 200)}
+	f.add("with_text", "Structured and text.", readSchema, nil, func(context.Context, *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+		return &sdk.CallToolResult{StructuredContent: big, Content: []sdk.Content{&sdk.TextContent{Text: "summary text"}}}, nil
+	})
+	f.add("alone", "Structured only.", readSchema, nil, func(context.Context, *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+		return &sdk.CallToolResult{StructuredContent: big}, nil
+	})
+	f.add("small", "Structured that fits.", readSchema, nil, func(context.Context, *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+		return &sdk.CallToolResult{StructuredContent: map[string]any{"k": 1}, Content: []sdk.Content{&sdk.TextContent{Text: "one"}}}, nil
+	})
+	m := mustPin(t, f)
+	server := f.server()
+	server.MaxContentBytes = 100
+	tools, rep, err := Load(context.Background(), server, m, Rules{
+		"with_text": {SideEffect: agentrt.ReadOnly},
+		"alone":     {SideEffect: agentrt.ReadOnly},
+		"small":     {SideEffect: agentrt.ReadOnly},
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer rep.Connection.Close()
+
+	res, err := call(t, byName(t, tools, "fs_with_text"), `{"path":"a"}`)
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if got := text(t, res.Content); got != "summary text" {
+		t.Errorf("content = %q, want the text blocks", got)
+	}
+	if want := "fs/with_text: 14 bytes, truncated, structured content of 208 bytes dropped for the text"; res.Summary != want {
+		t.Errorf("summary = %q, want %q", res.Summary, want)
+	}
+
+	res, err = call(t, byName(t, tools, "fs_alone"), `{"path":"a"}`)
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if got := text(t, res.Content); got != structuredDropped || !strings.Contains(res.Summary, "dropped") {
+		t.Errorf("content = %q, summary = %q, want the drop said in both", got, res.Summary)
+	}
+
+	res, err = call(t, byName(t, tools, "fs_small"), `{"path":"a"}`)
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if string(res.Content) != `{"k":1}` || res.Summary != "fs/small: 7 bytes" {
+		t.Errorf("content = %s, summary = %q, want the object kept", res.Content, res.Summary)
+	}
+}
+
+// TestFixed_ACallThatSetsAFixedParameterFails is the audit's probe: the
+// fixed value used to replace the model's silently, so the approval showed
+// /etc and the server received /safe.
+func TestFixed_ACallThatSetsAFixedParameterFails(t *testing.T) {
+	f := newFake(t)
+	f.add("read_file", "Read a file.", rootSchema, nil, echoHandler)
+	m := mustPin(t, f)
+	tools, _, err := load(t, f, m, Rules{"read_file": {
+		SideEffect: agentrt.ReadOnly,
+		Fixed:      map[string]json.RawMessage{"root": json.RawMessage(`"/safe"`)},
+	}})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	_, err = call(t, tools[0], `{"path":"p","root":"/etc"}`)
+	if err == nil || !strings.Contains(err.Error(), `"root" is fixed`) {
+		t.Errorf("err = %v, want the fixed parameter refused", err)
+	}
+}
+
+// TestRules_HiddenNamesMustBeSoundToHide is the audit's probe: a misspelled
+// Deny was accepted silently, and a denied name the schema's combinators
+// still required was removed from properties alone.
+func TestRules_HiddenNamesMustBeSoundToHide(t *testing.T) {
+	const (
+		anyOf     = `{"type":"object","properties":{"path":{"type":"string"},"force":{"type":"boolean"}},"anyOf":[{"required":["force"]},{"required":["path"]}]}`
+		pattern   = `{"type":"object","properties":{"path":{"type":"string"},"force":{"type":"boolean"}},"patternProperties":{"^zz":{"type":"boolean"}}}`
+		dependent = `{"type":"object","properties":{"path":{"type":"string"},"force":{"type":"boolean"}},"dependentRequired":{"path":["force"]}}`
+		ifThen    = `{"type":"object","properties":{"path":{"type":"string"},"root":{"type":"string"}},"if":{"properties":{"path":{"const":"x"}}},"then":{"required":["root"]}}`
+		defs      = `{"type":"object","properties":{"path":{"type":"string"},"force":{"type":"boolean"}},"$defs":{"f":{"properties":{"force":{"const":true}}}}}`
+		nested    = `{"type":"object","properties":{"path":{"type":"string"},"force":{"type":"boolean"},"opts":{"type":"object","properties":{"force":{"type":"boolean"}}}},"allOf":[{"required":["path"]}]}`
+		unrelated = `{"type":"object","properties":{"path":{"type":"string"},"force":{"type":"boolean"}},"oneOf":[{"required":["path"]}]}`
+	)
+	f := newFake(t)
+	f.add("misspelled", "w", writeSchema, nil, echoHandler)
+	f.add("no_such_fixed", "w", writeSchema, nil, echoHandler)
+	f.add("any_of", "w", anyOf, nil, echoHandler)
+	f.add("pattern", "w", pattern, nil, echoHandler)
+	f.add("dependent", "w", dependent, nil, echoHandler)
+	f.add("if_then", "w", ifThen, nil, echoHandler)
+	f.add("defs", "w", defs, nil, echoHandler)
+	f.add("nested", "w", nested, nil, echoHandler)
+	f.add("unrelated", "w", unrelated, nil, echoHandler)
+	m := mustPin(t, f)
+
+	deny := func() Rule { return Rule{SideEffect: agentrt.LocalMutation, Deny: []string{"force"}} }
+	_, rep, err := load(t, f, m, Rules{
+		"misspelled":    {SideEffect: agentrt.LocalMutation, Deny: []string{"forse"}},
+		"no_such_fixed": {SideEffect: agentrt.LocalMutation, Fixed: map[string]json.RawMessage{"nonexistent": json.RawMessage(`1`)}},
+		"any_of":        deny(),
+		"pattern":       deny(),
+		"dependent":     deny(),
+		"if_then":       {SideEffect: agentrt.LocalMutation, Fixed: map[string]json.RawMessage{"root": json.RawMessage(`"/srv"`)}},
+		"defs":          deny(),
+		"nested":        deny(),
+		"unrelated":     deny(),
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := map[string]string{
+		"misspelled":    `hides "forse", which is not a top-level property`,
+		"no_such_fixed": `hides "nonexistent", which is not a top-level property`,
+		"any_of":        `input schema's anyOf mentions it`,
+		"pattern":       "patternProperties",
+		"dependent":     `input schema's dependentRequired mentions it`,
+		"if_then":       `input schema's then mentions it`,
+		"defs":          `input schema's $defs mentions it`,
+	}
+	for tool, reason := range want {
+		if got := refusal(rep, tool); !strings.Contains(got, reason) {
+			t.Errorf("%s: refusal %q, want %q", tool, got, reason)
+		}
+	}
+	if len(rep.Registered) != 2 || rep.Registered[0].Tool != "nested" || rep.Registered[1].Tool != "unrelated" {
+		t.Errorf("registered = %+v, want the two tools whose hidden name nothing else mentions", rep.Registered)
 	}
 }
 
