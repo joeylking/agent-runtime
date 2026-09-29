@@ -112,13 +112,16 @@ Run them before changing an adapter:
 ```
 
 The examples. `examples/scripted` needs nothing and CI runs it; `examples/live`
-needs the Ollama server; `examples/mcp` needs that and Node, for
-`npx @modelcontextprotocol/server-filesystem`, and is the demo that exercises
-every control at once:
+needs the Ollama server; `examples/mcp` needs that and Node, and is the demo
+that exercises every control at once. It runs the MCP filesystem server pinned
+by version and integrity hash in `examples/mcp/package-lock.json`, started with
+`node` from a local install, so install it once, without running any package's
+install scripts, before `pin` or `run`:
 
 ```sh
 go run ./examples/scripted
 go run ./examples/live
+(cd examples/mcp && npm ci --ignore-scripts)
 go run ./examples/mcp pin && go run ./examples/mcp run
 ```
 
@@ -154,9 +157,32 @@ tagged:
 1. **Tag the core** only once CI is green on the exact commit being
    tagged — not a later commit, and not a commit CI hasn't run against
    at all.
-2. **Re-pin the nested modules** to the new core version (the `require`
-   line in each nested module's `go.mod`), run `go mod tidy` in each, and
-   push that as an ordinary commit.
+2. **Re-pin the nested modules** to the new core version. The proxy and the
+   checksum database can lag a freshly pushed tag by a few minutes; wait for
+   the proxy to actually serve it, then let `go get` do the re-pin, then
+   confirm what it wrote against the checksum database independently. For
+   each nested module (`providers/ollama`, `providers/anthropic`,
+   `providers/openai`, `mcp`):
+
+   ```sh
+   # Wait until the proxy serves the tag just pushed.
+   until curl -sf https://proxy.golang.org/github.com/joeylking/agent-runtime/@v/vX.Y.Z.info; do sleep 5; done
+
+   (cd providers/ollama && go get github.com/joeylking/agent-runtime@vX.Y.Z)
+
+   # Confirm the go.sum lines go get just wrote independently, against the
+   # checksum database, before trusting them.
+   curl -sf https://sum.golang.org/lookup/github.com/joeylking/agent-runtime@vX.Y.Z
+   ```
+
+   Never bypass the checksum database to make a re-pin go through —
+   `GONOSUMDB`, `GOPRIVATE`, `GOFLAGS=-mod=mod`, or `GOPROXY=direct` all skip
+   the verification that catches a tag whose content changed after the fact
+   or a proxy serving something other than what was pushed, and none of them
+   is needed here: the core's modules are public, and `go get` at default
+   settings re-pins and verifies both together. If the proxy or the checksum
+   database has not caught up, wait; do not route around them. Then run
+   `go mod tidy` in each, and push the result as an ordinary commit.
 3. **Wait for both CI and the release check to go green** on that commit.
    The release check does not trigger on an ordinary push (see the
    comment at the top of `.github/workflows/release-check.yml`), so run it
@@ -177,6 +203,14 @@ commit, on the core or on a nested module: a consumer's `go.sum` pins the
 content a tag names, and moving it after the fact breaks that promise
 silently. A mistake in a tagged commit is fixed by tagging a new patch
 version, not by rewriting the old tag.
+
+A release that adds a schema migration changes what `OpenStore` writes to a
+database on first open. Before such a release's database is opened by
+anything, stop the operator binary (`agentrt`) and every consumer process
+that has that database open, on every host that shares it — old and new
+schema versions are not read together, and `OpenExisting` refuses a mismatch
+rather than guessing, but only after something has tried to open the file.
+Restart them on the new build once the migration has run once.
 
 ## Style
 

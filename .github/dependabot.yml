@@ -9,12 +9,21 @@
 # Each entry below is grouped so a week with several updates in the same
 # ecosystem and directory still opens at most one pull request, not one per
 # dependency.
+#
+# cooldown holds a version back until it has been published for this many
+# days, so a version is not proposed the day a compromised maintainer
+# account or a build system pushes it, before the ecosystem has had a
+# chance to notice and yank it. gomod supports separate days per semver
+# bump (checked against the current Dependabot configuration reference);
+# github-actions supports only default-days, not a per-bump split.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns:
@@ -24,6 +33,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
     groups:
       gomod:
         patterns:
@@ -33,6 +47,11 @@ updates:
     directory: "/providers/ollama"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
     groups:
       gomod:
         patterns:
@@ -42,6 +61,11 @@ updates:
     directory: "/providers/anthropic"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
     groups:
       gomod:
         patterns:
@@ -51,6 +75,11 @@ updates:
     directory: "/providers/openai"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
     groups:
       gomod:
         patterns:
@@ -60,6 +89,11 @@ updates:
     directory: "/mcp"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
     groups:
       gomod:
         patterns:
@@ -69,6 +103,11 @@ updates:
     directory: "/examples/live"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
     groups:
       gomod:
         patterns:
@@ -78,6 +117,11 @@ updates:
     directory: "/examples/mcp"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
     groups:
       gomod:
         patterns:

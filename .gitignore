@@ -2,7 +2,36 @@
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 go.work
 go.work.sum
 .env
 .env.*
+
+# macOS Finder metadata. Already-tracked files are unaffected; this only
+# stops new ones from being added.
+.DS_Store
+
+# replay.Recorder output, wherever an example or a consumer points it.
+recordings/
+
+# Node dependencies (examples/mcp's pinned filesystem server is installed
+# into examples/mcp/node_modules by `npm ci --ignore-scripts`; no install
+# belongs in the repository).
+node_modules/
+
+# Binaries `go build` drops when run without -o from a package directory:
+# the two flags this repository's own commands are invoked with everywhere
+# else (`go run`, or `go build -o` into /bin) never create these, but a
+# plain `go build` from inside one of these directories does.
+/agentrt
+/cmd/agentrt/agentrt
+/examples/live/live
+/examples/mcp/mcp
+/examples/scripted/scripted

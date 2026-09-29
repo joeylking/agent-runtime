@@ -16,12 +16,17 @@ permissions:
   contents: read
 
 # One run per ref at a time. A branch's superseded push is cancelled, but a
-# tag is immutable once pushed (see release-check.yml and CONTRIBUTING.md)
-# and the default branch's history is what release decisions are read from,
-# so neither is ever cancelled mid-run.
+# tag is immutable once pushed (see release-check.yml and CONTRIBUTING.md),
+# the default branch's history is what release decisions are read from, and
+# a schedule run has no superseding push to be cancelled in favour of, so
+# none of the three is ever cancelled mid-run. github.ref is compared
+# against the literal refs/heads/main rather than built from
+# github.event.repository.default_branch, which is empty on a schedule
+# event and would otherwise make a scheduled default-branch run cancel
+# itself.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' && github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && github.ref != 'refs/heads/main' && github.event_name != 'schedule' }}
 
 # The core module supports the current Go release and the one before it, so it
 # is built with both. GOTOOLCHAIN=local forbids a silent switch to a newer
@@ -38,9 +43,15 @@ jobs:
         go-version: ["1.26.x", "1.27.x"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ matrix.go-version }}
+      # setup-go restores the module cache above; verify its contents against
+      # go.sum before anything is built with it, so a corrupted or tampered
+      # cache entry is a hard failure rather than a silently poisoned build.
+      - run: go mod verify
       - run: go vet ./...
       - run: go test -race -count=1 ./...
       - name: scripted example
@@ -106,16 +117,19 @@ jobs:
         go-version: ["1.26.x", "1.27.x"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ matrix.go-version }}
+      - run: go mod verify
       - name: workspace
         run: go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./examples/live ./examples/mcp
       - name: nested modules
         run: |
           for m in providers/ollama providers/anthropic providers/openai mcp examples/live examples/mcp; do
             echo "== $m"
-            (cd "$m" && go vet ./... && go test -race -count=1 ./...)
+            (cd "$m" && go mod verify && go vet ./... && go test -race -count=1 ./...)
           done
 
   # Static analysis and the tidy check run once, on the newest supported Go,
@@ -125,9 +139,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.x"
+      - run: GOWORK=off go mod verify
       - name: gofmt
         run: |
           out=$(gofmt -l .)
@@ -151,5 +168,5 @@ jobs:
         run: |
           for m in providers/ollama providers/anthropic providers/openai mcp examples/live examples/mcp; do
             echo "== $m"
-            (cd "$m" && staticcheck ./... && govulncheck ./...)
+            (cd "$m" && go mod verify && staticcheck ./... && govulncheck ./...)
           done
