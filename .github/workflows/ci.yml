@@ -37,6 +37,8 @@ env:
 jobs:
   unit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -74,10 +76,10 @@ jobs:
           fi
 
           go run ./cmd/agentrt -db "$db" runs
-          run=$(go run ./cmd/agentrt -db "$db" -json runs | jq -r '.[0].id')
+          run=$(go run ./cmd/agentrt -db "$db" -json runs | jq -r '.runs[0].id')
           go run ./cmd/agentrt -db "$db" show "$run"
           go run ./cmd/agentrt -db "$db" events "$run" | tail -3
-          go run ./cmd/agentrt -db "$db" -json events "$run" | jq -e -s 'length > 8' > /dev/null
+          go run ./cmd/agentrt -db "$db" -json events "$run" | jq -e -s '[.[] | select(.meta != true)] | length > 8' > /dev/null
 
           # runs, show, and events open the database read-only, so they must
           # still work when the file itself is not writable.
@@ -111,6 +113,8 @@ jobs:
   # in-tree one; release-check.yml builds that graph before a tag.
   modules:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -137,6 +141,8 @@ jobs:
   # not toolchain-version-dependent behaviour.
   lint:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
