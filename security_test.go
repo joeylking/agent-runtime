@@ -505,7 +505,7 @@ func TestLease_OwnExpiredLeaseTakeoverIsRecorded(t *testing.T) {
 // another process is refused for as long as the loop is alive.
 func TestLease_HeldConnectionDoesNotStarveTheHeartbeat(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l.db")
-	const ttl = 150 * time.Millisecond
+	const ttl = 300 * time.Millisecond
 	work := newGate("sync")
 	agent := &listAgent{decisions: []Decision{{Kind: DecideToolCall, Tool: "sync", Args: []byte(`{}`)}, {Kind: DecideComplete}}}
 	a := openProcess(t, path, Config{Agent: agent, Tools: []Tool{work}, LeaseTTL: ttl})

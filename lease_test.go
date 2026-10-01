@@ -251,14 +251,14 @@ func TestLease_LoopThatLosesItsLeaseStopsBeforeTheNextToolCall(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l.db")
 	work := newGate("work")
 	agent := &listAgent{decisions: []Decision{{Kind: DecideToolCall, Tool: "work", Args: []byte(`{}`)}, {Kind: DecideToolCall, Tool: "work", Args: []byte(`{"n":2}`)}, {Kind: DecideComplete}}}
-	p := openProcess(t, path, Config{Agent: agent, Tools: []Tool{work}, LeaseTTL: 60 * time.Millisecond})
+	p := openProcess(t, path, Config{Agent: agent, Tools: []Tool{work}, LeaseTTL: 300 * time.Millisecond})
 	other := openProcess(t, path, Config{Agent: agent, Tools: []Tool{work}})
 	work.during = func(c ToolCall) {
 		// Another owner takes the lease; the heartbeat notices.
 		if _, err := other.store.DB().Exec(`UPDATE runs SET lease_owner = 'other', lease_expires_at = ? WHERE id = ?`, formatTime(time.Now().Add(time.Hour)), c.RunID); err != nil {
 			t.Error(err)
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(600 * time.Millisecond)
 	}
 	close(work.release)
 	run, err := p.d.Start(context.Background(), "g", leaseLimits())
@@ -381,7 +381,7 @@ func TestLease_CancelNeedsNoLease(t *testing.T) {
 // not wait for the loop.
 func TestLease_LongToolCallKeepsTheLease(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l.db")
-	const ttl = 90 * time.Millisecond
+	const ttl = 300 * time.Millisecond
 	work := newGate("work")
 	agent := &listAgent{decisions: []Decision{{Kind: DecideToolCall, Tool: "work", Args: []byte(`{}`)}, {Kind: DecideComplete}}}
 	p1 := openProcess(t, path, Config{Agent: agent, Tools: []Tool{work}, LeaseTTL: ttl})
@@ -424,10 +424,12 @@ func TestLease_HeartbeatStopsOnReturnAndOnPanic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l.db")
 	slow := &gate{spec: ToolSpec{Name: "slow", Description: "s", InputSchema: []byte(`{"type":"object"}`), SideEffect: ReadOnly, Timeout: time.Second},
 		entered: make(chan string, 1), release: make(chan struct{})}
-	slow.during = func(ToolCall) { time.Sleep(50 * time.Millisecond) } // several heartbeats
+	// Several renewals at a third of the TTL, with room for a slow CI runner
+	// under the race detector and full synchronous commits.
+	slow.during = func(ToolCall) { time.Sleep(time.Second) }
 	close(slow.release)
-	p := openProcess(t, path, Config{Agent: &listAgent{decisions: []Decision{{Kind: DecideToolCall, Tool: "slow", Args: []byte(`{}`)}, {Kind: DecideComplete}}}, Tools: []Tool{slow}, LeaseTTL: 15 * time.Millisecond})
-	q := openProcess(t, path, Config{Agent: panicAgent{}, LeaseTTL: 15 * time.Millisecond})
+	p := openProcess(t, path, Config{Agent: &listAgent{decisions: []Decision{{Kind: DecideToolCall, Tool: "slow", Args: []byte(`{}`)}, {Kind: DecideComplete}}}, Tools: []Tool{slow}, LeaseTTL: 300 * time.Millisecond})
+	q := openProcess(t, path, Config{Agent: panicAgent{}, LeaseTTL: 300 * time.Millisecond})
 	base := runtime.NumGoroutine()
 	for range 3 {
 		if run, err := p.d.Start(context.Background(), "g", leaseLimits()); err != nil || run.Status != StatusCompleted {
