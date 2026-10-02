@@ -682,6 +682,33 @@ func TestDecide_InteractiveConfirmation(t *testing.T) {
 	})
 }
 
+// TestDecide_EOFBeforeAnAnswerRefusesWithUsage reproduces "approve <run>
+// </dev/null": stdin passes as a terminal (or is simply exhausted) but
+// gives nothing to read before EOF, which must refuse at exit 2, the same
+// as having no terminal at all, not read as a typed decline at exit 1.
+func TestDecide_EOFBeforeAnAnswerRefusesWithUsage(t *testing.T) {
+	path, runID, approvalID := pausedDB(t)
+	code, _, errw := execFull(t, "", true, "-db", path, "approve", runID, "-by", "joey")
+	if code != exitUsage {
+		t.Fatalf("exit %d, want %d\nstderr:\n%s", code, exitUsage, errw)
+	}
+	if !strings.Contains(errw, "-approval") || !strings.Contains(errw, "-yes") {
+		t.Fatalf("refusal does not say how to proceed:\n%s", errw)
+	}
+	store, err := agentrt.OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	a, err := store.GetApproval(context.Background(), runID, approvalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != agentrt.ApprovalPending {
+		t.Fatalf("hitting EOF before an answer must not decide anything: %+v", a)
+	}
+}
+
 func TestDecide_RefusesAnEmptyIdentity(t *testing.T) {
 	path, runID, _ := pausedDB(t)
 	t.Setenv("USER", "")
@@ -1125,6 +1152,67 @@ func TestShow_LongArgumentTruncatedHeadAndTail(t *testing.T) {
 	}
 }
 
+// TestShow_NestedFieldsIndentConsistently reproduces the uneven
+// indentation bug: printOneField ran the bounded value through
+// json.MarshalIndent with its own two-space prefix, which
+// json.MarshalIndent does not apply to a value's first line, so printField
+// then adding its own four-space prefix to every line left a value's
+// opening brace two columns left of its matching closing brace. A
+// two-level nested value's matching braces must land in the same column.
+func TestShow_NestedFieldsIndentConsistently(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested.db")
+	store, err := agentrt.OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := &scripted.Agent{Decisions: []agentrt.Decision{scripted.ToolCall("push", `{"n":7}`, "needs approval")}}
+	policy := agentrt.PolicyFunc(func(_ context.Context, req agentrt.ToolRequest, _ agentrt.RunView) (agentrt.PolicyDecision, error) {
+		return agentrt.NeedApproval("publication", "remote mutation", nil,
+			map[string]any{"nested": map[string]any{"inner": map[string]any{"a": 1}}})
+	})
+	d, err := agentrt.NewDriver(agentrt.Config{Store: store, Agent: agent, Policy: policy,
+		Tools: []agentrt.Tool{newTool("push", agentrt.RemoteMutation)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := d.Start(context.Background(), "g", agentrt.Limits{MaxSteps: 5, MaxConsecutiveToolFailures: 3, LoopThreshold: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != agentrt.StatusWaitingForApproval {
+		t.Fatalf("status = %s", r.Status)
+	}
+	store.Close()
+
+	code, out, errw := exec(t, "-db", path, "show", r.ID)
+	requireOK(t, code, out, errw)
+
+	lines := strings.Split(out, "\n")
+	indent := func(l string) int { return len(l) - len(strings.TrimLeft(l, " ")) }
+	find := func(want string, from int) int {
+		for i := from; i < len(lines); i++ {
+			if strings.TrimSpace(lines[i]) == want {
+				return i
+			}
+		}
+		t.Fatalf("line %q not found after %d:\n%s", want, from, out)
+		return -1
+	}
+	outerOpen := find("{", 0)
+	innerOpen := find(`"inner": {`, outerOpen)
+	innerClose := find("}", innerOpen+1)
+	outerClose := find("}", innerClose+1)
+	if indent(lines[outerOpen]) != indent(lines[outerClose]) {
+		t.Fatalf("outer braces at columns %d and %d, want equal:\n%s", indent(lines[outerOpen]), indent(lines[outerClose]), out)
+	}
+	if indent(lines[innerOpen]) != indent(lines[innerClose]) {
+		t.Fatalf("inner braces at columns %d and %d, want equal:\n%s", indent(lines[innerOpen]), indent(lines[innerClose]), out)
+	}
+	if indent(lines[innerOpen]) <= indent(lines[outerOpen]) {
+		t.Fatalf("inner brace is not indented deeper than the outer one:\n%s", out)
+	}
+}
+
 // TestClip_CutsOnAUTF8CharacterBoundary: clip used to slice by raw byte
 // count and could split a multi-byte character in half.
 func TestClip_CutsOnAUTF8CharacterBoundary(t *testing.T) {
@@ -1412,5 +1500,37 @@ func TestRead_OnlyThePageIsReadFromAHugeDatabase(t *testing.T) {
 	requireOK(t, code, out, errw)
 	if !strings.Contains(out, fmt.Sprintf("(showing 5 of %d)", events)) {
 		t.Fatalf("events total not counted:\n%s", out)
+	}
+}
+
+// TestIsTerminal_DevNullIsNotATerminal: /dev/null is a character device,
+// like a real terminal, but isTerminal must tell it apart by identity
+// (os.SameFile against os.DevNull) rather than treat every character
+// device as somewhere to prompt.
+func TestIsTerminal_DevNullIsNotATerminal(t *testing.T) {
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if isTerminal(f) {
+		t.Fatal("os.DevNull must not be treated as a terminal")
+	}
+}
+
+// TestIsTerminal_RegularFileIsNotATerminal: an ordinary file is not a
+// character device at all, the case isTerminal already handled.
+func TestIsTerminal_RegularFileIsNotATerminal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "y")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if isTerminal(f) {
+		t.Fatal("a regular file must not be treated as a terminal")
 	}
 }

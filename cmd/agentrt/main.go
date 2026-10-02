@@ -48,6 +48,12 @@ global flags:
   -db path              SQLite database (default: $AGENTRT_DB)
   -json                 emit JSON instead of aligned text
 
+runs, show, and events flags (show and events: come after the run id):
+  -limit n              rows to show: runs, or steps and pending approvals,
+                        or events (default: 100 for runs, 500 for show and
+                        events; 0: unlimited, read a page at a time)
+  -offset n             skip that many first (default: 0)
+
 approve and reject flags (may come before or after the run id):
   -approval id          which approval (default: the run's only pending one)
   -by who               who decided (default: $USER); unauthenticated: this
@@ -88,6 +94,13 @@ const (
 
 // errUsage marks an error the operator can fix by reading the usage text.
 var errUsage = errors.New("usage")
+
+// errNoAnswer marks confirm's read reaching end of input before an answer
+// was typed. It is not a decline: stdin passed a terminal check but gave
+// nothing to read (a closed pipe, a redirect that looked like a terminal),
+// and the caller refuses the same way as when there was no terminal to ask
+// at, rather than recording it as a typed "n".
+var errNoAnswer = errors.New("no answer before end of input")
 
 // env is what a command needs once its arguments are known good: the store,
 // the output format, where to write, and what to read a confirmation from.
@@ -704,7 +717,13 @@ func printOneField(w io.Writer, key string, v any) {
 		fmt.Fprintf(w, "  %s (unprintable: %v)\n", trace.Sanitize(key), err)
 		return
 	}
-	bounded, err := json.MarshalIndent(view.BoundValue(v), "  ", "  ")
+	// No prefix here: json.MarshalIndent only puts its prefix in front of
+	// every line but the first, so a non-empty prefix left the value's own
+	// opening brace two columns left of its matching closing brace once
+	// printField's per-line indent was added below. An empty prefix nests
+	// consistently on its own, so a uniform prefix added once, to every
+	// line alike, stays uniform.
+	bounded, err := json.MarshalIndent(view.BoundValue(v), "", "  ")
 	if err != nil {
 		printField(w, key, trace.Sanitize(string(orig)), len(orig))
 		return
@@ -832,6 +851,9 @@ func cmdDecide(ctx context.Context, e *env, runID, approvalID, by, note string, 
 	if !e.json {
 		printWaiting(e, a)
 	}
+	refuse := func() error {
+		return fmt.Errorf("%w: %s: refusing without -approval, -yes, or an interactive terminal to confirm at; pass -approval %s or -yes", errUsage, verb, a.ID)
+	}
 	switch {
 	case approvalID != "":
 		// Naming the approval by id is itself the deliberate act.
@@ -840,6 +862,11 @@ func cmdDecide(ctx context.Context, e *env, runID, approvalID, by, note string, 
 	case e.interactive && !e.json:
 		// A prompt has nowhere to go that keeps -json's stdout pure JSON.
 		ok, err := confirm(e, fmt.Sprintf("%s approval %s of run %s? [y/N] ", verb, a.ID, runID))
+		if errors.Is(err, errNoAnswer) {
+			// Reaching end of input before any answer is the same refusal
+			// as having no terminal to ask at, not a typed decline.
+			return refuse()
+		}
 		if err != nil {
 			return err
 		}
@@ -847,7 +874,7 @@ func cmdDecide(ctx context.Context, e *env, runID, approvalID, by, note string, 
 			return fmt.Errorf("%s: declined at the prompt", verb)
 		}
 	default:
-		return fmt.Errorf("%w: %s: refusing without -approval, -yes, or an interactive terminal to confirm at; pass -approval %s or -yes", errUsage, verb, a.ID)
+		return refuse()
 	}
 	obs := trace.Writer(e.errw)
 	// ApproveShown/RejectShown bind the decision to a.Hash, the hash of
@@ -875,11 +902,15 @@ func cmdDecide(ctx context.Context, e *env, runID, approvalID, by, note string, 
 }
 
 // confirm prints prompt and reads one line from e.stdin, treating "y" or
-// "yes" (case-insensitively) as consent and anything else, including no
-// input at all, as a decline.
+// "yes" (case-insensitively) as consent and any other typed line as a
+// decline. Reaching the end of input before anything was typed returns
+// errNoAnswer rather than a decline: nothing was answered.
 func confirm(e *env, prompt string) (bool, error) {
 	fmt.Fprint(e.out, prompt)
-	line, _ := bufio.NewReader(e.stdin).ReadString('\n')
+	line, err := bufio.NewReader(e.stdin).ReadString('\n')
+	if line == "" && err != nil {
+		return false, errNoAnswer
+	}
 	line = strings.ToLower(strings.TrimSpace(line))
 	return line == "y" || line == "yes", nil
 }
@@ -977,10 +1008,23 @@ func clip(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// isTerminal reports whether f is a character device, which is what a
-// terminal is and what a pipe or a file is not. The standard library is
-// enough for deciding whether anyone is there to confirm.
+// isTerminal reports whether f is a character device that is not the null
+// device, which is what a terminal is and what a pipe, a file, or
+// /dev/null is not. /dev/null is itself a character device, so it would
+// otherwise pass the character-device check and make "approve <run>
+// </dev/null" prompt, read nothing, and decline rather than refuse. It is
+// told apart from a real terminal by identity (os.SameFile against
+// os.DevNull), not by path, since a terminal could be reached through a
+// different name for the same device and /dev/null through one too. The
+// standard library is enough for deciding whether anyone is there to
+// confirm.
 func isTerminal(f *os.File) bool {
 	info, err := f.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
+	if err != nil || info.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	if null, err := os.Stat(os.DevNull); err == nil && os.SameFile(info, null) {
+		return false
+	}
+	return true
 }

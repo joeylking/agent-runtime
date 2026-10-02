@@ -373,6 +373,30 @@ func TestCancel_WrapsADatabaseLockedByAnotherConsumer(t *testing.T) {
 	}
 }
 
+// TestCancel_AlreadyTerminalNamesItsStatus reproduces the defect
+// wrapDecideErr's text matching caused: cancelling a run a second time
+// must not be reported as the approval wording ("approval is already
+// decided"), which is wrong for a run that finished rather than an
+// approval decided twice. It must say the run is already finished and
+// name its status.
+func TestCancel_AlreadyTerminalNamesItsStatus(t *testing.T) {
+	store, runID := pausedRun(t)
+	ctx := context.Background()
+	if err := agentrt.Cancel(ctx, store, nil, runID, "joey", "first"); err != nil {
+		t.Fatal(err)
+	}
+	err := view.Cancel(ctx, store, nil, runID, "joey", "second")
+	if !errors.Is(err, view.ErrRunFinished) {
+		t.Fatalf("err = %v, want ErrRunFinished", err)
+	}
+	if !strings.Contains(err.Error(), "already finished") || !strings.Contains(err.Error(), string(agentrt.StatusCancelled)) {
+		t.Fatalf("message does not say the run is already finished and name its status: %v", err)
+	}
+	if strings.Contains(err.Error(), "approval is already decided") {
+		t.Fatalf("must not report the approval wording for a run cancel: %v", err)
+	}
+}
+
 // Runs reads pending approvals for every run in one query; each row equals
 // what Summary, which reads the run's own approvals, says for that run:
 // waiting with one pending approval, waiting with two, cancelled with one

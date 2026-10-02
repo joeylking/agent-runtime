@@ -310,7 +310,9 @@ func pendingApprovals(ctx context.Context, store *agentrt.Store, runID string) (
 // Errors decideError wraps around whatever agentrt.Approve, agentrt.Reject,
 // and agentrt.Cancel report, so a caller such as cmd/agentrt can match the
 // shape of a failure instead of parsing its text. The core functions return
-// plain fmt.Errorf values with no sentinel of their own; these give one.
+// plain fmt.Errorf values wrapping its own exported sentinels
+// (agentrt.ErrRunState, agentrt.ErrNotPending); these give the operator
+// surface its own to match on.
 var (
 	// ErrRunNotWaiting means the run is not (or no longer) waiting for
 	// approval: another decision, a resume, or an expiry already moved it
@@ -319,6 +321,11 @@ var (
 	// ErrApprovalDecided means the named approval was already approved,
 	// rejected, or expired; it is not the caller's to decide again.
 	ErrApprovalDecided = errors.New("approval is already decided")
+	// ErrRunFinished means Cancel was asked to end a run that is already
+	// terminal (COMPLETED, FAILED, or CANCELLED): distinct from
+	// ErrRunNotWaiting, which is for a run that was never (or no longer)
+	// waiting for approval, not one that finished.
+	ErrRunFinished = errors.New("run is already finished")
 	// ErrDatabaseLocked means another process holds the database open for
 	// writing. It wraps the driver's own error, whose text carries the raw
 	// SQLite code, so a front end can say something a person can act on.
@@ -352,11 +359,30 @@ func RejectShown(ctx context.Context, store *agentrt.Store, obs agentrt.Observer
 	return wrapDecideErr(agentrt.RejectShown(ctx, store, obs, runID, approvalID, shownHash, by, note))
 }
 
-// Cancel ends a run, wrapping errors the same way Approve does.
+// Cancel ends a run, wrapping ErrDatabaseLocked the same way Approve does.
+// Unlike Approve and Reject, the core's agentrt.ErrRunState here means the
+// run is already terminal, not that it was never waiting for approval, so
+// it is wrapped as ErrRunFinished instead of ErrRunNotWaiting.
 func Cancel(ctx context.Context, store *agentrt.Store, obs agentrt.Observer, runID, by, note string) error {
-	return wrapDecideErr(agentrt.Cancel(ctx, store, obs, runID, by, note))
+	err := agentrt.Cancel(ctx, store, obs, runID, by, note)
+	if err == nil {
+		return nil
+	}
+	if isLocked(err) {
+		return fmt.Errorf("%w: %v", ErrDatabaseLocked, err)
+	}
+	if errors.Is(err, agentrt.ErrRunState) {
+		return fmt.Errorf("%w: %v", ErrRunFinished, err)
+	}
+	return err
 }
 
+// wrapDecideErr wraps what Approve, Reject, ApproveShown, and RejectShown
+// return so a front end matches ErrRunNotWaiting, ErrApprovalDecided, and
+// ErrDatabaseLocked with errors.Is rather than searching the message for
+// words like "already", which also appears in text that means something
+// else (a run already terminal, which Cancel reports as ErrRunFinished,
+// not ErrApprovalDecided).
 func wrapDecideErr(err error) error {
 	if err == nil {
 		return nil
@@ -364,11 +390,10 @@ func wrapDecideErr(err error) error {
 	if isLocked(err) {
 		return fmt.Errorf("%w: %v", ErrDatabaseLocked, err)
 	}
-	msg := err.Error()
 	switch {
-	case strings.Contains(msg, "not waiting for approval"):
+	case errors.Is(err, agentrt.ErrRunState):
 		return fmt.Errorf("%w: %v", ErrRunNotWaiting, err)
-	case strings.Contains(msg, "already"):
+	case errors.Is(err, agentrt.ErrNotPending):
 		return fmt.Errorf("%w: %v", ErrApprovalDecided, err)
 	}
 	return err
