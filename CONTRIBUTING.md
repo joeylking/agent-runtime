@@ -186,12 +186,15 @@ tagged:
 3. **Wait for both CI and the release check to go green** on that commit.
    The release check does not trigger on an ordinary push (see the
    comment at the top of `.github/workflows/release-check.yml`), so run it
-   with `workflow_dispatch` for this commit; it is what actually builds
+   with `workflow_dispatch` for this commit, with the `examples` input off
+   because the examples cannot be re-pinned until the nested tags exist
+   (`gh workflow run release-check.yml -f examples=false`); it is what actually builds
    each nested module against its newly pinned core release with
    `GOWORK=off`, which `go work`-based CI cannot exercise.
 4. **Tag the nested modules**, now that both are green for that commit.
 5. **Re-pin the examples** (`examples/live`, `examples/mcp`) to the new
-   nested-module tags, tidy, and push.
+   nested-module tags, tidy, and push. Then run the release check once
+   more with its default inputs, which includes the examples.
 6. **Create a GitHub release for every tag** — the core's and each nested
    module's. The changelog's `## [Unreleased]` section becomes that
    release's dated section in `CHANGELOG.md`, and the GitHub release body

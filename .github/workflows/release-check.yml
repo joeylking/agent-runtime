@@ -26,6 +26,11 @@ on:
   schedule:
     - cron: "44 6 * * 1"
   workflow_dispatch:
+    inputs:
+      examples:
+        description: "Also check examples/live and examples/mcp, which pin the nested modules' tags"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -55,9 +60,19 @@ jobs:
           go-version: ${{ matrix.go-version }}
       - name: install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      # The examples pin the nested modules' own tags, so they can only be
+      # re-pinned after those tags exist. A nested tag's push, and the
+      # manual run that precedes it, therefore check the four library
+      # modules; the schedule and an ordinary manual run check everything.
       - name: nested modules against their pinned core
+        env:
+          WITH_EXAMPLES: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.examples) }}
         run: |
-          for m in providers/ollama providers/anthropic providers/openai mcp examples/live examples/mcp; do
+          modules="providers/ollama providers/anthropic providers/openai mcp"
+          if [ "$WITH_EXAMPLES" = "true" ]; then
+            modules="$modules examples/live examples/mcp"
+          fi
+          for m in $modules; do
             echo "== $m"
             (
               cd "$m"

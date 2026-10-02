@@ -3,7 +3,7 @@ module github.com/joeylking/agent-runtime/mcp
 go 1.26.0
 
 require (
-	github.com/joeylking/agent-runtime v0.2.1
+	github.com/joeylking/agent-runtime v0.3.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 )
 
@@ -20,11 +20,11 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
-	modernc.org/libc v1.75.7 // indirect
+	modernc.org/libc v1.77.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
-	modernc.org/sqlite v1.59.0 // indirect
+	modernc.org/sqlite v1.60.1 // indirect
 )
