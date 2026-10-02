@@ -192,6 +192,9 @@ tagged:
    each nested module against its newly pinned core release with
    `GOWORK=off`, which `go work`-based CI cannot exercise.
 4. **Tag the nested modules**, now that both are green for that commit.
+   Push the tags one at a time: GitHub creates no push event when more
+   than three tags arrive in one push, so the release check would not run
+   for any of them.
 5. **Re-pin the examples** (`examples/live`, `examples/mcp`) to the new
    nested-module tags, tidy, and push. Then run the release check once
    more with its default inputs, which includes the examples.
