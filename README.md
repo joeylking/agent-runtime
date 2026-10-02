@@ -115,20 +115,18 @@ kit has one. This library exists for the controls around the loop.
 
 ## Status
 
-The current release is v0.2.1. Both consumers run on v0.2.0, the release
-before it. v0.2.1 includes the packages that both of them had written
-separately, an adapter that puts the tools of any MCP server behind the
-policy, and the groundwork for outside contributors. These are items 1, 2,
-and 8 of the [roadmap](docs/roadmap.md). Items 3 to 6 are not started. Item
-7, writing up the ideas, is ongoing.
+The current release is v0.3.0. The runtime includes the packages that both
+consumers had written separately, an adapter that puts the tools of any MCP
+server behind the policy, and the groundwork for outside contributors. These
+are items 1, 2, and 8 of the [roadmap](docs/roadmap.md). Items 3 to 6 are
+not started. Item 7, writing up the ideas, is ongoing.
 
-This page describes the code in the repository, which is ahead of the
-release. `go get` installs v0.2.1 and the v0.1.1 adapters. Those do not yet
-have the lease on a run, the database only its owner can use, the pause
-after an interrupted action, the approval tied to what was displayed, or the
+v0.3.0 followed an audit and a security review of v0.2.1. It added the lease
+on a run, the database only its owner can use, the pause after an
+interrupted action, the approval tied to what was displayed, and the
 adapters' refusal of redirects and of keys over plain http.
-[CHANGELOG.md](CHANGELOG.md) lists every change under Unreleased and begins
-with what an upgrade requires. The three that matter most:
+[CHANGELOG.md](CHANGELOG.md) begins with what an upgrade from v0.2 requires.
+The three that matter most:
 
 - Stop every older process and every older `agentrt` binary that has the
   database open before the new version first opens it.
@@ -137,13 +135,10 @@ with what an upgrade requires. The three that matter most:
 - A consumer that sets no `Config.Reconcile` will see a run pause for an
   operator when an action was interrupted by a crash.
 
-The next release removes exported symbols, so it will be v0.3.0 and not a
-v0.2 patch.
-
 The provider adapters and the MCP adapter are separate modules inside this
-repository, tagged with a directory prefix: `providers/ollama/v0.1.1`,
-`providers/anthropic/v0.1.1`, `providers/openai/v0.1.1`, and `mcp/v0.1.1`.
-Each requires core v0.2.1.
+repository, tagged with a directory prefix: `providers/ollama/v0.2.0`,
+`providers/anthropic/v0.2.0`, `providers/openai/v0.2.0`, and `mcp/v0.2.0`.
+Each requires core v0.3.0.
 
 The API is pre-1.0 and changes when a consumer needs it to.
 
@@ -180,8 +175,8 @@ Pre-1.0, so the promise is narrow and written down rather than implied:
 - the replay key is the model name and the canonical JSON of the request
   (`replay.Key`), and its shape has not changed. A recording made through
   `render` stops matching when a release changes what `render` produces for
-  a step in it, and the release notes say when that happens. The unreleased
-  code does this for a reply with more than one tool use and for a reply
+  a step in it, and the release notes say when that happens. v0.3.0 does
+  this for a reply with more than one tool use and for a reply
   with no tool use that is longer than 500 bytes.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) is how a change gets in, and

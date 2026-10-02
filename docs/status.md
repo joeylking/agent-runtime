@@ -190,7 +190,7 @@ See ADR 5.
 
 ## Security sweep
 
-Every fix in the security sweep on the `audit-fixes` branch, core and
+Every fix in the security sweep released in v0.3.0, core and
 modules, with the test that verifies it. See `SECURITY.md` and ADR 6.
 
 | Capability | Status | Reference |

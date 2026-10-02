@@ -13,8 +13,13 @@ entry names a specific module only when the change is not in the core.
 
 ## [Unreleased]
 
-Everything below is on the `audit-fixes` branch since v0.2.1, not yet
-released. Several entries change behaviour a consumer or an operator will
+## [v0.3.0] - 2026-10-01
+
+Nested modules `mcp`, `providers/ollama`, `providers/anthropic`, and
+`providers/openai` released at v0.2.0, pinning this core release.
+
+This release follows an audit and a four-position security review of
+v0.2.1. Several entries change behaviour a consumer or an operator will
 meet on the first run. Before upgrading:
 
 1. **Stop every older process and operator binary before this version
@@ -489,7 +494,8 @@ step, failure, loop, call, token, cost, and time limits, an accounting
 model caller with retries, record and replay models, and an audit log
 written with the state. See `docs/architecture.md` and `docs/status.md`.
 
-[Unreleased]: https://github.com/joeylking/agent-runtime/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/joeylking/agent-runtime/compare/v0.3.0...HEAD
+[v0.3.0]: https://github.com/joeylking/agent-runtime/compare/v0.2.1...v0.3.0
 [v0.2.1]: https://github.com/joeylking/agent-runtime/releases/tag/v0.2.1
 [v0.2.0]: https://github.com/joeylking/agent-runtime/releases/tag/v0.2.0
 [v0.1.2]: https://github.com/joeylking/agent-runtime/releases/tag/v0.1.2

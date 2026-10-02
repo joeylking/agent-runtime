@@ -15,11 +15,14 @@ name: release-check
 # before a nested module is tagged, and a nested module is tagged only after
 # this workflow is green for the commit being tagged. See CONTRIBUTING.md's
 # release procedure.
+# The tag filter matches nested-module tags only (mcp/v0.2.0,
+# providers/ollama/v0.2.0). It does not match a core tag: when the core is
+# tagged the nested modules still pin the previous core, so this check could
+# only fail there. "**" is needed because "*" does not cross a "/".
 on:
   push:
     tags:
-      - "v*"
-      - "*/v*"
+      - "**/v*"
   schedule:
     - cron: "44 6 * * 1"
   workflow_dispatch:
