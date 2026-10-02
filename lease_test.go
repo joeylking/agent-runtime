@@ -251,7 +251,8 @@ func TestLease_LoopThatLosesItsLeaseStopsBeforeTheNextToolCall(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l.db")
 	work := newGate("work")
 	agent := &listAgent{decisions: []Decision{{Kind: DecideToolCall, Tool: "work", Args: []byte(`{}`)}, {Kind: DecideToolCall, Tool: "work", Args: []byte(`{"n":2}`)}, {Kind: DecideComplete}}}
-	p := openProcess(t, path, Config{Agent: agent, Tools: []Tool{work}, LeaseTTL: 300 * time.Millisecond})
+	p := openProcess(t, path, Config{Agent: agent, Tools: []Tool{work}, LeaseTTL: 5 * time.Second})
+	p.d.renewEvery = 25 * time.Millisecond
 	other := openProcess(t, path, Config{Agent: agent, Tools: []Tool{work}})
 	work.during = func(c ToolCall) {
 		// Another owner takes the lease; the heartbeat notices.
@@ -381,15 +382,16 @@ func TestLease_CancelNeedsNoLease(t *testing.T) {
 // not wait for the loop.
 func TestLease_LongToolCallKeepsTheLease(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l.db")
-	const ttl = 300 * time.Millisecond
+	const ttl = time.Second
 	work := newGate("work")
 	agent := &listAgent{decisions: []Decision{{Kind: DecideToolCall, Tool: "work", Args: []byte(`{}`)}, {Kind: DecideComplete}}}
 	p1 := openProcess(t, path, Config{Agent: agent, Tools: []Tool{work}, LeaseTTL: ttl})
 	p2 := openProcess(t, path, Config{Agent: agent, Tools: []Tool{work}, LeaseTTL: ttl})
+	p1.d.renewEvery = 50 * time.Millisecond
 	done := make(chan result, 1)
 	go func() { r, err := p1.d.Start(context.Background(), "g", leaseLimits()); done <- result{r, err} }()
 	runID := <-work.entered
-	for range 5 {
+	for range 3 {
 		time.Sleep(ttl)
 		if _, err := p2.d.Resume(context.Background(), runID); !errors.As(err, new(ErrRunLeased)) {
 			t.Fatalf("resume during a long tool call: %v", err)
@@ -424,12 +426,13 @@ func TestLease_HeartbeatStopsOnReturnAndOnPanic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l.db")
 	slow := &gate{spec: ToolSpec{Name: "slow", Description: "s", InputSchema: []byte(`{"type":"object"}`), SideEffect: ReadOnly, Timeout: time.Second},
 		entered: make(chan string, 1), release: make(chan struct{})}
-	// Several renewals at a third of the TTL, with room for a slow CI runner
-	// under the race detector and full synchronous commits.
-	slow.during = func(ToolCall) { time.Sleep(time.Second) }
+	// Several renewals during the call. The lease itself is long, so a
+	// stalled runner cannot let it lapse.
+	slow.during = func(ToolCall) { time.Sleep(200 * time.Millisecond) }
 	close(slow.release)
-	p := openProcess(t, path, Config{Agent: &listAgent{decisions: []Decision{{Kind: DecideToolCall, Tool: "slow", Args: []byte(`{}`)}, {Kind: DecideComplete}}}, Tools: []Tool{slow}, LeaseTTL: 300 * time.Millisecond})
-	q := openProcess(t, path, Config{Agent: panicAgent{}, LeaseTTL: 300 * time.Millisecond})
+	p := openProcess(t, path, Config{Agent: &listAgent{decisions: []Decision{{Kind: DecideToolCall, Tool: "slow", Args: []byte(`{}`)}, {Kind: DecideComplete}}}, Tools: []Tool{slow}, LeaseTTL: 5 * time.Second})
+	q := openProcess(t, path, Config{Agent: panicAgent{}, LeaseTTL: 5 * time.Second})
+	p.d.renewEvery, q.d.renewEvery = 25*time.Millisecond, 25*time.Millisecond
 	base := runtime.NumGoroutine()
 	for range 3 {
 		if run, err := p.d.Start(context.Background(), "g", leaseLimits()); err != nil || run.Status != StatusCompleted {

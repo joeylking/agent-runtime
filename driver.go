@@ -68,6 +68,9 @@ type Driver struct {
 	wall        func() time.Time
 	sleep       func(context.Context, time.Duration) error
 	noHeartbeat bool
+	// renewEvery overrides the renewal interval of a third of the TTL, so
+	// a test can renew often under a lease long enough for a slow runner.
+	renewEvery time.Duration
 	// active holds the runs a call of this driver is executing, so a second
 	// Start or Resume of one of them here is refused rather than taking
 	// over the lease this driver itself holds.

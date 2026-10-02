@@ -54,9 +54,13 @@ func (l *lease) start(at time.Time) {
 		close(l.done)
 		return
 	}
+	every := ttl / 3
+	if l.d.renewEvery > 0 {
+		every = l.d.renewEvery
+	}
 	go func() {
 		defer close(l.done)
-		tick := time.NewTicker(ttl / 3)
+		tick := time.NewTicker(every)
 		defer tick.Stop()
 		for {
 			select {

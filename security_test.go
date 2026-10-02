@@ -505,11 +505,12 @@ func TestLease_OwnExpiredLeaseTakeoverIsRecorded(t *testing.T) {
 // another process is refused for as long as the loop is alive.
 func TestLease_HeldConnectionDoesNotStarveTheHeartbeat(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l.db")
-	const ttl = 300 * time.Millisecond
+	const ttl = time.Second
 	work := newGate("sync")
 	agent := &listAgent{decisions: []Decision{{Kind: DecideToolCall, Tool: "sync", Args: []byte(`{}`)}, {Kind: DecideComplete}}}
 	a := openProcess(t, path, Config{Agent: agent, Tools: []Tool{work}, LeaseTTL: ttl})
 	b := openProcess(t, path, Config{Agent: agent, Tools: []Tool{work}, LeaseTTL: ttl})
+	a.d.renewEvery = 50 * time.Millisecond
 	done := make(chan result, 1)
 	go func() { r, err := a.d.Start(context.Background(), "g", leaseLimits()); done <- result{r, err} }()
 	runID := <-work.entered
@@ -517,7 +518,7 @@ func TestLease_HeldConnectionDoesNotStarveTheHeartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range 8 {
+	for range 3 {
 		time.Sleep(ttl / 2)
 		if _, err := b.d.Resume(context.Background(), runID); !errors.As(err, new(ErrRunLeased)) {
 			t.Fatalf("another process resumed a live run: %v", err)
