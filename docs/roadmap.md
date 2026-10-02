@@ -2,10 +2,10 @@
 
 agent-runtime is a library for running one tool-using agent under
 deterministic control. Two consumers, [repo-steward](https://github.com/joeylking/repo-steward)
-and [casework](https://github.com/joeylking/casework), run on v0.1. This
-roadmap turns what those consumers demonstrated into things other people
-can use. It is ordered by leverage, and every item names the consumer
-evidence that justifies it, because the rule from
+and [casework](https://github.com/joeylking/casework), run on the current
+release. This roadmap turns what those consumers demonstrated into things
+other people can use. It is ordered by leverage, and every item names the
+consumer evidence that justifies it, because the rule from
 [ADR 1](decisions/0001-custom-runtime.md) still holds: abstractions are
 added when a consumer demonstrates the need, not before.
 
@@ -44,10 +44,11 @@ to do instead. The nested modules version independently, with their own
 directory-prefixed tags, and each names the core version it requires in its
 `go.mod`. The SQLite schema only migrates forward: a newer core opens a
 database written by an older one and applies what is missing, and there are no
-down migrations. Recordings stay valid across core versions, because the replay
-key is the model name and the canonical JSON of the request (`replay.Key`); a
-release that changed that shape would invalidate every recording and would say
-so.
+down migrations. Recordings stay valid across core versions as long as a
+release has not changed what `render` produces for a step in them, because the
+replay key is the model name and the canonical JSON of the request
+(`replay.Key`); the release notes say when `render`'s output changes, as
+README.md's Compatibility section does for v0.3.0.
 
 The core module `github.com/joeylking/agent-runtime` keeps two
 dependencies: a JSON Schema validator and SQLite. Everything below that

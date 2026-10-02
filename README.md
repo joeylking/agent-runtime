@@ -176,8 +176,11 @@ Pre-1.0, so the promise is narrow and written down rather than implied:
   (`replay.Key`), and its shape has not changed. A recording made through
   `render` stops matching when a release changes what `render` produces for
   a step in it, and the release notes say when that happens. v0.3.0 does
-  this for a reply with more than one tool use and for a reply
-  with no tool use that is longer than 500 bytes.
+  this for a reply with more than one tool use, for a reply
+  with no tool use that is longer than 500 bytes, and for a run with a step
+  interrupted while deciding inside the recent-results window: the window
+  now counts rendered steps, where v0.2.1 counted raw steps, so such a run
+  renders differently.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) is how a change gets in, and
 [SECURITY.md](SECURITY.md) is what the runtime does and does not defend against.

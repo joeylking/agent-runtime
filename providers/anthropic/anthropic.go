@@ -44,14 +44,15 @@
 // No SDK error leaves the adapter: an HTTP error becomes a
 // providers.StatusError built from the status, the body, and any
 // Retry-After header, so the request and its key header are never part of
-// an error a consumer logs. A 429 or a 5xx (529 included) wraps that
-// StatusError in agentrt.TransientError, with the same Retry-After when the
-// response carried one; any other HTTP error is the StatusError alone,
-// which ends the run. A transport failure below HTTP, such as a lost
-// connection, is classified the same way providers.ClassifyTransport
-// documents: a timeout and the caller's own cancellation are returned bare
-// so the accounting caller charges them as ambiguous, and anything else
-// worth retrying is transient. Response bodies are bounded by
+// an error a consumer logs. A 408, 409, 425, 429, or 5xx (529 included)
+// wraps that StatusError in agentrt.TransientError, with the same
+// Retry-After when the response carried one; any other HTTP error is the
+// StatusError alone, which ends the run. A transport failure below HTTP,
+// such as a lost connection, is classified the same way
+// providers.ClassifyTransport documents: a timeout and the caller's own
+// cancellation are returned bare so the accounting caller charges them as
+// ambiguous, and anything else worth retrying is transient. Response
+// bodies are bounded by
 // providers.MaxBodyBytes (16 MiB), and a request with no deadline of its
 // own falls back to providers.DefaultTimeout (15 minutes) as a backstop to
 // the caller's context.
@@ -547,10 +548,11 @@ func inputSchema(schema, extra map[string]any) sdk.ToolInputSchemaParam {
 var unsupportedInStrict = map[string]bool{"minimum": true, "maximum": true, "exclusiveMinimum": true, "exclusiveMaximum": true, "multipleOf": true, "minLength": true, "maxLength": true, "maxItems": true, "pattern": true, "uniqueItems": true}
 
 // StrictSubset returns a copy of a schema reduced to what strict tool use
-// accepts: unsupported keywords removed, minItems clamped to 0 or 1, and
-// additionalProperties false on every object. It walks the schema's
-// structure, so a property named like a keyword ("pattern", "maximum") is
-// kept, and values such as enum, const, and default are copied untouched.
+// accepts: unsupported keywords removed, minItems over 1 removed (0 and 1
+// are left as given), and additionalProperties false on every object. It
+// walks the schema's structure, so a property named like a keyword
+// ("pattern", "maximum") is kept, and values such as enum, const, and
+// default are copied untouched.
 // It is exported because a consumer that shows an operator the schema it
 // sent needs the same transform.
 func StrictSubset(v any) any {

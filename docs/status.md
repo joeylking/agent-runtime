@@ -10,7 +10,7 @@ exists, reference given), **Verified** (a named test exercises it).
 | Run, Step, Decision, Observation, ToolSpec, PolicyDecision, Event types | Implemented | `agentrt.go` |
 | SQLite store with migrations, runs, steps, events | Verified | `store.go`, `TestStore_ReopenFileBacked` |
 | Events committed in the same transaction as state changes, delivered to the observer after commit | Verified | `store.go` `txn`, `TestDriver_CompletesAndPersists` |
-| Step loop: decide, validate, policy, execute, observe | Verified | `driver.go`, `TestDriver_CompletesAndPersists` |
+| Step loop: decide, validate, policy, execute, observe | Verified | `loop.go`, `TestDriver_CompletesAndPersists` |
 | Decision recorded verbatim before validation | Verified | `TestDriver_InvalidArgumentsBecomeObservation` |
 | Tool argument schema validation before policy | Verified | `schema.go`, `TestDriver_InvalidArgumentsBecomeObservation` |
 | Tool registration rejects missing schema, timeout, or side effect | Verified | `TestNewDriver_RejectsBadTools` |
@@ -49,7 +49,7 @@ exists, reference given), **Verified** (a named test exercises it).
 | Capability | Status | Reference |
 |---|---|---|
 | Transport classification: a timeout or a body cut off mid-read is returned bare so the caller charges it as ambiguous; caller cancellation, a host that does not resolve, a certificate failure, and a malformed URL are permanent; every other transport error is transient | Verified | `providers`, `TestClassifyTransport_EveryClass`, `TestClassifyTransport_RealRoundTrips` |
-| HTTP status classification: 408, 429, 529, and 5xx are transient, other non-2xx permanent, both carrying the status and a bounded body excerpt | Verified | `TestClassifyStatus_RetryableAndPermanent`, `TestClassifyStatus_BodyExcerptIsBounded` |
+| HTTP status classification: 408, 409, 425, 429, 529, and every other 5xx are transient, other non-2xx permanent, both carrying the status and a bounded body excerpt | Verified | `TestClassifyStatus_RetryableAndPermanent`, `TestClassifyStatus_BodyExcerptIsBounded` |
 | An SDK adapter with only a status code and an error classifies the same way | Verified | `TestClassifyAPIError_StatusOnlyAdapter` |
 | Provider response bodies are read under a 16 MiB bound, and a larger one is refused by name | Verified | `TestReadBody_RefusesABodyOverTheLimit`, `TestClient_LimitsBodiesAndNeverSharesTheDefault` |
 | Tool-use ids synthesized for providers that omit them | Verified | `TestSynthesizeToolUseID_UniquePerIndex` |
@@ -133,7 +133,7 @@ exists, reference given), **Verified** (a named test exercises it).
 | The exactly-one pending-approval rule | Verified | `ExamplePendingApproval` |
 | A pinned MCP tool with no operator rule left unregistered, over in-memory transports with no server | Verified | `ExampleLoad` |
 | Pre-1.0 compatibility promise: additive within a minor, release notes name what a minor bump changes, nested modules versioned independently and each naming its core version, forward-only migrations, recordings stable across core versions | Implemented | `README.md`, `docs/roadmap.md` |
-| The core module builds and tests on Go 1.26 and 1.27, with `GOTOOLCHAIN=local` so the older job cannot switch toolchains. Every nested module's `go` line is 1.26, and each requires the core release v0.2.1 | Implemented | `.github/workflows/ci.yml`, the comment above each nested `go` directive |
+| The core module builds and tests on Go 1.26 and 1.27, with `GOTOOLCHAIN=local` so the older job cannot switch toolchains. Every nested module's `go` line is 1.26, and each requires the core release v0.3.0 | Implemented | `.github/workflows/ci.yml`, the comment above each nested `go` directive |
 | Public roadmap issue, pinned, mirroring the item list with a status per item | Implemented | [#3](https://github.com/joeylking/agent-runtime/issues/3) |
 | CI lint job: gofmt, staticcheck and govulncheck at pinned versions, and a core `go mod tidy -diff` check | Implemented | `.github/workflows/ci.yml` |
 | Release check builds each nested module against the versions it pins, with no workspace, on every tag and weekly | Implemented | `.github/workflows/release-check.yml` |
@@ -147,9 +147,9 @@ exists, reference given), **Verified** (a named test exercises it).
 |---|---|---|
 | Run and step status transitions are compare-and-set inside their transaction; of two concurrent resumes one executes the approved request and the other gets `ErrRunState` | Verified | `store.go` `transition`, `TestResume_ConcurrentResumeExecutesOnce` |
 | An operator cancel is not overwritten by a live loop: its next write fails and it returns the cancelled run | Verified | `TestCancel_LiveLoopStopsAtItsNextWrite` |
-| One policy-outcome dispatch for the loop and resume; an unknown or empty outcome fails the run as `internal_error` in both | Verified | `driver.go` `apply`, `TestPolicy_UnknownOutcomeFailsLoopAndResume` |
+| One policy-outcome dispatch for the loop and resume; an unknown or empty outcome fails the run as `internal_error` in both | Verified | `loop.go` `apply`, `TestPolicy_UnknownOutcomeFailsLoopAndResume` |
 | Resume evaluates policy while the run is still WAITING and commits the resume, the resume-time `step.policy`, and the tool start together | Verified | `TestResume_CrashAfterResumeKeepsTheApprovedRequest` |
-| A step and the run it ends commit in one transaction: complete, fail, terminal tool, tool abort, policy abort, limits, loop detection | Verified | `driver.go` `settle`, `TestDriver_TerminalToolCommitsWithTheRun` |
+| A step and the run it ends commit in one transaction: complete, fail, terminal tool, tool abort, policy abort, limits, loop detection | Verified | `step.go` `settle`, `TestDriver_TerminalToolCommitsWithTheRun` |
 | Every path reads the clock as often and in the order it always has, because a deterministic consumer keys its own records on that sequence | Verified | `TestDriver_ClockReadingsAreStable` |
 | A panic inside a transaction rolls it back and propagates | Verified | `TestStore_PanicInTransactionRollsBack` |
 | Consumer JSON is checked where it enters: arguments or a result that are not usable JSON (malformed, invalid UTF-8, a repeated key) become an `invalid_decision` with the bytes kept as a string; tool content becomes a `tool_error` keeping the bytes; an unusable capability or presentation fails the run as `internal_error` without executing | Verified | `hash.go` `checkJSON`, `TestCheckJSON_RejectsWhatWouldHashLossily`, `TestDriver_UnusableJSONDecisionsAreRecordedInvalid`, `TestDriver_UnusableToolContentIsToolError`, `TestDriver_UnusablePolicyJSONFailsWithoutExecuting` |

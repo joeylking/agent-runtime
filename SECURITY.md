@@ -70,8 +70,13 @@ cannot influence.
   operator saw is what they decide, even against a concurrent writer.
   `-approval <id>`, `-yes`, or `y` typed at an interactive prompt is
   required before anything is decided; run non-interactively with none of
-  those, the command refuses. `-by`/`decided_by` is a label recorded
-  exactly as given, never verified.
+  those, the command refuses rather than prompt. Stdin is a terminal only
+  when it is a character device that is not `/dev/null`, by identity
+  (`os.SameFile`) rather than by path, so redirecting it from `/dev/null`
+  is treated as no terminal, not as a prompt that reads nothing and
+  declines; reaching the end of input before anything was typed at a real
+  terminal refuses the same way, rather than being read as a typed "n".
+  `-by`/`decided_by` is a label recorded exactly as given, never verified.
 
 ### Limits and accounting
 

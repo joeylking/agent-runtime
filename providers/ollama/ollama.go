@@ -8,12 +8,12 @@
 // caller owns retries, so every attempt is recorded; a timeout, and a read
 // that fails after the status line (the connection was lost mid-response, so
 // the request may have been served), are both returned bare so that caller
-// charges them as ambiguous. A 429 or a 5xx becomes a providers.StatusError
-// wrapped in agentrt.TransientError, which the caller retries; any other
-// non-2xx is the StatusError alone, which ends the run. A reply the server
-// served but that cannot be used, because it does not decode or carries an
-// error field, is an agentrt.ServedError with whatever usage the reply
-// reported.
+// charges them as ambiguous. A 408, 409, 425, 429, or 5xx becomes a
+// providers.StatusError wrapped in agentrt.TransientError, which the
+// caller retries; any other non-2xx is the StatusError alone, which ends
+// the run. A reply the server served but that cannot be used, because it
+// does not decode or carries an error field, is an agentrt.ServedError
+// with whatever usage the reply reported.
 //
 // A reply whose token counts are negative, do not fit, or are not integers
 // is an agentrt.ServedError with zero usage naming the count, so the

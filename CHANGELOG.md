@@ -13,6 +13,63 @@ entry names a specific module only when the change is not in the core.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`approve </dev/null` prompted, read nothing, and declined at exit 1**
+  instead of refusing at exit 2, because `/dev/null` is a character device
+  and `isTerminal` treated every character device as a terminal. Stdin is
+  now a terminal only when it is a character device that is not
+  `/dev/null`, compared by identity (`os.SameFile`), not by path; and
+  reaching the end of input before anything was typed at a real terminal
+  now refuses the same way, rather than being recorded as a typed "n".
+  `SECURITY.md` is corrected to match.
+- **`cancel` on a run that was already finished reported "approval is
+  already decided"**, because `view.wrapDecideErr` matched the core's
+  errors by searching their message for words like "already" instead of
+  matching the sentinels the core exports (`agentrt.ErrRunState`,
+  `agentrt.ErrNotPending`) with `errors.Is`. Matching is now by sentinel;
+  `Cancel`'s case wraps the new `view.ErrRunFinished` instead of
+  `ErrApprovalDecided`, and names the run's actual status.
+- **`show`'s nested JSON values printed with uneven indentation**: a
+  value's opening brace landed two columns left of its matching closing
+  brace, because `printOneField` gave `json.MarshalIndent` its own prefix,
+  which `json.MarshalIndent` does not apply to a value's first line.
+  Nesting now indents consistently at every depth.
+- **`agentrt`'s usage text did not mention `-limit` or `-offset` for
+  `runs`, `show`, or `events`**, though all three have taken them since
+  v0.3.0. It now lists them with their defaults.
+- Package docs for `providers/ollama`, `providers/openai`, and
+  `providers/anthropic`, and a row of `docs/status.md`, said only 429 and
+  5xx are transient; `providers.Transient` (and the adapters' own retries)
+  also treat 408, 409, and 425 as transient, matching `CHANGELOG.md`'s own
+  v0.3.0 entry. `providers/anthropic`'s `StrictSubset` doc comment said
+  `minItems` is clamped to 0 or 1; the code removes it outright above 1,
+  leaving 0 and 1 as given.
+- `docs/status.md`: three rows pointed at `driver.go` for the step loop,
+  `apply`, and `settle`, which moved to `loop.go` and `step.go` in
+  v0.3.0's split; and one said the nested modules require core v0.2.1,
+  when they require v0.3.0. Every file and symbol reference in the
+  document was checked against the source it names.
+
+### Changed
+
+- **README.md's Compatibility section and `CHANGELOG.md`'s v0.3.0 entry
+  named two cases where v0.3.0 changed what `render` produces, and so
+  breaks a recording's replay match: a reply with more than one tool use,
+  and a tool-less reply over 500 bytes. There is a third, omitted from
+  both: the recent-results window now counts rendered steps rather than
+  raw steps, so a run with a step interrupted while deciding inside the
+  window renders differently.** README.md now states all three; the
+  v0.3.0 section gets the third with a note that it was added after
+  release, since that section is already published and is not rewritten
+  silently.
+- `docs/roadmap.md` no longer says the two consumers "run on v0.1", a
+  version that would go stale as they move to later releases; it says
+  they run on "the current release." Its paragraph on recordings staying
+  valid across core versions now carries the same qualification as
+  README.md's Compatibility section: only as long as a release has not
+  changed what `render` produces for a step in them.
+
 ## [v0.3.0] - 2026-10-01
 
 Nested modules `mcp`, `providers/ollama`, `providers/anthropic`, and
@@ -332,7 +389,10 @@ meet on the first run. Before upgrading:
   twelve schemas is unchanged. Cache writes are priced at the rate of
   their class, and the price table is dated 2026-09-29.
 - The recent-results window in `render` counts rendered steps rather than
-  raw steps.
+  raw steps. A run with a step interrupted while deciding inside the
+  window renders differently from v0.2.1, and a recording made through
+  `render` across such a step stops matching (added after release:
+  omitted from the release notes).
 - `driver.go` is split into `loop.go`, `step.go`, `approval.go`, and
   `resume.go` as pure moves.
 - CI runs weekly as well as on push, cancels superseded branch runs,
