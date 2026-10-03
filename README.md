@@ -115,7 +115,7 @@ kit has one. This library exists for the controls around the loop.
 
 ## Status
 
-The current release is v0.3.1. Both consumers run on v0.3.0, and v0.3.1
+The current release is v0.3.2. Both consumers run on v0.3.1, and v0.3.2
 only adds to it. The runtime includes the packages that both consumers had
 written separately, an adapter that puts the tools of any MCP server behind
 the policy, and the groundwork for outside contributors. These are items 1,

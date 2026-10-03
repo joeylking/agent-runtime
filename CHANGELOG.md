@@ -13,6 +13,11 @@ entry names a specific module only when the change is not in the core.
 
 ## [Unreleased]
 
+## [v0.3.2] - 2026-10-03
+
+Nested module `bench` released at v0.1.1; `export/otel` v0.1.0 and the
+v0.2.0 modules are unaffected.
+
 Core v0.3.2 and `bench/v0.1.1`, both additive patches found while
 repo-steward and casework adopted v0.3.1. Nothing a v0.3.1 consumer calls
 changes, and no migration or operator step is needed.
@@ -661,7 +666,8 @@ step, failure, loop, call, token, cost, and time limits, an accounting
 model caller with retries, record and replay models, and an audit log
 written with the state. See `docs/architecture.md` and `docs/status.md`.
 
-[Unreleased]: https://github.com/joeylking/agent-runtime/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/joeylking/agent-runtime/compare/v0.3.2...HEAD
+[v0.3.2]: https://github.com/joeylking/agent-runtime/compare/v0.3.1...v0.3.2
 [v0.3.1]: https://github.com/joeylking/agent-runtime/compare/v0.3.0...v0.3.1
 [v0.3.0]: https://github.com/joeylking/agent-runtime/compare/v0.2.1...v0.3.0
 [v0.2.1]: https://github.com/joeylking/agent-runtime/releases/tag/v0.2.1

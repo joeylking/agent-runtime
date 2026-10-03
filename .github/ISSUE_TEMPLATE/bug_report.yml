@@ -21,7 +21,7 @@ body:
         output rather than a version number so the form never needs editing
         at release time.
       placeholder: |
-        github.com/joeylking/agent-runtime v0.3.1
+        github.com/joeylking/agent-runtime v0.3.2
         github.com/joeylking/agent-runtime/mcp v0.2.0
       render: text
     validations:
