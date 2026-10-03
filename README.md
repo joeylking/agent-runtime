@@ -154,6 +154,9 @@ Where to read more:
 - [docs/status.md](docs/status.md): every control with the test that
   verifies it.
 - [docs/decisions](docs/decisions): why it is built this way.
+- [docs/essays](docs/essays): the ideas written out for someone deciding
+  whether to trust an agent with a real system, each claim linked to the
+  test behind it.
 - [CHANGELOG.md](CHANGELOG.md): what each release changed and what a
   consumer has to do about it.
 - [Wiki](https://github.com/joeylking/agent-runtime/wiki): the same material

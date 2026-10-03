@@ -227,6 +227,10 @@ approvals, ambiguous-attempt accounting, policy outside the model, and
 "the tables are the state, the events are the explanation". Each links
 to the test that verifies the claim.
 
+**Status.** Six essays published on 2026-10-03 under `docs/essays` and
+on the wiki, each claim linked to the test that verifies it. The item
+stays open: new ideas get written up as they are built.
+
 ### 8. Open-source hygiene
 
 `CONTRIBUTING.md`, `SECURITY.md`, issue templates, runnable `Example_`

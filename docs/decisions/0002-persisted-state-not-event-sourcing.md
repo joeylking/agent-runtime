@@ -12,7 +12,9 @@ recovered from the rows, and the consumer reconciles its own journals.
 
 Alternatives: event sourcing with a fold that rebuilds the run.
 
-Tradeoffs: two writes per transition; a completeness test and a
-consistency test keep the audit log honest.
+Tradeoffs: two writes per transition. The tests that keep the audit log
+honest compare the observer's events with the stored ones
+(`TestDriver_CompletesAndPersists`) and run every event type the runtime
+emits from real drivers (`TestFixtures_EmitEveryEventType`).
 
 Revisit when: a consumer needs projections or replay into branches.
