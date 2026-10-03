@@ -148,7 +148,7 @@ the consumer.
 **Done when** repo-steward's `bench summarize` runs on the extracted
 module unchanged, and casework publishes results in the same format.
 
-**Status.** Built in the repository, awaiting release as core v0.3.1
+**Status.** Built in the repository, shipped in core v0.3.1
 with `bench/v0.1.0` and `export/otel/v0.1.0`. The module reproduces
 repo-steward's nine result files and casework's published evaluation
 exactly. The done-when still needs both consumers to adopt it, with a
@@ -171,7 +171,7 @@ decide whether a reference `Agent` belongs in the runtime.
 tests with the kit.
 
 **Status.** Built in the repository as the core package `testkit`,
-awaiting release as core v0.3.1. The examination found no reference `Agent`
+shipped in core v0.3.1. The examination found no reference `Agent`
 worth shipping yet: about ten generic lines remain in each consumer's
 agent, and the generic candidate is casework's raw model-turn table, which
 would be a store table, not an `Agent`. The done-when still needs both
@@ -191,7 +191,7 @@ no other input.
 the consumer.
 
 **Status.** Built in the repository: the core package `export` and the
-nested module `export/otel`, awaiting release as core v0.3.1 and
+nested module `export/otel`, shipped in core v0.3.1 and
 `export/otel/v0.1.0`. Done: a run's trace appeared in a stock
 OpenTelemetry collector on 2026-10-02, with no code in the consumer.
 
