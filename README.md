@@ -115,14 +115,14 @@ kit has one. This library exists for the controls around the loop.
 
 ## Status
 
-The current release is v0.3.0, and both consumers run on it. The runtime
-includes the packages that both consumers had written separately, an adapter that puts the tools of any MCP
-server behind the policy, and the groundwork for outside contributors. These
-are items 1, 2, and 8 of the [roadmap](docs/roadmap.md). Items 3 to 6, the
-evaluation vocabulary, the test kit, event export, and the approval channel,
-are built in the repository and ship in v0.3.1, which is additive only;
-neither consumer has adopted them yet. Item 7, writing up the ideas, is
-ongoing.
+The current release is v0.3.1. Both consumers run on v0.3.0, and v0.3.1
+only adds to it. The runtime includes the packages that both consumers had
+written separately, an adapter that puts the tools of any MCP server behind
+the policy, and the groundwork for outside contributors. These are items 1,
+2, and 8 of the [roadmap](docs/roadmap.md). Items 3 to 6, the evaluation
+vocabulary, the test kit, event export, and the approval channel, shipped in
+v0.3.1; neither consumer has adopted them yet. Item 7, writing up the ideas,
+is ongoing.
 
 v0.3.0 followed an audit and a security review of v0.2.1. It added the lease
 on a run, the database only its owner can use, the pause after an
@@ -141,9 +141,9 @@ The three that matter most:
 The provider adapters and the MCP adapter are separate modules inside this
 repository, tagged with a directory prefix: `providers/ollama/v0.2.0`,
 `providers/anthropic/v0.2.0`, `providers/openai/v0.2.0`, and `mcp/v0.2.0`.
-Each requires core v0.3.0. Two more nested modules, `bench` and `export/otel`,
-are in the repository and will be tagged `bench/v0.1.0` and
-`export/otel/v0.1.0` after v0.3.1.
+Each requires core v0.3.0, which v0.3.1 only adds to. Two more nested
+modules shipped with v0.3.1: `bench/v0.1.0`, which has no requirements at
+all, and `export/otel/v0.1.0`, which requires core v0.3.1.
 
 The API is pre-1.0 and changes when a consumer needs it to.
 
@@ -439,8 +439,8 @@ thing running: the quick start above is its commands.
 
 ## Measuring, testing, watching, and approving from elsewhere
 
-Four additions sit around the loop rather than in it. They are in the
-repository now and ship in v0.3.1, which is not yet tagged.
+Four additions sit around the loop rather than in it. They shipped in
+v0.3.1.
 
 - **Measuring an agent.** `bench` is the vocabulary for scoring an agent that
   acts: each trial lands in exactly one outcome, every count is shown with
