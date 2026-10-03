@@ -5,7 +5,7 @@ module github.com/joeylking/agent-runtime/export/otel
 go 1.26.0
 
 require (
-	github.com/joeylking/agent-runtime v0.3.0
+	github.com/joeylking/agent-runtime v0.3.1
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.47.0
