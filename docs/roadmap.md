@@ -246,5 +246,8 @@ replays passing unchanged. Item 8 shipped in v0.2.1 (core) with the
 nested modules at v0.1.1; it came next because it needed no new code.
 Items 3 through 6 shipped together in core v0.3.1 on 2026-10-02,
 followed by `bench/v0.1.0` and `export/otel/v0.1.0`. Both consumers adopted
-items 3, 4, and 6 on 2026-10-03, so items 1 through 6 and 8 are done. 7
-is continuous.
+items 3, 4, and 6 on 2026-10-03, so items 1 through 6 and 8 are done.
+The first six essays of item 7 were published the same day, in
+`docs/essays` and on the wiki; v0.3.2 and `bench/v0.1.1` collected the
+small additions the consumers' adoption asked for. Item 7 stays open for
+each idea built from here.
