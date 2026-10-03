@@ -446,7 +446,14 @@ func TestFuzz_InvalidForAnEmptyObjectSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(inv) < 7 || !strings.Contains(fmt.Sprint(inv), "unexpected") {
+	// Joined as text: fmt prints a []json.RawMessage as text on Go 1.27
+	// and as decimal bytes on 1.26.
+	var all strings.Builder
+	for _, c := range inv {
+		all.Write(c)
+		all.WriteByte('\n')
+	}
+	if len(inv) < 7 || !strings.Contains(all.String(), "unexpected") {
 		t.Fatalf("%d cases: %s", len(inv), inv)
 	}
 }
