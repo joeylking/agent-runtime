@@ -212,10 +212,10 @@ func (o Operator) Cancel(ctx context.Context, runID, by, note string) error {
 }
 
 // decide records an approval decision. A run that is not waiting fails
-// with ErrRunState; an approval that is not pending with ErrNotPending, and
-// one that has expired with ErrApprovalExpired, which matches it; one whose fields no longer match its hash with
-// ErrApprovalHash; and, when shown is set, one whose hash is not shown with
-// ErrApprovalChanged. The checks are repeated on the row read inside the
+// with ErrRunState; an approval that is not pending with ErrNotPending, or
+// with ErrApprovalExpired, which matches it, when it has expired; one whose
+// fields no longer match its hash with ErrApprovalHash; and, when shown is
+// set, one whose hash is not shown with ErrApprovalChanged. The checks are repeated on the row read inside the
 // deciding transaction, which holds the write lock, and the update is
 // conditional on the hash checked.
 func decide(ctx context.Context, store *Store, obs Observer, clock func() time.Time, runID, approvalID, shown, by, note string, status ApprovalStatus) error {

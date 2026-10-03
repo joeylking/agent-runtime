@@ -49,7 +49,9 @@ it first because its example imports the new core package `export`.
   `export/otel` module.** `export.Follower` delivers a database's events in
   commit order from a cursor, read-only and from a separate process, with a
   JSON Lines sink matching `trace.JSONL`; a persisted cursor makes delivery
-  exactly once across restarts. `export/otel` turns the events into
+  exactly once across clean stops, and a process killed between a sink
+  call and the cursor save redelivers from the saved cursor, so a hard kill
+  is at least once. `export/otel` turns the events into
   OpenTelemetry spans (a run, its steps, each model attempt, each approval
   wait), with ids derived from the run's own, so a restarted exporter or a run
   resumed later continues the same trace. Model-chosen text is truncated and
@@ -58,8 +60,8 @@ it first because its example imports the new core package `export`.
   checked against a stock OpenTelemetry collector.
 - **Approving from a chat bot or a browser: the `approver` and
   `approver/webhook` packages.** `approver.Approver` shows an approval,
-  approves, rejects, or cancels the run, each bound to the hash that was
-  shown, and returns the runtime's typed errors. `approver/webhook` serves it
+  approves or rejects it bound to the hash that was shown, cancels the run,
+  and returns the runtime's typed errors. `approver/webhook` serves it
   over HTTP behind an HMAC signature, a timestamp window, replay refusal, a
   rate limit, and a body bound; every route names one run. It honours expiry
   and renders a sanitised plain-text form for a chat message.

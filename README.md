@@ -468,8 +468,8 @@ go get github.com/joeylking/agent-runtime/bench
 go get github.com/joeylking/agent-runtime/export/otel
 ```
 
-Neither line resolves until the release is tagged. In a workspace of this
-repository they resolve now.
+Both resolve to the released tags. In a workspace of this repository they
+resolve to the tree.
 
 ```go
 // measuring: read result files, print the comparison, refusing mixed commits

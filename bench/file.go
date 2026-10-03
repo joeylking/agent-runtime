@@ -63,7 +63,8 @@ type Trial struct {
 type File struct {
 	Format string `json:"format"`
 	// Commit is the consumer's commit the trials ran at. Empty means
-	// unknown, which Compare treats as a commit of its own.
+	// unknown; Compare treats every unknown as one commit that is not any
+	// named one.
 	Commit    string    `json:"commit,omitempty"`
 	StartedAt time.Time `json:"started_at"`
 	// Options are the harness settings: repo-steward's budget caps,

@@ -83,8 +83,8 @@ type CompareOptions struct {
 
 var (
 	// ErrMixedCommits is returned when the columns come from more than one
-	// commit and CompareOptions.AllowMixedCommits is not set. A file with
-	// no commit counts as a commit of its own.
+	// commit and CompareOptions.AllowMixedCommits is not set. Files with
+	// no commit share one unknown commit, which is not any named one.
 	ErrMixedCommits = errors.New("bench: results from different commits are not comparable")
 	// ErrMixedTaxonomies is returned when the columns were scored by
 	// different outcome sets. No option accepts this.
