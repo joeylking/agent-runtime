@@ -140,9 +140,80 @@ func RejectShown(ctx context.Context, store *Store, obs Observer, runID, approva
 	return decide(ctx, store, obs, time.Now, runID, approvalID, shownHash, by, note, ApprovalRejected)
 }
 
+// ErrApprovalExpired means a decision found the approval expired: its
+// ApprovalTTL had passed by the deciding clock, so the decision expired it
+// and cancelled the run as approval_expired, or it had been expired
+// before. It matches ErrNotPending with errors.Is, which an expired
+// approval has always returned, and the message is unchanged: it names
+// the approval and, for one the decision expired, the expiry time.
+var ErrApprovalExpired error = notPending("agentrt: approval has expired")
+
+// notPending is a sentinel that matches ErrNotPending.
+type notPending string
+
+func (e notPending) Error() string { return string(e) }
+func (e notPending) Unwrap() error { return ErrNotPending }
+
+// expiredError is the error of a decision on an expired approval: its
+// message is the one ErrNotPending always carried, and it matches
+// ErrApprovalExpired and, through it, ErrNotPending.
+type expiredError string
+
+func (e expiredError) Error() string { return string(e) }
+func (e expiredError) Unwrap() error { return ErrApprovalExpired }
+
+// Operator decides approvals and cancels runs without a driver, as the
+// package-level Approve, Reject, ApproveShown, RejectShown, and Cancel do,
+// stamping and judging expiry by Now. A channel's tests set Now to put an
+// approval before or past its expiry; the zero Now is the wall clock, so
+// Operator{Store: s, Observer: o}.Approve is Approve(ctx, s, o, ...).
+type Operator struct {
+	Store    *Store
+	Observer Observer
+	Now      func() time.Time
+}
+
+func (o Operator) clock() func() time.Time {
+	if o.Now == nil {
+		return time.Now
+	}
+	return o.Now
+}
+
+// Approve is the package-level Approve on o's clock.
+func (o Operator) Approve(ctx context.Context, runID, approvalID, by, note string) error {
+	return decide(ctx, o.Store, o.Observer, o.clock(), runID, approvalID, "", by, note, ApprovalApproved)
+}
+
+// Reject is the package-level Reject on o's clock.
+func (o Operator) Reject(ctx context.Context, runID, approvalID, by, note string) error {
+	return decide(ctx, o.Store, o.Observer, o.clock(), runID, approvalID, "", by, note, ApprovalRejected)
+}
+
+// ApproveShown is the package-level ApproveShown on o's clock.
+func (o Operator) ApproveShown(ctx context.Context, runID, approvalID, shownHash, by, note string) error {
+	if shownHash == "" {
+		return fmt.Errorf("%w: approval %s: no hash was shown", ErrApprovalChanged, approvalID)
+	}
+	return decide(ctx, o.Store, o.Observer, o.clock(), runID, approvalID, shownHash, by, note, ApprovalApproved)
+}
+
+// RejectShown is the package-level RejectShown on o's clock.
+func (o Operator) RejectShown(ctx context.Context, runID, approvalID, shownHash, by, note string) error {
+	if shownHash == "" {
+		return fmt.Errorf("%w: approval %s: no hash was shown", ErrApprovalChanged, approvalID)
+	}
+	return decide(ctx, o.Store, o.Observer, o.clock(), runID, approvalID, shownHash, by, note, ApprovalRejected)
+}
+
+// Cancel is the package-level Cancel on o's clock.
+func (o Operator) Cancel(ctx context.Context, runID, by, note string) error {
+	return cancelRun(ctx, o.Store, o.Observer, o.clock(), runID, by, note)
+}
+
 // decide records an approval decision. A run that is not waiting fails
-// with ErrRunState; an approval that is not pending, or has expired, with
-// ErrNotPending; one whose fields no longer match its hash with
+// with ErrRunState; an approval that is not pending with ErrNotPending, and
+// one that has expired with ErrApprovalExpired, which matches it; one whose fields no longer match its hash with
 // ErrApprovalHash; and, when shown is set, one whose hash is not shown with
 // ErrApprovalChanged. The checks are repeated on the row read inside the
 // deciding transaction, which holds the write lock, and the update is
@@ -160,6 +231,9 @@ func decide(ctx context.Context, store *Store, obs Observer, clock func() time.T
 		return err
 	}
 	check := func(a Approval) error {
+		if a.Status == ApprovalExpired {
+			return expiredError(fmt.Sprintf("%v: approval %s is already %s", ErrNotPending, approvalID, a.Status))
+		}
 		if a.Status != ApprovalPending {
 			return fmt.Errorf("%w: approval %s is already %s", ErrNotPending, approvalID, a.Status)
 		}
@@ -176,7 +250,7 @@ func decide(ctx context.Context, store *Store, obs Observer, clock func() time.T
 		if err := expireApproval(ctx, store, obs, run, a, now); err != nil {
 			return err
 		}
-		return fmt.Errorf("%w: approval %s expired at %s", ErrNotPending, approvalID, a.ExpiresAt.Format(time.RFC3339))
+		return expiredError(fmt.Sprintf("%v: approval %s expired at %s", ErrNotPending, approvalID, a.ExpiresAt.Format(time.RFC3339)))
 	}
 	return store.tx(ctx, obs, func(t *txn) error {
 		if err := t.requireStatus(ctx, runID, StatusWaitingForApproval); err != nil {

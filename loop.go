@@ -287,12 +287,7 @@ func (d *Driver) validateDecision(dec Decision) error {
 		if !ok {
 			return fmt.Errorf("unknown tool %q", dec.Tool)
 		}
-		if len(bytes.TrimSpace(dec.Args)) > 0 {
-			if err := checkJSON(dec.Args); err != nil {
-				return fmt.Errorf("arguments are not usable JSON: %w", err)
-			}
-		}
-		return cs.validate(dec.Args)
+		return checkArgs(cs, dec.Args)
 	case "":
 		return errors.New("decision has no kind")
 	case KindTruncated:

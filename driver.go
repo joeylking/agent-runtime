@@ -122,24 +122,15 @@ func NewDriver(cfg Config) (*Driver, error) {
 	}
 	for _, t := range cfg.Tools {
 		spec := t.Spec()
-		if spec.Name == "" {
-			return nil, errors.New("agentrt: tool with empty name")
-		}
-		if _, dup := d.tools[spec.Name]; dup {
+		if _, dup := d.tools[spec.Name]; dup && spec.Name != "" {
 			return nil, fmt.Errorf("agentrt: duplicate tool %q", spec.Name)
 		}
-		if !spec.SideEffect.valid() {
-			return nil, fmt.Errorf("agentrt: tool %q: invalid side effect %q", spec.Name, spec.SideEffect)
-		}
-		if spec.Timeout <= 0 {
-			return nil, fmt.Errorf("agentrt: tool %q: timeout is required", spec.Name)
-		}
-		cs, err := compileSchema(spec.Name, spec.InputSchema)
+		ts, err := CompileTool(spec)
 		if err != nil {
-			return nil, fmt.Errorf("agentrt: %w", err)
+			return nil, err
 		}
 		d.tools[spec.Name] = t
-		d.schemas[spec.Name] = cs
+		d.schemas[spec.Name] = ts.schema
 		d.specs = append(d.specs, spec)
 	}
 	sort.Slice(d.specs, func(i, j int) bool { return d.specs[i].Name < d.specs[j].Name })

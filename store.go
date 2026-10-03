@@ -1196,6 +1196,66 @@ func (s *Store) ListEventsPage(ctx context.Context, runID string, limit, offset 
 	return out, total, rows.Err()
 }
 
+// ListEventsAfter returns at most limit events with Seq greater than seq,
+// in Seq order: of one run when runID is set, of every run interleaved in
+// commit order when it is empty. Each text column is capped at MaxPageText
+// and a time that does not parse reads as zero, as in ListEventsPage. Seq
+// is assigned in the transaction that commits the event, so it rises in
+// commit order across the database and is never reused: the last Seq
+// returned is a cursor a follower resumes after.
+func (s *Store) ListEventsAfter(ctx context.Context, runID string, seq int64, limit int) ([]Event, error) {
+	if err := pageArgs("events", limit, 0); err != nil {
+		return nil, err
+	}
+	query := `SELECT seq, ` + capText("run_id") + `, ` + capText("step_id") + `, ` + capText("at") + `, ` + capText("type") + `, ` + capJSON("payload_json") + ` FROM events WHERE seq > ?`
+	args := []any{seq}
+	if runID != "" {
+		query += ` AND run_id = ?`
+		args = append(args, runID)
+	}
+	rows, err := s.db.QueryContext(ctx, query+` ORDER BY seq LIMIT ?`, append(args, limit)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Event
+	for rows.Next() {
+		pageRow()
+		var e Event
+		var at, payload string
+		if err := rows.Scan(&e.Seq, &e.RunID, &e.StepID, &at, &e.Type, &payload); err != nil {
+			return nil, err
+		}
+		e.At, _ = parseTime(at)
+		e.Payload = json.RawMessage(payload)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ApprovalReason returns the policy's reason for an approval, capped at
+// MaxPageText characters: the Reason of the PolicyDecision that paused the
+// run on it, as its approval.requested event recorded it. The approval
+// row has no reason of its own. The step's recorded policy agrees while
+// the approval is pending; once it is granted and resumed, the step holds
+// the policy's decision at resume, and this still returns the one that
+// asked. ErrNotFound when the run has no such approval; empty when the
+// approval has no approval.requested event.
+func (s *Store) ApprovalReason(ctx context.Context, runID, approvalID string) (string, error) {
+	var reason sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT (SELECT `+extract("e.payload_json", "$.reason")+` FROM events e
+		WHERE e.run_id = a.run_id AND e.step_id = a.step_id AND e.type = ? AND CASE WHEN json_valid(e.payload_json) THEN json_extract(e.payload_json, '$.approval_id') END = a.id
+		ORDER BY e.seq LIMIT 1)
+		FROM approvals a WHERE a.run_id = ? AND a.id = ?`, EventApprovalRequested, runID, approvalID).Scan(&reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	return reason.String, nil
+}
+
 // PendingApprovalIDsOf is PendingApprovalIDs for the named runs only, with
 // at most max ids per run, each capped at MaxPageText: what a page of runs
 // needs to say which approval each is waiting on, bounded by the page.
@@ -1336,6 +1396,16 @@ func (t *txn) takeLease(ctx context.Context, id string, now time.Time, from ...R
 		return "", time.Time{}, err
 	}
 	return owner, until, nil
+}
+
+// Lease returns the lease stored on a run: the owner of the driver that
+// holds it and when it expires by that driver's wall clock. A run nobody
+// holds, paused, finished, or released by the call that executed it, has
+// an empty owner and a zero time. A lease whose time has passed is
+// stale, not released: Resume takes such a run over. ErrNotFound when
+// there is no such run.
+func (s *Store) Lease(ctx context.Context, runID string) (owner string, until time.Time, err error) {
+	return s.lease(ctx, runID)
 }
 
 // lease reads a run's lease outside a transaction.
