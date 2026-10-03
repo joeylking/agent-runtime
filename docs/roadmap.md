@@ -208,8 +208,7 @@ approval's presentation JSON, verifies the caller, and honours expiry.
 the reference implementation and the hash still binds.
 
 **Status.** Built in the repository as the core packages `approver` and
-`approver/webhook`, with `examples/approver`, awaiting release as core
-v0.3.1. Proven against the real repo-steward binary: a publication approval
+`approver/webhook`, with `examples/approver`, shipped in core v0.3.1. Proven against the real repo-steward binary: a publication approval
 was granted through the webhook and the hash still bound on resume. The
 done-when still needs adoption in both consumers.
 
@@ -235,7 +234,7 @@ Items 1 and 2 shipped in v0.2.0 (core) with the nested modules at
 v0.1.0, and both consumers deleted their copies with their recorded
 replays passing unchanged. Item 8 shipped in v0.2.1 (core) with the
 nested modules at v0.1.1; it came next because it needed no new code.
-Items 3 through 6 are built in the repository and ship together as core
-v0.3.1, followed by `bench/v0.1.0` and `export/otel/v0.1.0`. Item 5 is
-done; items 3, 4, and 6 wait on adoption in both consumers. 7 is
+Items 3 through 6 shipped together in core v0.3.1 on 2026-10-02,
+followed by `bench/v0.1.0` and `export/otel/v0.1.0`. Item 5 is done;
+items 3, 4, and 6 wait on adoption in both consumers. 7 is
 continuous.
