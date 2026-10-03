@@ -21,14 +21,15 @@
 // answers 202: the run stays waiting until its owner resumes it. reject
 // and cancel answer 200 with the run cancelled. Errors are JSON,
 // {"error": text, "code": name}: 400 for a body that is not a decision,
-// 401 for a request that does not verify, 404 for a run or approval that
-// does not exist under the run named, or any other route or method, 409
-// approval_changed when the stored approval is not the one
+// including one with no hash or no identity, which never reaches the
+// Approver; 401 for a request that does not verify; 404 for a run or
+// approval that does not exist under the run named, or any other route or
+// method; 409 approval_changed when the stored approval is not the one
 // shown, 409 not_pending when it is already decided, 409 run_not_waiting
 // (run_finished for cancel) when the run is in another state, 409
-// approval_hash when the stored row no longer matches its own hash, 410
-// expired when the approval's expiry has passed, 413 for a body over
-// Config.MaxBody, and 429 when Config.Rate is exceeded.
+// approval_hash when the stored row no longer matches its own hash; 410
+// expired when the approval's expiry has passed; 413 for a body over
+// Config.MaxBody; and 429 when Config.Rate is exceeded.
 //
 // # Verification
 //

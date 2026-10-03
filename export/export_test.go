@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -442,3 +443,44 @@ func TestJSONL_MatchesTrace(t *testing.T) {
 type failWriter struct{}
 
 func (failWriter) Write([]byte) (int, error) { return 0, errors.New("closed") }
+
+// A follower that dies without returning, as a killed process does,
+// saves nothing for the page it was delivering: the next follower on the
+// same cursor delivers that page's events again. Delivery is at least
+// once across a hard kill, and the redelivery stops at the page.
+func TestFollower_AtLeastOnceAfterAHardKill(t *testing.T) {
+	dir := t.TempDir()
+	store := openStore(t, filepath.Join(dir, "runs.db"))
+	cursor := export.FileCursor{Path: filepath.Join(dir, "cursor")}
+	runScripted(t, store, 3, `{}`)
+	ctx := context.Background()
+	const page = 4
+	var first collect
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = (&export.Follower{Store: store, Cursor: cursor, Once: true, PageSize: page}).Follow(ctx, func(e agentrt.Event) error {
+			if len(first.all()) == page+2 {
+				runtime.Goexit() // the process dies inside the second page
+			}
+			return first.sink(e)
+		})
+	}()
+	<-done
+	saved, err := cursor.Load(ctx)
+	if err != nil || saved != first.all()[page-1].Seq {
+		t.Fatalf("cursor %d, %v; want the first page's last, %d", saved, err, first.all()[page-1].Seq)
+	}
+	var second collect
+	if err := (&export.Follower{Store: store, Cursor: cursor, Once: true, PageSize: page}).Follow(ctx, second.sink); err != nil {
+		t.Fatal(err)
+	}
+	again := first.all()[page:]
+	if len(again) != 2 || len(second.all()) < 2 || fmt.Sprint(seqs(second.all()[:2])) != fmt.Sprint(seqs(again)) {
+		t.Fatalf("delivered after the kill %v, then %v; want %v delivered again", seqs(again), seqs(second.all()), seqs(again))
+	}
+	all, _ := store.ListEventsAfter(ctx, "", 0, 1000)
+	if got := seqs(append(first.all()[:page], second.all()...)); fmt.Sprint(got) != fmt.Sprint(seqs(all)) {
+		t.Fatalf("delivered %v, store has %v", got, seqs(all))
+	}
+}

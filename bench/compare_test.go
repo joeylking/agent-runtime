@@ -113,3 +113,43 @@ func TestCompare_ProvenanceCarriesOptionsAndNotes(t *testing.T) {
 		t.Errorf("provenance:\n%s", md)
 	}
 }
+
+// Repetitions that reached different states are spelled out in the means
+// table as the outcome is, never shown as one of them.
+func TestCompare_MeansSpellOutMixedReachedStates(t *testing.T) {
+	f := column("aaa", start, "m1",
+		Trial{Scenario: "S3", Repeat: 1, Expect: "proposal", Reached: "proposal_prepared", Outcome: "completed"},
+		Trial{Scenario: "S3", Repeat: 2, Expect: "proposal", Reached: "limit_exhausted", Outcome: "failed"},
+		Trial{Scenario: "S4", Repeat: 1, Expect: "proposal", Reached: "limit_exhausted", Outcome: "failed"},
+		Trial{Scenario: "S4", Repeat: 2, Expect: "proposal", Outcome: "failed"},
+		Trial{Scenario: "S5", Repeat: 1, Expect: "refusal", Reached: "blocked", Outcome: "correct_refusal"},
+		Trial{Scenario: "S5", Repeat: 2, Expect: "refusal", Reached: "blocked", Outcome: "correct_refusal"},
+	)
+	md, err := Compare(Latest([]*File{f}), CompareOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"| S3 | model m1 @ aaa | mixed: `completed`×1, `failed`×1 | mixed: limit_exhausted×1, proposal_prepared×1 |",
+		"| S4 | model m1 @ aaa | `failed` | mixed: limit_exhausted×1, —×1 |",
+		"| S5 | model m1 @ aaa | `correct_refusal` | blocked |",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("missing %q in\n%s", want, md)
+		}
+	}
+}
+
+// Files that all lack a commit share one unknown commit: they compare
+// without AllowMixedCommits, and the output says no commit was recorded.
+func TestCompare_UnknownCommitsAreOneCommit(t *testing.T) {
+	a := column("", start, "m1", Trial{Scenario: "S1", Repeat: 1, Outcome: "failed", Expect: "proposal"})
+	b := column("", start, "m2", Trial{Scenario: "S1", Repeat: 1, Outcome: "failed", Expect: "proposal"})
+	md, err := Compare(Latest([]*File{a, b}), CompareOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(md, "not comparable") || !strings.Contains(md, "| model m1 | no commit recorded |") || !strings.Contains(md, "model m2 @ no commit recorded") {
+		t.Fatalf("unknown commits:\n%s", md)
+	}
+}

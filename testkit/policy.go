@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"text/tabwriter"
+	"time"
 
 	agentrt "github.com/joeylking/agent-runtime"
 )
@@ -106,6 +107,9 @@ func CheckPolicy(t testing.TB, p agentrt.Policy, tools []agentrt.Tool, cases []P
 // is class, over f.Count generated arguments per such tool that pass the
 // runtime's validation, in each of views (the empty view when none are
 // given). A class with no tool fails: the assertion would hold of nothing.
+// A consumer that has no tool of the class, and asserts that its policy
+// never allows one, adds StandIn(name, class) to tools: a tool the policy
+// has never heard of, which it must answer for all the same.
 func Never(t testing.TB, p agentrt.Policy, tools []agentrt.Tool, class agentrt.SideEffect, outcome agentrt.PolicyOutcome, f Fuzz, views ...agentrt.RunView) {
 	t.Helper()
 	if len(views) == 0 {
@@ -148,6 +152,23 @@ func Never(t testing.TB, p agentrt.Policy, tools []agentrt.Tool, class agentrt.S
 	if !found {
 		t.Errorf("testkit: no tool has side effect %s", class)
 	}
+}
+
+// StandIn is a tool of side effect class for a tool set that has none,
+// as Never needs: its schema is any JSON object, and a call returns the
+// fixed result {"stand_in":name} without doing anything. In a Scenario its
+// calls are recorded in Result.Calls, as every tool's are.
+func StandIn(name string, class agentrt.SideEffect) agentrt.Tool {
+	return standIn{agentrt.ToolSpec{Name: name, Description: "stand-in " + string(class) + " tool " + name + "; it does nothing", InputSchema: []byte(`{"type":"object"}`), SideEffect: class, Timeout: time.Second}}
+}
+
+type standIn struct{ spec agentrt.ToolSpec }
+
+func (s standIn) Spec() agentrt.ToolSpec { return s.spec }
+
+func (s standIn) Call(context.Context, agentrt.ToolCall) (agentrt.ToolResult, error) {
+	content, err := json.Marshal(map[string]string{"stand_in": s.spec.Name})
+	return agentrt.ToolResult{Content: content, Summary: "stand-in " + s.spec.Name}, err
 }
 
 // probe is one request to put through the runtime's validation.

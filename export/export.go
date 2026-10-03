@@ -154,11 +154,17 @@ type Follower struct {
 
 // Follow reads events after the cursor and calls sink for each, in Seq
 // order, until ctx is done, sink fails, or, with Once, nothing more is
-// committed. The cursor is saved after each page and before returning, so
-// a follower stopped by its context and started again does not deliver an
-// event twice; a process killed between a sink call and the save that
-// follows it delivers again from the saved cursor, so a sink that must not
-// act twice keys on Seq. Follow returns ctx.Err() when ctx ends it.
+// committed. Follow returns ctx.Err() when ctx ends it.
+//
+// The cursor is saved after each page and before Follow returns, so
+// delivery is exactly once across stops that return: a follower stopped
+// by its context, by a sink error, or by Once, and started again on the
+// same cursor, delivers each event once (the event a sink refused is
+// delivered again, since it was never delivered). It is at least once
+// after a hard kill: a process that dies between a sink call and the save
+// that follows it, or whose save fails, starts again from the cursor last
+// saved and delivers again what it delivered since, at most one page of
+// PageSize events. A sink that must not act twice keys on Seq.
 func (f *Follower) Follow(ctx context.Context, sink Sink) error {
 	if f.Store == nil {
 		return errors.New("export: Follower.Store is nil")

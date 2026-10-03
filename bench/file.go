@@ -63,8 +63,11 @@ type Trial struct {
 type File struct {
 	Format string `json:"format"`
 	// Commit is the consumer's commit the trials ran at. Empty means
-	// unknown; Compare treats every unknown as one commit that is not any
-	// named one.
+	// unknown. Compare treats every unknown as one commit that is not any
+	// named one: files that all lack a commit are compared without
+	// CompareOptions.AllowMixedCommits even if they ran at different
+	// commits, a file without one beside a file with one needs it, and the
+	// output names the unknown commit "no commit recorded".
 	Commit    string    `json:"commit,omitempty"`
 	StartedAt time.Time `json:"started_at"`
 	// Options are the harness settings: repo-steward's budget caps,

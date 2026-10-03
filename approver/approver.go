@@ -48,8 +48,12 @@ type Pending struct {
 
 // Decision is what a channel supplies to decide an approval. Hash is the
 // hash of the approval as it was shown, and the decision is refused with
-// agentrt.ErrApprovalChanged if the stored approval differs from it. By is
-// an identity label, recorded as given.
+// agentrt.ErrApprovalChanged if the stored approval differs from it. An
+// empty Hash differs from every stored hash, so Local refuses it with
+// agentrt.ErrApprovalChanged, not ErrDecision, and nothing is decided;
+// approver/webhook refuses a body without one before it reaches the
+// Approver, as 400 bad_request. By is an identity label, recorded as
+// given; an empty one is ErrDecision.
 type Decision struct {
 	RunID      string `json:"run_id"`
 	ApprovalID string `json:"approval_id"`
@@ -83,6 +87,19 @@ type Approver interface {
 	Cancel(ctx context.Context, runID, by, note string) error
 }
 
+// RunReader reads the run a channel is about to decide or cancel, so it
+// can show the run without opening the store itself. It is separate from
+// Approver, which it does not change: a channel that needs it asserts it,
+// or holds a *Local, which implements both.
+type RunReader interface {
+	// Run returns the run as a front end reads one it may not trust:
+	// every text column capped at agentrt.MaxPageText
+	// (agentrt.Store.GetRunCapped), with Goal, ReasonDetail, and Result
+	// then bounded as an approval's fields are (view.BoundValue,
+	// view.BoundRaw). agentrt.ErrNotFound for a run that does not exist.
+	Run(ctx context.Context, runID string) (agentrt.Run, error)
+}
+
 // ErrExpired means the approval had passed its expiry when the decision
 // arrived: the runtime expired it and cancelled the run as
 // approval_expired. An error matching it also matches the runtime's
@@ -100,7 +117,12 @@ var ErrDecision = errors.New("approver: decision is incomplete")
 type Local struct {
 	// Now, when set before the Local is used, is the clock that judges
 	// expiry and stamps decisions, for a channel's tests; nil is the wall
-	// clock.
+	// clock. It is not for a consumer's run clock: a deterministic
+	// Config.Now also stamps the run's own records, one reading per
+	// recorded state change, so a decision stamped through the same clock
+	// here takes a reading the run did not, and every later timestamp of
+	// the run shifts. casework's replay recordings stopped matching when
+	// it shared its scenario clock this way; a consumer leaves Now nil.
 	Now   func() time.Time
 	store *agentrt.Store
 	obs   agentrt.Observer
@@ -114,8 +136,14 @@ func New(store *agentrt.Store, obs agentrt.Observer) *Local {
 }
 
 // Open is New over the database at path, opened for writing through
-// agentrt.OpenExisting: it must already exist, at this build's schema
-// version, and must not be a symbolic link. Close closes it.
+// agentrt.OpenExisting, which never creates or migrates a database: the
+// file must already carry this build's schema, as the consumer's own
+// agentrt.OpenStore leaves it, and must not be a symbolic link. A missing
+// file is an error matching fs.ErrNotExist; a database the runtime never
+// opened is refused as "not an agent-runtime database"; one an older
+// build wrote, or a newer build migrated, is agentrt.ErrSchemaVersion,
+// and the older one opens once the consumer's own process, at this
+// build, has opened it with agentrt.OpenStore. Close closes it.
 func Open(path string, obs agentrt.Observer) (*Local, error) {
 	store, err := agentrt.OpenExisting(path, false)
 	if err != nil {
@@ -130,6 +158,18 @@ func (l *Local) Close() error {
 		return nil
 	}
 	return l.store.Close()
+}
+
+// Run implements RunReader.
+func (l *Local) Run(ctx context.Context, runID string) (agentrt.Run, error) {
+	run, err := l.store.GetRunCapped(ctx, runID)
+	if err != nil {
+		return agentrt.Run{}, err
+	}
+	run.Goal = view.BoundValue(run.Goal).(string)
+	run.ReasonDetail = view.BoundValue(run.ReasonDetail).(string)
+	run.Result = view.BoundRaw(run.Result)
+	return run, nil
 }
 
 // Pending implements Approver through agentrt.Store.ListApprovalsPage, so

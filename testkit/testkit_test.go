@@ -207,6 +207,25 @@ func TestRun_ApprovedRequestSurvivesACrashAfterResume(t *testing.T) {
 	}
 }
 
+// Resumes counts the resume after the operator's approval as well as the
+// one after the crash: started, resumed after the approval, crashed,
+// resumed after the crash, which is two resumes and one crash, the
+// arithmetic Result.Resumes documents.
+func TestRun_ResumesCountsTheApprovalAndTheCrash(t *testing.T) {
+	push := newTool("push", agentrt.RemoteMutation)
+	sc := scenario(push)
+	sc.Reconcile = func(context.Context, agentrt.RunView) (agentrt.Reconciliation, error) {
+		return agentrt.Reconciliation{Outcome: agentrt.ReconcileContinue}, nil
+	}
+	res := testkit.Run(t, sc, testkit.Crash{Step: 0, At: testkit.AfterToolEffect})
+	if res.Run.Status != agentrt.StatusCompleted || push.calls.Load() != 1 || len(res.Approvals) != 1 {
+		t.Fatalf("run %s, %d calls, %d approvals: %s", res.Run.Status, push.calls.Load(), len(res.Approvals), res)
+	}
+	if res.Resumes != 2 || len(res.Crashes) != 1 {
+		t.Fatalf("resumes %d crashes %v, want 2 and 1", res.Resumes, res.Crashes)
+	}
+}
+
 // A resume that took the run over and died before pausing leaves the
 // next resume knowing the step was executing: it still waits.
 func TestRun_CrashAfterTakeoverStillWaitsForTheOperator(t *testing.T) {
@@ -334,6 +353,34 @@ func TestNever_HoldsAndFails(t *testing.T) {
 	testkit.Never(r, agentrt.DefaultPolicy(), classTools()[:1], agentrt.Destructive, agentrt.Allow, f)
 	if r.joined() != "testkit: no tool has side effect destructive" {
 		t.Fatalf("errors = %q", r.joined())
+	}
+}
+
+// A tool set with no destructive tool asserts that one is never allowed
+// over a stand-in, which Never evaluates like any tool and a run calls
+// like any tool.
+func TestStandIn_StandsForAClassNoToolHas(t *testing.T) {
+	f := testkit.Fuzz{Count: 8}
+	tools := append(classTools()[:1], testkit.StandIn("delete_path", agentrt.Destructive))
+	testkit.Never(t, agentrt.DefaultPolicy(), tools, agentrt.Destructive, agentrt.Allow, f)
+	r := &recorder{TB: t}
+	testkit.Never(r, agentrt.DefaultPolicy(), []agentrt.Tool{testkit.StandIn("look", agentrt.ReadOnly)}, agentrt.ReadOnly, agentrt.Allow, f)
+	if len(r.errors) != 8 || !strings.Contains(r.errors[0], "look is allow, which a read_only tool must never be") {
+		t.Fatalf("errors = %q", r.joined())
+	}
+
+	look := testkit.StandIn("look", agentrt.ReadOnly)
+	if spec := look.Spec(); spec.Name != "look" || spec.SideEffect != agentrt.ReadOnly {
+		t.Fatalf("spec = %+v", spec)
+	}
+	sc := testkit.Scenario{Tools: []agentrt.Tool{look}, Policy: agentrt.DefaultPolicy(), Goal: "g",
+		Agent: &scripted.Agent{Decisions: []agentrt.Decision{scripted.ToolCall("look", `{"any":["thing"]}`, ""), scripted.Complete(`{}`)}}}
+	res := testkit.Run(t, sc)
+	if res.Run.Status != agentrt.StatusCompleted || len(res.Calls) != 1 || string(res.Calls[0].Args) != `{"any":["thing"]}` {
+		t.Fatalf("calls %+v: %s", res.Calls, res)
+	}
+	if obs := res.Steps[0].Observation; obs == nil || string(obs.Content) != `{"stand_in":"look"}` {
+		t.Fatalf("observation = %+v", obs)
 	}
 }
 

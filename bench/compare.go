@@ -301,8 +301,8 @@ func matrixCell(group []Trial) string {
 }
 
 // means is one row per scenario and column with every number averaged
-// over the judged repetitions, and the outcome marked mixed when they
-// disagreed.
+// over the judged repetitions, and the outcome and the reached state each
+// marked mixed when they disagreed.
 func means(b *strings.Builder, cols []Column) {
 	b.WriteString("Means across repetitions:\n\n| Scenario | Column | Outcome | Reached | Steps | Tool calls | Policy denials | Model calls | Tokens in/out | Cost (USD) | Wall |\n|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, id := range scenarios(cols) {
@@ -345,7 +345,7 @@ func meanCells(id, col string, tax Taxonomy, group []Trial) []string {
 	}
 	return []string{
 		id, col, outcome,
-		orDash(mostFrequent(judged, func(t Trial) string { return t.Reached })),
+		reachedCell(judged),
 		num(steps / n), num(tools / n), num(denials / n), num(calls / n),
 		num(in/n) + "/" + num(out/n),
 		fmt.Sprintf("%.4f", cost/n/1e6),
@@ -372,24 +372,26 @@ func outcomeCell(tax Taxonomy, judged []Trial) string {
 	return "mixed: " + strings.Join(parts, ", ")
 }
 
-// mostFrequent is the commonest value, the first in name order on a tie.
-func mostFrequent(group []Trial, f func(Trial) string) string {
+// reachedCell is the reached state when the repetitions agreed and the
+// spread, in name order, when they did not, as outcomeCell spells it.
+func reachedCell(judged []Trial) string {
 	counts := map[string]int{}
-	for _, t := range group {
-		counts[f(t)]++
+	for _, t := range judged {
+		counts[orDash(t.Reached)]++
+	}
+	if len(counts) == 1 {
+		return orDash(judged[0].Reached)
 	}
 	keys := make([]string, 0, len(counts))
 	for k := range counts {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	best, bestN := "", -1
-	for _, k := range keys {
-		if counts[k] > bestN {
-			best, bestN = k, counts[k]
-		}
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = fmt.Sprintf("%s×%d", k, counts[k])
 	}
-	return best
+	return "mixed: " + strings.Join(parts, ", ")
 }
 
 func provenance(b *strings.Builder, cols []Column) {

@@ -147,9 +147,16 @@ type Result struct {
 	// Inputs is what the Agent was handed at every decision across every
 	// Driver, in order, for rendering checks.
 	Inputs []agentrt.StepInput
-	// Crashes are the crashes that fired, in order; Resumes counts the
-	// Drivers after the first.
+	// Crashes are the crashes that fired, in order.
 	Crashes []Crash
+	// Resumes counts every Driver that ran the run after the first, which
+	// started it: the resume after an operator's approval as well as the
+	// resume after a crash. A resume refused while a crashed Driver's
+	// lease is live, and the Driver that records the operator's decision,
+	// are not counted. A run that pauses for one approval and crashes once
+	// after it is resumed is started (Driver 1), resumed after the
+	// approval (Driver 2, which crashes), and resumed after the crash
+	// (Driver 3): Resumes is 3 - 1 = 2, with one Crash.
 	Resumes int
 }
 

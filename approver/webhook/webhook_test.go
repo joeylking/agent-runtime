@@ -251,6 +251,24 @@ func TestHandler_StaleHashIsRefusedAndNothingDecided(t *testing.T) {
 	}
 }
 
+// A decision without a hash is refused here, as 400 bad_request, before
+// it reaches the Approver; approver.Local itself refuses it as changed.
+func TestHandler_MissingHashIsABadRequest(t *testing.T) {
+	s := newScene(t, "t")
+	res, out := s.do("POST", s.approvePath(), s.decision("", "joey"))
+	s.requireStatus(res, out, 400, "bad_request")
+	if a := s.approval(); a.Status != agentrt.ApprovalPending {
+		t.Fatalf("approval = %s", a.Status)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range s.events {
+		if e.Type == webhook.EventDecision {
+			t.Fatalf("a refused body reached the Approver: %s", e.Payload)
+		}
+	}
+}
+
 // The approval changes under the operator between the show and the
 // decision: the stored hash moves, and the decision bound to the shown
 // hash is refused inside the deciding transaction.

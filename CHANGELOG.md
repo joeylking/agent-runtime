@@ -13,6 +13,43 @@ entry names a specific module only when the change is not in the core.
 
 ## [Unreleased]
 
+Core v0.3.2 and `bench/v0.1.1`, both additive patches found while
+repo-steward and casework adopted v0.3.1. Nothing a v0.3.1 consumer calls
+changes, and no migration or operator step is needed.
+
+### Added
+
+- **A channel can show the run it is about to cancel without opening the
+  store.** `approver.RunReader`, implemented by `*approver.Local`, returns a
+  run read as a front end reads one it may not trust: text capped, and the
+  goal, reason detail, and result bounded as an approval's fields are.
+  `approver.Approver` is unchanged; a channel holding a `*Local` has both.
+- **A policy test can assert a side-effect class the consumer has no tool
+  of.** `testkit.StandIn(name, class)` is an open-schema tool of that class
+  that returns a fixed result; `testkit.Never`, which still fails for a class
+  no tool has, says to add one.
+
+### Fixed
+
+- **`bench`: the means table no longer shows one reached state for
+  repetitions that ended differently.** A scenario whose repetitions reached
+  `blocked` and `proposal_prepared` read as `blocked` beside a mixed
+  outcome; it now reads `mixed: blocked×1, proposal_prepared×1`, as the
+  outcome cell spells a mixed outcome. Every other byte of a comparison is
+  unchanged, pinned by a golden file over both consumers' fixtures.
+- **Doc comments now say what the code does where the adoption found them
+  unclear.** `approver.Open` names what a consumer sees for a database
+  without this build's schema (a missing file, a database the runtime never
+  opened, `ErrSchemaVersion`); `approver.Local.Now` says it is for a
+  channel's tests and not a consumer's run clock, which also stamps the
+  run's own records; `approver.Decision` says a missing hash is refused as
+  changed by `Local` and as 400 `bad_request` by the webhook;
+  `testkit.Result.Resumes` counts the resume after an operator's decision as
+  well as after a crash, with the arithmetic for one of each;
+  `bench.File.Commit` says files without a commit compare as one commit;
+  `export.Follower.Follow` says delivery is exactly once across stops that
+  return and at least once, at most one page again, after a hard kill.
+
 ## [v0.3.1] - 2026-10-02
 
 Nested modules `bench` released at v0.1.0 and `export/otel` at v0.1.0;

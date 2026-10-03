@@ -2,7 +2,9 @@ package approver_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"io/fs"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -295,5 +297,86 @@ func TestLocal_PendingCarriesThePolicyReason(t *testing.T) {
 	ps, err = approver.New(st, nil).Pending(ctx, run.ID, 5)
 	if err != nil || len(ps) != 1 || len(ps[0].Reason) >= len(long) || !strings.Contains(ps[0].Reason, "bytes omitted") {
 		t.Fatalf("long reason = %d bytes, %v", len(ps[0].Reason), err)
+	}
+}
+
+var _ approver.RunReader = (*approver.Local)(nil)
+
+// A channel shows the run it is about to cancel through the Local it
+// decides with, without opening the store: before the cancel and after
+// it, and bounded as an approval is.
+func TestLocal_RunReadsTheRunWithoutTheStore(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "runs.db")
+	st, err := agentrt.OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	_, run, _ := paused(t, st, `{"n":1}`, nil, 0, tool("push", agentrt.RemoteMutation))
+	long := strings.Repeat("x", 5000)
+	agent := &scripted.Agent{Decisions: []agentrt.Decision{scripted.Complete(`{"s":"` + long + `"}`)}}
+	d, err := agentrt.NewDriver(agentrt.Config{Store: st, Agent: agent, Policy: agentrt.DefaultPolicy()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done, err := d.Start(ctx, long, agentrt.DefaultLimits())
+	if err != nil || done.Status != agentrt.StatusCompleted {
+		t.Fatalf("start = %+v, %v", done, err)
+	}
+
+	ap, err := approver.Open(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ap.Close()
+	var rr approver.RunReader = ap
+	got, err := rr.Run(ctx, run.ID)
+	if err != nil || got.ID != run.ID || got.Status != agentrt.StatusWaitingForApproval || got.Goal != "g" {
+		t.Fatalf("run before cancel = %+v, %v", got, err)
+	}
+	if err := ap.Cancel(ctx, run.ID, "joey", "unwanted"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = rr.Run(ctx, run.ID); err != nil || got.Status != agentrt.StatusCancelled || got.Reason != agentrt.ReasonOperatorCancelled || got.FinishedAt.IsZero() {
+		t.Fatalf("run after cancel = %+v, %v", got, err)
+	}
+	big, err := rr.Run(ctx, done.ID)
+	if err != nil || len(big.Goal) >= len(long) || !strings.Contains(big.Goal, "bytes omitted") || len(big.Result) >= len(long) || !strings.Contains(string(big.Result), "bytes omitted") {
+		t.Fatalf("bounded run: goal %d bytes, result %d bytes, %v", len(big.Goal), len(big.Result), err)
+	}
+	if _, err := rr.Run(ctx, "nope"); !errors.Is(err, agentrt.ErrNotFound) {
+		t.Fatalf("unknown run: %v", err)
+	}
+}
+
+// Open never creates or migrates: what a consumer sees for a missing
+// file, a database the runtime never opened, and one at another schema
+// version.
+func TestOpen_RefusesADatabaseWithoutTheSchema(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := approver.Open(filepath.Join(dir, "missing.db"), nil); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("missing: %v", err)
+	}
+	foreign := filepath.Join(dir, "foreign.db")
+	older := filepath.Join(dir, "older.db")
+	for path, ddl := range map[string]string{
+		foreign: `CREATE TABLE notes (body TEXT)`,
+		older:   `CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY); INSERT INTO schema_migrations VALUES (1)`,
+	} {
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(ddl); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+	}
+	if _, err := approver.Open(foreign, nil); err == nil || !strings.Contains(err.Error(), "not an agent-runtime database") {
+		t.Fatalf("foreign: %v", err)
+	}
+	if _, err := approver.Open(older, nil); !errors.Is(err, agentrt.ErrSchemaVersion) {
+		t.Fatalf("older: %v", err)
 	}
 }
