@@ -121,7 +121,7 @@ written separately, an adapter that puts the tools of any MCP server behind
 the policy, and the groundwork for outside contributors. These are items 1,
 2, and 8 of the [roadmap](docs/roadmap.md). Items 3 to 6, the evaluation
 vocabulary, the test kit, event export, and the approval channel, shipped in
-v0.3.1; neither consumer has adopted them yet. Item 7, writing up the ideas,
+v0.3.1, and both consumers run on them. Item 7, writing up the ideas,
 is ongoing.
 
 v0.3.0 followed an audit and a security review of v0.2.1. It added the lease

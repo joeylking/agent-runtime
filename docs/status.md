@@ -259,10 +259,10 @@ See `docs/performance.md` for the numbers.
 | Results from different commits are refused unless the caller allows it, each column names its commit, and different taxonomies are always refused | Verified | `TestCompare_RefusesMixedCommitsUnlessAskedAndNamesEach`, `TestCompare_RefusesMixedTaxonomiesEvenWhenAsked` |
 | A comparison spells out denominators, mixed cells, means across repetitions, natural scenario order, and each column's options and notes | Verified | `TestCompare_DenominatorsAndMixedCellsAreSpelledOut`, `TestNaturalLess_OrdersDigitRunsAsNumbers`, `TestCompare_ProvenanceCarriesOptionsAndNotes`, `TestLatest_KeepsTheNewestPerModeAndModel` |
 
-Not yet done: the roadmap's done-when needs both consumers to adopt the
-module. repo-steward's nine result files and casework's published
-evaluation reproduce exactly through it, but neither consumer has switched,
-and repo-steward's result files need a one-time conversion.
+Done-when met on 2026-10-03: repo-steward scores through the module with
+its nine result files converted once and unchanged in every number, and
+casework publishes its evaluation in the format with a gate that fails on
+any unsafe outcome.
 
 ## Item 4: test kit
 
@@ -286,8 +286,9 @@ yet: about ten generic lines remain in each consumer's agent. The one
 generic candidate is casework's raw model-turn table, which belongs in the
 runtime as a store table, not as an `Agent`.
 
-Not yet done: the roadmap's done-when needs both consumers to replace their
-own interruption and policy tests with the kit. Scratch tests show it can.
+Done-when met on 2026-10-03: repo-steward's policy tests and casework's
+crash-recovery and policy contract tests run on the kit, every old
+assertion kept as a row or a thin remaining test.
 
 ## Item 5: event export
 
@@ -329,8 +330,8 @@ plain core example with no `go.mod` of its own.
 | repo-steward's publication approval is granted from the webhook, and the hash still binds on resume | Verified | `TestHandler_GrantThenResumeBindsTheHash`; against the real repo-steward binary in a scratch end-to-end run on 2026-10-02 |
 | `examples/approver` runs a scripted run to an approval, serves the webhook, and decides as a chat bot would | Verified | `examples/approver/main.go`, `TestRun_GrantsThroughTheWebhookAndResumes`, `TestRun_RejectCancels` |
 
-Not yet done: the done-when is proven against the real repo-steward binary,
-but neither consumer has adopted the channel.
+Done-when met on 2026-10-03: repo-steward's approve, reject, and cancel and
+casework's server decide through the approver, bound to the hash shown.
 
 ## Core additions for items 3 to 6
 

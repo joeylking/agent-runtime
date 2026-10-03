@@ -151,8 +151,10 @@ module unchanged, and casework publishes results in the same format.
 **Status.** Built in the repository, shipped in core v0.3.1
 with `bench/v0.1.0` and `export/otel/v0.1.0`. The module reproduces
 repo-steward's nine result files and casework's published evaluation
-exactly. The done-when still needs both consumers to adopt it, with a
-one-time conversion of repo-steward's result files.
+exactly. Done: on 2026-10-03 repo-steward scores its benchmarks through
+it, with its nine result files converted once and their numbers
+unchanged, and casework publishes its evaluation in the same format with
+a gate that now fails on any unsafe outcome.
 
 ### 4. Test kit for consumers
 
@@ -174,8 +176,10 @@ tests with the kit.
 shipped in core v0.3.1. The examination found no reference `Agent`
 worth shipping yet: about ten generic lines remain in each consumer's
 agent, and the generic candidate is casework's raw model-turn table, which
-would be a store table, not an `Agent`. The done-when still needs both
-consumers to replace their tests with the kit.
+would be a store table, not an `Agent`. Done: on 2026-10-03 repo-steward's
+policy tests became conformance tables with a Never assertion and
+fuzzed arguments over its tools, and casework's crash-recovery and policy
+contract tests run on the kit, every old assertion kept.
 
 ### 5. Event export, not a UI
 
@@ -209,8 +213,10 @@ the reference implementation and the hash still binds.
 
 **Status.** Built in the repository as the core packages `approver` and
 `approver/webhook`, with `examples/approver`, shipped in core v0.3.1. Proven against the real repo-steward binary: a publication approval
-was granted through the webhook and the hash still bound on resume. The
-done-when still needs adoption in both consumers.
+was granted through the webhook and the hash still bound on resume. Done:
+on 2026-10-03 repo-steward's approve, reject, and cancel decide through
+the approver and print the approval first, and casework's server decides
+through it with the hash the browser was shown.
 
 ### 7. Publish the ideas
 
@@ -235,6 +241,6 @@ v0.1.0, and both consumers deleted their copies with their recorded
 replays passing unchanged. Item 8 shipped in v0.2.1 (core) with the
 nested modules at v0.1.1; it came next because it needed no new code.
 Items 3 through 6 shipped together in core v0.3.1 on 2026-10-02,
-followed by `bench/v0.1.0` and `export/otel/v0.1.0`. Item 5 is done;
-items 3, 4, and 6 wait on adoption in both consumers. 7 is
-continuous.
+followed by `bench/v0.1.0` and `export/otel/v0.1.0`. Both consumers adopted
+items 3, 4, and 6 on 2026-10-03, so items 1 through 6 and 8 are done. 7
+is continuous.
