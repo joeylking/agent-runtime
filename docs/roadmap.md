@@ -54,7 +54,7 @@ The core module `github.com/joeylking/agent-runtime` keeps two
 dependencies: a JSON Schema validator and SQLite. Everything below that
 adds a dependency lives in a nested module in this repository with its
 own `go.mod`, tagged with a directory prefix (`mcp/v0.1.0`,
-`providers/ollama/v0.1.0`). A consumer imports only what it uses, and a
+`providers/ollama/v0.1.0`, `bench/v0.1.0`, `export/otel/v0.1.0`). A consumer imports only what it uses, and a
 vulnerability in a provider SDK never taints the core.
 
 ## Items
@@ -148,6 +148,12 @@ the consumer.
 **Done when** repo-steward's `bench summarize` runs on the extracted
 module unchanged, and casework publishes results in the same format.
 
+**Status.** Built in the repository, awaiting release as core v0.3.1
+with `bench/v0.1.0` and `export/otel/v0.1.0`. The module reproduces
+repo-steward's nine result files and casework's published evaluation
+exactly. The done-when still needs both consumers to adopt it, with a
+one-time conversion of repo-steward's result files.
+
 ### 4. Test kit for consumers
 
 **Problem.** A consumer wants to assert that its policy denies a class of
@@ -164,6 +170,13 @@ decide whether a reference `Agent` belongs in the runtime.
 **Done when** both consumers replace their own interruption and policy
 tests with the kit.
 
+**Status.** Built in the repository as the core package `testkit`,
+awaiting release as core v0.3.1. The examination found no reference `Agent`
+worth shipping yet: about ten generic lines remain in each consumer's
+agent, and the generic candidate is casework's raw model-turn table, which
+would be a store table, not an `Agent`. The done-when still needs both
+consumers to replace their tests with the kit.
+
 ### 5. Event export, not a UI
 
 **Problem.** Operators already have dashboards. The runtime should feed
@@ -177,6 +190,11 @@ no other input.
 **Done when** a run's trace appears in a stock collector with no code in
 the consumer.
 
+**Status.** Built in the repository: the core package `export` and the
+nested module `export/otel`, awaiting release as core v0.3.1 and
+`export/otel/v0.1.0`. Done: a run's trace appeared in a stock
+OpenTelemetry collector on 2026-10-02, with no code in the consumer.
+
 ### 6. Portable approval channel
 
 **Problem.** Approval today assumes the operator can reach the SQLite
@@ -188,6 +206,12 @@ approval's presentation JSON, verifies the caller, and honours expiry.
 
 **Done when** repo-steward's publication approval can be granted from
 the reference implementation and the hash still binds.
+
+**Status.** Built in the repository as the core packages `approver` and
+`approver/webhook`, with `examples/approver`, awaiting release as core
+v0.3.1. Proven against the real repo-steward binary: a publication approval
+was granted through the webhook and the hash still bound on resume. The
+done-when still needs adoption in both consumers.
 
 ### 7. Publish the ideas
 
@@ -211,5 +235,7 @@ Items 1 and 2 shipped in v0.2.0 (core) with the nested modules at
 v0.1.0, and both consumers deleted their copies with their recorded
 replays passing unchanged. Item 8 shipped in v0.2.1 (core) with the
 nested modules at v0.1.1; it came next because it needed no new code.
-Items 3 through 6 follow as consumer evidence arrives; 7 is
+Items 3 through 6 are built in the repository and ship together as core
+v0.3.1, followed by `bench/v0.1.0` and `export/otel/v0.1.0`. Item 5 is
+done; items 3, 4, and 6 wait on adoption in both consumers. 7 is
 continuous.

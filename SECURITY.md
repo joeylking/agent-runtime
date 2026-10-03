@@ -31,6 +31,8 @@ Pre-1.0, so only the current release line is fixed:
 | `github.com/joeylking/agent-runtime/providers/anthropic` | the latest tag |
 | `github.com/joeylking/agent-runtime/providers/openai` | the latest tag |
 | `github.com/joeylking/agent-runtime/mcp` | the latest tag |
+| `github.com/joeylking/agent-runtime/bench` | the latest tag |
+| `github.com/joeylking/agent-runtime/export/otel` | the latest tag |
 
 Older minors and older nested-module tags get no fixes. A nested module names
 the core version it requires, so a core fix may need that module re-tagged too.
@@ -77,6 +79,25 @@ cannot influence.
   declines; reaching the end of input before anything was typed at a real
   terminal refuses the same way, rather than being read as a typed "n".
   `-by`/`decided_by` is a label recorded exactly as given, never verified.
+- `approver/webhook` is the reference portable approval channel. Every
+  request, reads included, carries a timestamp, a nonce, and an HMAC-SHA256
+  under a shared secret from configuration (never the URL), computed over the
+  timestamp, nonce, method, path, and body (`X-Approval-Timestamp`,
+  `X-Approval-Nonce`, `X-Approval-Signature`), and compared in constant time.
+  A timestamp more than `Config.Skew` from the handler's clock, five minutes
+  by default, is refused, and so is a signature seen before within the window.
+  Requests are rate limited before their bodies are read, by default 10 a
+  second with a burst of 20, and a body over `Config.MaxBody`, 16 KiB by
+  default, is refused with 413. A decision must name the run and approval of
+  the path, the hash the caller was shown, and an identity, and is recorded
+  through `agentrt.ApproveShown` or `RejectShown`, so what the channel showed
+  is what it decides. Every route names one run and nothing lists runs. The
+  handler has no users or sessions: `by` is a label, the secret is the only
+  authentication, and whoever holds it can decide any approval whose run id
+  they know. Anyone who can write the database can approve without it. The
+  handler speaks plain HTTP and must sit behind TLS and a network boundary the
+  operator controls. Model-chosen text in the plain-text rendering is escaped
+  with `trace.Sanitize`.
 
 ### Limits and accounting
 
@@ -321,6 +342,13 @@ cannot influence.
   `interrupted_side_effect` runs a call that may already have taken
   effect. The runtime cannot tell; the approval says so, and the choice
   is the operator's.
+- **Where exported events go.** `export.Follower` only reads: it opens the
+  database read-only and never writes. The OpenTelemetry exporter in
+  `export/otel` cuts model-chosen text (goals, reasons, arguments, messages,
+  a provider's error text) at a bound and never uses it as a span name, but
+  what remains is still sent to whatever collector the operator configured.
+  The runtime does not redact it, and a collector is outside what the
+  runtime defends.
 - **Secrets.** Provider keys come from the consumer's configuration. The
   adapters redact the key in their own output and keep it out of their
   errors, but decisions, arguments, observations, and approval

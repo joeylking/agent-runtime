@@ -26,7 +26,8 @@ The maintainer reviews and merges. There is no CLA.
 The core module `github.com/joeylking/agent-runtime` keeps two dependencies: a
 JSON Schema validator and SQLite. Anything that adds a dependency lives in a
 nested module in this repository with its own `go.mod`, tagged with a directory
-prefix (`mcp/v0.1.0`, `providers/ollama/v0.1.0`), so a consumer imports only
+prefix (`mcp/v0.1.0`, `providers/ollama/v0.1.0`, `bench/v0.1.0`,
+`export/otel/v0.1.0`), so a consumer imports only
 what it uses and a provider SDK never reaches the core. A change that would add
 a third dependency to the core belongs in a nested module instead.
 
@@ -34,7 +35,7 @@ Nested modules pin the core to its release tag, so working across them needs a
 workspace, which resolves the in-tree core instead:
 
 ```sh
-go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./examples/live ./examples/mcp
+go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./bench ./export/otel ./examples/live ./examples/mcp
 ```
 
 `go.work` is not committed.
@@ -59,7 +60,7 @@ GOWORK=off go test -race -count=1 ./...
 Each nested module, through the workspace:
 
 ```sh
-for m in providers/ollama providers/anthropic providers/openai mcp examples/live examples/mcp; do
+for m in providers/ollama providers/anthropic providers/openai mcp bench export/otel examples/live examples/mcp; do
   (cd "$m" && go vet ./... && go test -race -count=1 ./...)
 done
 ```
@@ -95,7 +96,7 @@ version belongs to the release check below, not here, because the
 workspace overrides that pin):
 
 ```sh
-for m in providers/ollama providers/anthropic providers/openai mcp examples/live examples/mcp; do
+for m in providers/ollama providers/anthropic providers/openai mcp bench export/otel examples/live examples/mcp; do
   (cd "$m" && staticcheck ./... && govulncheck ./...)
 done
 ```
@@ -161,8 +162,12 @@ tagged:
    checksum database can lag a freshly pushed tag by a few minutes; wait for
    the proxy to actually serve it, then let `go get` do the re-pin, then
    confirm what it wrote against the checksum database independently. For
-   each nested module (`providers/ollama`, `providers/anthropic`,
-   `providers/openai`, `mcp`):
+   each nested module that requires the core (`providers/ollama`,
+   `providers/anthropic`, `providers/openai`, `mcp`, `export/otel`), as below.
+   `export/otel` must be re-pinned to a core release that contains the
+   `export` package its example imports. `bench` has no requirements at all,
+   not even the core, so it has nothing to re-pin: it is tagged after the
+   core like the others, and this step does not apply to it.
 
    ```sh
    # Wait until the proxy serves the tag just pushed.

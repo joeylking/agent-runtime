@@ -118,8 +118,11 @@ kit has one. This library exists for the controls around the loop.
 The current release is v0.3.0, and both consumers run on it. The runtime
 includes the packages that both consumers had written separately, an adapter that puts the tools of any MCP
 server behind the policy, and the groundwork for outside contributors. These
-are items 1, 2, and 8 of the [roadmap](docs/roadmap.md). Items 3 to 6 are
-not started. Item 7, writing up the ideas, is ongoing.
+are items 1, 2, and 8 of the [roadmap](docs/roadmap.md). Items 3 to 6, the
+evaluation vocabulary, the test kit, event export, and the approval channel,
+are built in the repository and ship in v0.3.1, which is additive only;
+neither consumer has adopted them yet. Item 7, writing up the ideas, is
+ongoing.
 
 v0.3.0 followed an audit and a security review of v0.2.1. It added the lease
 on a run, the database only its owner can use, the pause after an
@@ -138,7 +141,9 @@ The three that matter most:
 The provider adapters and the MCP adapter are separate modules inside this
 repository, tagged with a directory prefix: `providers/ollama/v0.2.0`,
 `providers/anthropic/v0.2.0`, `providers/openai/v0.2.0`, and `mcp/v0.2.0`.
-Each requires core v0.3.0.
+Each requires core v0.3.0. Two more nested modules, `bench` and `export/otel`,
+are in the repository and will be tagged `bench/v0.1.0` and
+`export/otel/v0.1.0` after v0.3.1.
 
 The API is pre-1.0 and changes when a consumer needs it to.
 
@@ -198,7 +203,7 @@ pinned by version and integrity hash in `examples/mcp/package-lock.json`, an
 because the example and the MCP adapter are nested modules:
 
 ```sh
-go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./examples/live ./examples/mcp
+go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./bench ./export/otel ./examples/live ./examples/mcp
 (cd examples/mcp && npm ci --ignore-scripts)   # once: the pinned server, no install scripts
 go run ./examples/mcp pin      # hash the server's tools, print the hints it claims
 go run ./examples/mcp run      # load the operator's rules, run to the first write
@@ -386,7 +391,7 @@ build tag that skips unless a server answers. Working on the nested modules
 needs a workspace, which is what CI builds:
 
 ```sh
-go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./examples/live ./examples/mcp
+go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./bench ./export/otel ./examples/live ./examples/mcp
 ```
 
 ## MCP servers behind the policy
@@ -431,6 +436,67 @@ defer report.Connection.Close()
 [ADR 4](docs/decisions/0004-operator-classified-tools.md) records why the class
 is the operator's and why a hint may only refuse. `examples/mcp` is the whole
 thing running: the quick start above is its commands.
+
+## Measuring, testing, watching, and approving from elsewhere
+
+Four additions sit around the loop rather than in it. They are in the
+repository now and ship in v0.3.1, which is not yet tagged.
+
+- **Measuring an agent.** `bench` is the vocabulary for scoring an agent that
+  acts: each trial lands in exactly one outcome, every count is shown with
+  what it was counted out of, and one unsafe outcome disqualifies the run's
+  mode. Results are only compared within one commit. The scenarios and the
+  judging stay yours. It is a nested module with no dependencies.
+- **Testing without a model.** `testkit` helps a consumer prove what the
+  runtime promises about its own tools and policy: it crashes the loop at a
+  chosen point and resumes it in a fresh driver, checks a table of policy
+  decisions, fuzzes tool arguments against their schema, and checks that an
+  agent renders the same model request every time. It is a core package.
+- **Watching runs in a tool you already have.** `export` follows a database's
+  events from a separate process, read-only, and `export/otel` turns them
+  into OpenTelemetry spans for whatever collector the `OTEL_*` environment
+  names. The consumer needs no code. `export` is a core package; `export/otel`
+  is a nested module because it brings OpenTelemetry.
+- **Approving from a chat bot or a browser.** `approver` is the interface an
+  operator surface decides approvals through, and `approver/webhook` is a
+  signed HTTP channel over it, so an approval can be granted without access
+  to the database file. The decision is still bound to the request that was
+  shown. Both are core packages.
+
+```sh
+go get github.com/joeylking/agent-runtime/bench
+go get github.com/joeylking/agent-runtime/export/otel
+```
+
+Neither line resolves until the release is tagged. In a workspace of this
+repository they resolve now.
+
+```go
+// measuring: read result files, print the comparison, refusing mixed commits
+files, _ := bench.ReadDir("results"); out, err := bench.Compare(bench.Latest(files), bench.CompareOptions{})
+
+// testing: crash after the tool's effect, resume, and assert the contract held
+res := testkit.Run(t, testkit.Scenario{Tools: tools, Policy: policy, Agent: agent}, testkit.Crash{Step: 0, At: testkit.AfterToolEffect})
+
+// watching: follow the database from another process and send spans to the collector
+//   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 go run ./export/otel/example -db runs.db
+
+// approving: serve the signed channel over the database; the secret is at least 32 bytes
+h, _ := webhook.New(webhook.Config{Approver: approver.New(store, nil), Secret: secret}); http.ListenAndServe(addr, h)
+```
+
+The package docs say the rest:
+[`bench`](bench/bench.go), [`testkit`](testkit/testkit.go),
+[`export`](export/export.go), [`export/otel`](export/otel/otel.go),
+[`approver`](approver/approver.go), and
+[`approver/webhook`](approver/webhook/webhook.go), which lists the routes, the
+signature, and what the channel does not do. `examples/approver` runs a
+scripted run to an approval and decides it through the webhook, with no model
+and no network beyond loopback:
+
+```sh
+go run ./examples/approver
+```
 
 ## A live run that stops for an operator
 

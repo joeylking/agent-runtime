@@ -5,13 +5,75 @@ described by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 The core module (`github.com/joeylking/agent-runtime`) and its nested
 modules (`mcp`, `providers/ollama`, `providers/anthropic`,
-`providers/openai`) version independently — see docs/roadmap.md's "Module
+`providers/openai`, `bench`, `export/otel`) version independently — see docs/roadmap.md's "Module
 layout" — but the nested modules have so far always been re-tagged and
 released alongside the core release they pin, so each dated section below
 covers both together and says which nested-module tag shipped with it. An
 entry names a specific module only when the change is not in the core.
 
 ## [Unreleased]
+
+This release is additive: nothing a v0.3.0 consumer calls changes, and no
+migration or operator step is needed. The nested modules now also include
+`bench` and `export/otel`, each tagged separately: `bench/v0.1.0` and
+`export/otel/v0.1.0` follow the core release, and `export/otel` is pinned to
+it first because its example imports the new core package `export`.
+
+### Added
+
+- **Scoring an agent that acts: the `bench` module.** A consumer declares a
+  closed set of outcomes, each classed success, safe non-success, or unsafe,
+  and scores every trial into exactly one. Every count is reported with its
+  denominator, an excluded trial is in none, one unsafe outcome disqualifies a
+  mode, and results from different commits or different outcome sets are
+  refused by `Compare` unless the caller allows mixed commits, which the output
+  then says. The result file refuses anything that does not follow from its
+  trials and encodes byte for byte. It reproduces repo-steward's result files
+  and casework's published evaluation exactly. `bench` has no dependencies,
+  so it requires no core version.
+- **Testing a consumer's tools, policy, and agent without a model: the
+  `testkit` package.** `testkit.Run` crashes the loop at a chosen point,
+  resumes it in a fresh driver after the lease expires, and asserts the
+  interruption contract: nothing re-executes on its own, an approved request
+  executes at most once, and no step or lease is left in flight. It also
+  provides a policy conformance table (`CheckPolicy`, `Never`), schema fuzzing
+  of tool arguments, and a check that an agent renders byte-identical model
+  requests across a pause and a crash.
+- **Watching runs in a tool you already have: the `export` package and the
+  `export/otel` module.** `export.Follower` delivers a database's events in
+  commit order from a cursor, read-only and from a separate process, with a
+  JSON Lines sink matching `trace.JSONL`; a persisted cursor makes delivery
+  exactly once across restarts. `export/otel` turns the events into
+  OpenTelemetry spans (a run, its steps, each model attempt, each approval
+  wait), with ids derived from the run's own, so a restarted exporter or a run
+  resumed later continues the same trace. Model-chosen text is truncated and
+  never names a span. `export/otel/example` sends a database's runs to the
+  collector the `OTEL_*` environment names, over http/protobuf or gRPC, and was
+  checked against a stock OpenTelemetry collector.
+- **Approving from a chat bot or a browser: the `approver` and
+  `approver/webhook` packages.** `approver.Approver` shows an approval,
+  approves, rejects, or cancels the run, each bound to the hash that was
+  shown, and returns the runtime's typed errors. `approver/webhook` serves it
+  over HTTP behind an HMAC signature, a timestamp window, replay refusal, a
+  rate limit, and a body bound; every route names one run. It honours expiry
+  and renders a sanitised plain-text form for a chat message.
+  `examples/approver` runs the whole exchange with no model and no network
+  beyond loopback. repo-steward's publication approval was granted through it
+  and the hash still bound on resume.
+- Core additions the new packages are built on, all additive:
+  `Store.Lease` returns a run's stored lease owner and expiry;
+  `Store.ListEventsAfter` reads events after a sequence number for one
+  run or all of them, in commit order, which is how `export` follows the
+  table; a decision on an expired approval returns `ErrApprovalExpired`,
+  which still matches `ErrNotPending` and keeps its message;
+  `Operator{Store, Observer, Now}` is the driverless decision path on a
+  chosen clock, with the package-level functions unchanged;
+  `Store.ApprovalReason` returns the reason of the policy decision that
+  paused the run on an approval, from its `approval.requested` event, so a
+  channel can show it; `CompileTool`, `ToolSchema.Check`, and `CheckArgs`
+  are the runtime's acceptance of a tool's arguments without a driver,
+  giving the text an invalid decision records, and `NewDriver` and the
+  loop now go through the same code.
 
 ### Fixed
 

@@ -239,6 +239,21 @@ file must run on one host, or on hosts whose clocks agree to well within
 `LeaseTTL`; clock skew beyond that is unsupported, and so is SQLite on a
 network filesystem, whose locking and `fsync` SQLite cannot rely on.
 
+Four reads exist for tools that sit beside a consumer rather than inside
+it. `Store.Lease` returns a run's lease owner and expiry; an empty owner
+means nobody holds it. `Store.ListEventsAfter` reads events after a
+sequence number, for one run or all of them, in commit order and capped
+at `MaxPageText`; `export` follows the table through it and never
+writes. `Store.ApprovalReason` returns the reason of the policy decision
+that paused the run on an approval, read from its `approval.requested`
+event, so it is the pausing decision even after a resume-time policy
+decided otherwise. `CompileTool` checks a tool spec as `NewDriver` does
+and compiles its schema once; `ToolSchema.Check` and `CheckArgs` are the
+runtime's acceptance of a tool call's arguments, with the text an invalid
+decision records, so a consumer's tests can validate without a driver.
+`Operator` is the driverless decision path on a chosen clock, and a
+decision on an expired approval returns `ErrApprovalExpired`.
+
 ## Persistence
 
 One SQLite file in WAL mode with runs, steps, model_calls, approvals,
@@ -310,13 +325,31 @@ core.
 
 - the core module: the driver, the SQLite store, policy and limits,
   `providers`, `render`, `trace`, `view`, `replay`, `scripted`,
-  `cmd/agentrt`, and `examples/scripted`.
+  `cmd/agentrt`, `examples/scripted`, and the packages below that need
+  nothing beyond the core's own dependencies:
+  - `export`: a read-only follower of the events table that hands each event,
+    in commit order and from a cursor, to a sink, with a JSON Lines sink.
+  - `testkit`: what a consumer's tests use without a model: a crash and
+    resume harness, a policy conformance table, schema fuzzing of tool
+    arguments, and a render equivalence check.
+  - `approver`: the interface an operator surface decides approvals
+    through, bound to the hash it showed, and its store-backed
+    implementation.
+  - `approver/webhook`: the reference signed HTTP approval channel over
+    `approver`.
+  - `examples/approver`: a scripted run decided through the webhook as a
+    chat bot would, then resumed.
 - `providers/ollama`: a local Ollama server over its native chat API.
 - `providers/anthropic`: the Claude Messages API through the official SDK,
   with the raw assistant turn that keeps signed thinking blocks alive.
 - `providers/openai`: any OpenAI-compatible chat completions endpoint.
 - `mcp`: an MCP server's tools as runtime tools, pinned by hash and
   classified by an operator.
+- `bench`: the outcome vocabulary, result file, summarizer, and comparison
+  for scoring an agent that acts, with no dependencies at all.
+- `export/otel`: an exporter that turns the events `export` delivers into
+  OpenTelemetry spans, and the provider an operator's `OTEL_*` environment
+  configures.
 - `examples/live`: one live model run against in-memory tools that stops
   for an operator before the first change.
 - `examples/mcp`: the same controls over the MCP filesystem server,

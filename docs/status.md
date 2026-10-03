@@ -246,10 +246,105 @@ See `docs/performance.md` for the numbers.
 | `view.Runs` reads pending approvals in one query and matches per-run summaries; `GetApproval` is one row and refuses another run's approval | Verified | `Store.PendingApprovalIDs`, `TestRuns_OneQueryMatchesPerRunSummaries` |
 | `show` reads one bounded page of the run's steps and approvals, and counts the rest | Verified | `view.DetailPage`, `cmd/agentrt` `cmdShow`, `TestRead_OnlyThePageIsReadFromAHugeDatabase` |
 
+## Item 3: evaluation vocabulary
+
+`bench` is a nested module with no dependencies at all.
+
+| Capability | Status | Reference |
+|---|---|---|
+| A consumer's outcome set must be closed, classed success, safe non-success, or unsafe, with at least one success and one unsafe outcome | Verified | `bench/bench.go`, `TestTaxonomy_ValidateRequiresTheSafetyShape` |
+| A result file refuses a trial without exactly one known outcome or exclusion, a duplicate trial, a negative count, unknown fields, another format, and summaries that do not follow from the trials; encoding round-trips byte for byte | Verified | `TestFile_EncodeRefusesATrialWithoutExactlyOneOutcome`, `TestDecode_RefusesWhatDoesNotFollowFromTheTrials`, `TestFile_EncodeDecodeIsByteIdentical` |
+| Every count carries its denominator; an excluded trial is in none; an outcome outside its expectation joins the denominator rather than exceeding it; totals saturate | Verified | `TestSummarize_DenominatorsMatchRepoSteward`, `TestSummarize_MatchesCaseworkPerMode`, `TestSummarize_ExcludedTrialIsInNoDenominator`, `TestSummarize_OutcomeOutsideItsExpectationJoinsTheDenominator`, `TestSummarize_TotalsSaturateRatherThanWrap` |
+| One unsafe outcome disqualifies a mode | Verified | `TestSummary_OneUnsafeOutcomeDisqualifies` |
+| Results from different commits are refused unless the caller allows it, each column names its commit, and different taxonomies are always refused | Verified | `TestCompare_RefusesMixedCommitsUnlessAskedAndNamesEach`, `TestCompare_RefusesMixedTaxonomiesEvenWhenAsked` |
+| A comparison spells out denominators, mixed cells, means across repetitions, natural scenario order, and each column's options and notes | Verified | `TestCompare_DenominatorsAndMixedCellsAreSpelledOut`, `TestNaturalLess_OrdersDigitRunsAsNumbers`, `TestCompare_ProvenanceCarriesOptionsAndNotes`, `TestLatest_KeepsTheNewestPerModeAndModel` |
+
+Not yet done: the roadmap's done-when needs both consumers to adopt the
+module. repo-steward's nine result files and casework's published
+evaluation reproduce exactly through it, but neither consumer has switched,
+and repo-steward's result files need a one-time conversion.
+
+## Item 4: test kit
+
+`testkit` is a core package. It uses the public API and the schema library
+the core already requires.
+
+| Capability | Status | Reference |
+|---|---|---|
+| `testkit.Run` crashes the loop at a chosen point by parking its goroutine and closing its Store, resumes in a fresh Driver after the lease expires, and asserts that no step re-executes on its own, an approved request executes at most once, every tool start is finished or interrupted, no step or lease is left in flight, and every crash was reached | Verified | `testkit/testkit.go`, `TestRun_SideEffectLostToACrashRunsAgainOnlyWhenApproved`, `TestRun_ApprovedRequestSurvivesACrashAfterResume`, `TestRun_CrashAfterTakeoverStillWaitsForTheOperator`, `TestRun_RecordedStartWithoutTheToolRunsOnceWhenApproved`, `TestRun_InterruptionsThatNeedNoOperator`, `TestCheck_ReportsEveryBrokenInvariant` |
+| A policy conformance table is decided through the runtime's validation first (`Refused` before policy) and reports disagreements as one table; `Never` holds an outcome off a side-effect class over generated requests | Verified | `testkit/policy.go`, `TestCheckPolicy_AgreeingTablePasses`, `TestCheckPolicy_DisagreementsAreOneReadableTable`, `TestCheckPolicy_ViewReachesThePolicy`, `TestNever_HoldsAndFails` |
+| Schema fuzzing with the core's schema library: deterministic valid arguments reach the tool without a panic; near misses and the boundary cases (depth, duplicate key, invalid UTF-8, unpaired surrogate) are refused before the tool | Verified | `testkit/fuzz.go`, `TestFuzz_ValidIsDeterministicAndBounded`, `TestFuzz_InvalidCoversTheBoundaryAndNearMisses`, `TestFuzz_CheckPassesTheConsumersSchemas`, `TestFuzz_CheckReportsAPanicNotAnError` |
+| An agent renders byte-identical model requests from two runs of one scenario, through a pause and a crash | Verified | `testkit/render.go`, `TestSameRenders_HoldsAcrossAPauseAndACrash`, `TestSameRenders_FailsOnANondeterministicOpening` |
+
+The harness crashes after step.started, step.decided, step.tool_started,
+after the tool's effect and before its record, after step.tool_finished,
+after run.resumed, after step.interrupted, and at every pause. It cannot
+crash inside one transaction, between a tool's own journal writes, or during
+a model dispatch, because the public API reaches none of them. The
+examination the roadmap asks for found no reference `Agent` worth shipping
+yet: about ten generic lines remain in each consumer's agent. The one
+generic candidate is casework's raw model-turn table, which belongs in the
+runtime as a store table, not as an `Agent`.
+
+Not yet done: the roadmap's done-when needs both consumers to replace their
+own interruption and policy tests with the kit. Scratch tests show it can.
+
+## Item 5: event export
+
+`export` is a core package. `export/otel` is a nested module that depends on
+OpenTelemetry; `export/otel/example` is the operator-side program.
+
+| Capability | Status | Reference |
+|---|---|---|
+| A follower delivers a store's events in commit order, for one run or every run, from a cursor that is the event's Seq, through bounded page reads capped like `ListEventsPage`, and never writes; it runs beside the consumer on a store from `OpenExisting(path, true)` | Verified | `export/export.go`, `TestFollower_DeliversEveryRunInCommitOrder`, `TestFollower_ReadOnlyLeavesTheFileUntouched`, `TestFollower_PagesALargeTable` |
+| A persisted cursor makes delivery exactly once across restarts; a live follower stops on cancellation with the cursor saved | Verified | `TestFollower_ExactlyOnceAcrossRestarts`, `TestFollower_LiveRunAndStopOnCancel` |
+| The JSON Lines sink writes the record `trace.JSONL` writes | Verified | `export.JSONL`, `TestJSONL_MatchesTrace` |
+| OpenTelemetry spans from the event stream: one per run, step, model attempt, and approval wait; lease, limit, loop, and cancel as span events; attributes with stable names; model-chosen text truncated and never a span name | Verified | `export/otel/otel.go`, `TestExporter_RunAndStepSpans`, `TestExporter_ModelAttemptSpans`, `TestExporter_ApprovalWaitIsASpan`, `TestExporter_LimitLoopAndFailure`, `TestExporter_TruncatesModelChosenText` |
+| Trace and span ids are derived from run, step, attempt, and approval ids, so a restarted exporter or a run resumed later continues the same trace; starts missed by a restart come from the store | Verified | `TestExporter_DeterministicAcrossRestarts`, `TestExporter_InterruptedRunContinuesTheTrace` |
+| Every event type the runtime emits is mapped, from fixtures that run real drivers: paused and resumed, interrupted and taken over, cancelled with a late tool outcome, model-backed with a retry | Verified | `TestFixtures_EmitEveryEventType`, `TestExporter_CancelledRunAndLateTool` |
+| A run's trace appears in a stock collector with no code in the consumer, over OTLP http/protobuf or gRPC chosen from the `OTEL_*` environment | Implemented | `export/otel/example`, `otel.Provider`, `TestProvider_FromEnvironment` |
+
+Proven on 2026-10-02 against `otel/opentelemetry-collector-contrib` v0.161.0
+in a container: the done-when holds. Two exporter processes, one over http
+and one over gRPC, produced byte-identical trace and span ids. The module's
+direct dependencies are the core, `go.opentelemetry.io/otel`, `otel/sdk`,
+`otel/trace`, `otlptracehttp`, `otlptracegrpc`, and `stdouttrace`; its module
+graph is 114 modules, 35 of which provide packages.
+
+## Item 6: portable approval channel
+
+`approver` and `approver/webhook` are core packages that use only the
+standard library, the core, `view`, and `trace`. `examples/approver` is a
+plain core example with no `go.mod` of its own.
+
+| Capability | Status | Reference |
+|---|---|---|
+| `Approver` interface over show, approve, reject, cancel, bound by hash, per run | Verified | `approver/approver.go`, `TestLocal_ReturnsTypedErrors` |
+| The store-backed `Approver` returns the runtime's typed errors; expiry is named as `ErrExpired` wrapping `ErrNotPending` | Verified | `TestLocal_ExpiredWrapsNotPendingAndCancelsRun`, `TestOpen_UsesOpenExisting` |
+| Webhook: HMAC over timestamp, nonce, method, path, and body; skew window; replay refusal; rate and body bounds | Verified | `approver/webhook/webhook.go`, `TestHandler_SignatureSkewAndReplay`, `TestHandler_BodyAndRateBounds` |
+| A webhook decision is bound to the shown hash, against a concurrent change | Verified | `TestHandler_HashBindsAgainstAConcurrentChange`, `TestHandler_StaleHashIsRefusedAndNothingDecided` |
+| The webhook honours expiry: 410, and the runtime's own expiry path runs | Verified | `TestHandler_ExpiryIsReportedAndTheRuntimeExpires` |
+| The webhook names only the run addressed; typed errors are distinct statuses | Verified | `TestHandler_NotFoundAndNoCrossRunAccess`, `TestHandler_NotPendingAfterAGrant`, `TestHandler_RejectCancelsRun` |
+| Sanitised text rendering with a closing line the handler writes | Verified | `approver/webhook/text.go`, `TestHandler_TextRenderingIsSanitised` |
+| repo-steward's publication approval is granted from the webhook, and the hash still binds on resume | Verified | `TestHandler_GrantThenResumeBindsTheHash`; against the real repo-steward binary in a scratch end-to-end run on 2026-10-02 |
+| `examples/approver` runs a scripted run to an approval, serves the webhook, and decides as a chat bot would | Verified | `examples/approver/main.go`, `TestRun_GrantsThroughTheWebhookAndResumes`, `TestRun_RejectCancels` |
+
+Not yet done: the done-when is proven against the real repo-steward binary,
+but neither consumer has adopted the channel.
+
+## Core additions for items 3 to 6
+
+| Capability | Status | Reference |
+|---|---|---|
+| `Store.Lease` reads a run's stored lease owner and expiry; unheld is empty, unknown is `ErrNotFound` | Verified | `TestStore_LeaseReadsTheStoredLease` |
+| `Store.ListEventsAfter` delivers events after a sequence number in commit order, for one run or every run, capped at `MaxPageText` | Verified | `TestStore_ListEventsAfterFollowsSeqAcrossRuns` |
+| A decision on an expired approval is `ErrApprovalExpired`, which matches `ErrNotPending` with the same message | Verified | `TestApproval_ExpiryIsErrApprovalExpired` |
+| `Operator` decides and cancels on a chosen clock; the package functions keep the wall clock | Verified | `TestOperator_ClockDecidesExpiry` |
+| `Store.ApprovalReason` returns the pausing policy's reason even after a resume-time decision | Verified | `TestStore_ApprovalReasonIsThePausingPolicys` |
+| `CompileTool`, `ToolSchema.Check`, and `CheckArgs` give exactly the driver's acceptance and refusal text, compiling a spec once | Verified | `TestCheckArgs_IsTheDriversAcceptance`, `TestCheckArgs_CompilesOnceForASpec` |
+
 ## Not implemented
 
 | Capability | Where it is planned |
 |---|---|
 | Blob table for large tool outputs | when a consumer's observations outgrow the step row |
-| OpenTelemetry exporter over the events table | docs/roadmap.md item 5 |
-| Evaluation vocabulary, test kit, approval channel | docs/roadmap.md items 3, 4, 6 |

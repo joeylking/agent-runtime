@@ -101,8 +101,8 @@ jobs:
             exit 1
           fi
 
-  # The nested modules (the provider adapters, the MCP adapter) and the two
-  # examples have their own go.mod files, so ./... in the root module does not
+  # The nested modules (the provider adapters, the MCP adapter, bench, and the
+  # OpenTelemetry exporter) and the two examples have their own go.mod files, so ./... in the root module does not
   # reach them. A workspace makes them resolve the in-tree core rather than a
   # published version. The live-tagged tests are not run: they need a local
   # model server. Neither example's model path runs either: examples/mcp
@@ -128,10 +128,10 @@ jobs:
           go-version: ${{ matrix.go-version }}
       - run: go mod verify
       - name: workspace
-        run: go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./examples/live ./examples/mcp
+        run: go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./bench ./export/otel ./examples/live ./examples/mcp
       - name: nested modules
         run: |
-          for m in providers/ollama providers/anthropic providers/openai mcp examples/live examples/mcp; do
+          for m in providers/ollama providers/anthropic providers/openai mcp bench export/otel examples/live examples/mcp; do
             echo "== $m"
             (cd "$m" && go mod verify && go vet ./... && go test -race -count=1 ./...)
           done
@@ -169,10 +169,10 @@ jobs:
           GOWORK=off staticcheck ./...
           GOWORK=off govulncheck ./...
       - name: workspace
-        run: go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./examples/live ./examples/mcp
+        run: go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./bench ./export/otel ./examples/live ./examples/mcp
       - name: nested module static analysis
         run: |
-          for m in providers/ollama providers/anthropic providers/openai mcp examples/live examples/mcp; do
+          for m in providers/ollama providers/anthropic providers/openai mcp bench export/otel examples/live examples/mcp; do
             echo "== $m"
             (cd "$m" && go mod verify && staticcheck ./... && govulncheck ./...)
           done

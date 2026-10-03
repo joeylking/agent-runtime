@@ -69,13 +69,13 @@ jobs:
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
       # The examples pin the nested modules' own tags, so they can only be
       # re-pinned after those tags exist. A nested tag's push, and the
-      # manual run that precedes it, therefore check the four library
+      # manual run that precedes it, therefore check the six library
       # modules; the schedule and an ordinary manual run check everything.
       - name: nested modules against their pinned core
         env:
           WITH_EXAMPLES: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.examples) }}
         run: |
-          modules="providers/ollama providers/anthropic providers/openai mcp"
+          modules="providers/ollama providers/anthropic providers/openai mcp bench export/otel"
           if [ "$WITH_EXAMPLES" = "true" ]; then
             modules="$modules examples/live examples/mcp"
           fi
