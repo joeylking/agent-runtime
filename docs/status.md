@@ -133,7 +133,7 @@ exists, reference given), **Verified** (a named test exercises it).
 | The exactly-one pending-approval rule | Verified | `ExamplePendingApproval` |
 | A pinned MCP tool with no operator rule left unregistered, over in-memory transports with no server | Verified | `ExampleLoad` |
 | Pre-1.0 compatibility promise: additive within a minor, release notes name what a minor bump changes, nested modules versioned independently and each naming its core version, forward-only migrations, recordings stable across core versions | Implemented | `README.md`, `docs/roadmap.md` |
-| The core module builds and tests on Go 1.26 and 1.27, with `GOTOOLCHAIN=local` so the older job cannot switch toolchains. Every nested module's `go` line is 1.26, and each requires the core release v0.3.0 | Implemented | `.github/workflows/ci.yml`, the comment above each nested `go` directive |
+| The core module builds and tests on Go 1.26 and 1.27, with `GOTOOLCHAIN=local` so the older job cannot switch toolchains. Every nested module's `go` line is 1.26, and on `main` each requires the core release v0.4.0 | Implemented | `.github/workflows/ci.yml`, the comment above each nested `go` directive |
 | Public roadmap issue, pinned, mirroring the item list with a status per item | Implemented | [#3](https://github.com/joeylking/agent-runtime/issues/3) |
 | CI lint job: gofmt, staticcheck and govulncheck at pinned versions, and a core `go mod tidy -diff` check | Implemented | `.github/workflows/ci.yml` |
 | Release check builds each nested module against the versions it pins, with no workspace, on every tag and weekly | Implemented | `.github/workflows/release-check.yml` |

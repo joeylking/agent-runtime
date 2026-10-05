@@ -154,10 +154,10 @@ The three that matter most:
 
 The provider adapters and the MCP adapter are separate modules inside this
 repository, tagged with a directory prefix: `providers/ollama/v0.2.0`,
-`providers/anthropic/v0.2.0`, `providers/openai/v0.2.0`, and `mcp/v0.2.0`.
-Each requires core v0.3.0, which v0.3.1 only adds to. Two more nested
-modules shipped with v0.3.1: `bench/v0.1.0`, which has no requirements at
-all, and `export/otel/v0.1.0`, which requires core v0.3.1.
+`providers/anthropic/v0.2.0`, `providers/openai/v0.2.0`, `mcp/v0.2.1`,
+`export/otel/v0.1.1`, and `proxy/v0.1.0`. On `main` each requires core
+v0.4.0; the providers' tags still pin v0.3.0, which v0.4.0 only adds to.
+`bench/v0.1.1` has no requirements at all.
 
 The API is pre-1.0 and changes when a consumer needs it to.
 

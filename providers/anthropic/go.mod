@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.75.0
-	github.com/joeylking/agent-runtime v0.3.0
+	github.com/joeylking/agent-runtime v0.4.0
 )
 
 require (
