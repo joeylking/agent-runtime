@@ -3,6 +3,7 @@ package agentrt
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -36,5 +37,29 @@ func TestCheckArgs_CompilesOnceForASpec(t *testing.T) {
 	toolCache.Unlock()
 	if size > toolCacheSize {
 		t.Fatalf("cache holds %d specs", size)
+	}
+}
+
+// A panic inside the schema library is a refusal of the arguments, never
+// an acceptance and never the end of the process. The boundary keeps out
+// the numbers known to cause one, so validate is called directly with one.
+func TestValidate_APanicInTheLibraryIsARefusal(t *testing.T) {
+	for _, keyword := range []string{`"minimum":0`, `"maximum":0`, `"exclusiveMinimum":0`, `"exclusiveMaximum":0`, `"multipleOf":0.5`} {
+		cs, err := compileSchema("t", json.RawMessage(`{"type":"object","properties":{"n":{"type":"number",`+keyword+`}}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = cs.validate(json.RawMessage(`{"n":1e-10000000}`))
+		if err == nil || !strings.Contains(err.Error(), "could not be checked against the schema, so they are refused") {
+			t.Errorf("%s: %v", keyword, err)
+		}
+	}
+	cs, err := compileSchema("t", json.RawMessage(`{"type":"array","uniqueItems":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := `[1e-10000000` + strings.Repeat(`,1`, 30) + `]`
+	if err := cs.validate(json.RawMessage(items)); err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Errorf("uniqueItems: %v", err)
 	}
 }

@@ -29,6 +29,26 @@ func compileSchema(toolName string, raw json.RawMessage) (*compiledSchema, error
 	if err != nil {
 		return nil, fmt.Errorf("tool %q: input schema is not valid JSON: %w", toolName, err)
 	}
+	// A bound such as minimum or multipleOf past the number bound would be
+	// dropped by the library, or make every validation against it panic.
+	if err := checkNumbers(raw); err != nil {
+		return nil, fmt.Errorf("tool %q: input schema: %w", toolName, err)
+	}
+	s, err := compileDoc(toolName, doc)
+	if err != nil {
+		return nil, err
+	}
+	return &compiledSchema{schema: s}, nil
+}
+
+// compileDoc compiles a decoded schema. A panic inside the library is
+// refused as a schema that does not compile, never let through.
+func compileDoc(toolName string, doc any) (s *jsonschema.Schema, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			s, err = nil, fmt.Errorf("tool %q: input schema does not compile: the schema library failed: %v", toolName, r)
+		}
+	}()
 	c := jsonschema.NewCompiler()
 	// A schema is compiled from itself and the standard metaschemas, which
 	// the library embeds; the default loader would read any file: URL, so
@@ -39,7 +59,7 @@ func compileSchema(toolName string, raw json.RawMessage) (*compiledSchema, error
 	if err := c.AddResource(url, doc); err != nil {
 		return nil, fmt.Errorf("tool %q: %w", toolName, err)
 	}
-	s, err := c.Compile(url)
+	s, err = c.Compile(url)
 	if err != nil {
 		var ext *jsonschema.LoadURLError
 		if errors.As(err, &ext) {
@@ -47,7 +67,7 @@ func compileSchema(toolName string, raw json.RawMessage) (*compiledSchema, error
 		}
 		return nil, fmt.Errorf("tool %q: input schema does not compile: %w", toolName, err)
 	}
-	return &compiledSchema{schema: s}, nil
+	return s, nil
 }
 
 // ToolSchema is a tool's spec as NewDriver accepts it, with its input
@@ -81,9 +101,9 @@ func CompileTool(spec ToolSpec) (*ToolSchema, error) {
 
 // Check reports whether the runtime accepts args for the tool: the JSON
 // boundary checks a decision's arguments meet (depth, UTF-8, escaped
-// surrogates, repeated keys), then the input schema. Empty arguments mean
-// {}. Its error text is the one the driver records in an invalid_decision
-// observation for the same arguments.
+// surrogates, repeated keys, the number bound), then the input schema.
+// Empty arguments mean {}. Its error text is the one the driver records in
+// an invalid_decision observation for the same arguments.
 func (s *ToolSchema) Check(args json.RawMessage) error { return checkArgs(s.schema, args) }
 
 // checkArgs is the loop's acceptance of a tool call's arguments.
@@ -157,7 +177,20 @@ func (c *compiledSchema) validate(raw json.RawMessage) error {
 	if err != nil {
 		return fmt.Errorf("arguments are not valid JSON: %w", err)
 	}
-	if err := c.schema.Validate(v); err != nil {
+	return validateDoc(c.schema, v)
+}
+
+// validateDoc checks a decoded value against a compiled schema. The
+// boundary's checks keep out every input known to make the library panic,
+// and a panic that gets past them is a refusal, never an acceptance and
+// never the end of the process.
+func validateDoc(s *jsonschema.Schema, v any) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("arguments could not be checked against the schema, so they are refused: the schema library failed: %v", r)
+		}
+	}()
+	if err := s.Validate(v); err != nil {
 		return fmt.Errorf("arguments do not match schema: %w", err)
 	}
 	return nil

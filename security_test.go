@@ -124,6 +124,84 @@ func TestDriver_DeepJSONIsRefusedWhereItEnters(t *testing.T) {
 	})
 }
 
+// boundedSchema takes one number with a minimum, which a number past the
+// bound made the schema library panic on.
+const boundedSchema = `{"type":"object","properties":{"n":{"type":"number","minimum":0}},"additionalProperties":false}`
+
+// A number with an exponent past the schema library's reach, such as
+// 1e-10000000, made validation against a minimum panic, and nothing
+// recovered it: a model that chose one ended the process. It is refused
+// where it enters, as nesting is: arguments as an invalid decision keeping
+// the bytes, tool content as a tool_error keeping them, and a capability
+// by failing the run before anything executes.
+func TestDriver_HugeNumbersAreRefusedWhereTheyEnter(t *testing.T) {
+	ctx := context.Background()
+	t.Run("arguments and result", func(t *testing.T) {
+		for _, n := range []string{`1e-10000000`, `1e-1000000000`, `0.1e-9223372036854775808`} {
+			st := memStore(t)
+			write := &stubTool{spec: ToolSpec{Name: "write", Description: "write", InputSchema: []byte(boundedSchema), SideEffect: LocalMutation, Timeout: time.Second}}
+			args := `{"n":` + n + `}`
+			agent := &listAgent{decisions: []Decision{{Kind: DecideToolCall, Tool: "write", Args: []byte(args)}, {Kind: DecideComplete, Result: []byte(args)}, {Kind: DecideComplete}}}
+			run, err := mustDriver(t, Config{Store: st, Agent: agent, Tools: []Tool{write}}).Start(ctx, "g", leaseLimits())
+			if err != nil || run.Status != StatusCompleted || write.calls != 0 {
+				t.Fatalf("%s: run %s %s, %v, %d calls", n, run.Status, run.ReasonDetail, err, write.calls)
+			}
+			steps, err := st.ListSteps(ctx, run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s := steps[0]; s.Observation.Kind != ObserveInvalidDecision || !strings.Contains(s.Observation.Summary, "exponent beyond") || s.Decision.InvalidArgs != args {
+				t.Fatalf("%s: step 0 = %+v", n, s.Observation)
+			}
+			if s := steps[1]; s.Observation.Kind != ObserveInvalidDecision || s.Decision.InvalidResult != args {
+				t.Fatalf("%s: step 1 = %+v", n, s.Observation)
+			}
+		}
+	})
+	t.Run("tool content", func(t *testing.T) {
+		st := memStore(t)
+		content := `{"n":1e-10000000}`
+		read := funcTool{ToolSpec{Name: "read", Description: "read", InputSchema: []byte(boundedSchema), SideEffect: ReadOnly, Timeout: time.Second}, func(ToolCall) (ToolResult, error) {
+			return ToolResult{Content: []byte(content)}, nil
+		}}
+		agent := &listAgent{decisions: []Decision{{Kind: DecideToolCall, Tool: "read", Args: []byte(`{"n":1}`)}, {Kind: DecideComplete}}}
+		run, err := mustDriver(t, Config{Store: st, Agent: agent, Tools: []Tool{read}}).Start(ctx, "g", leaseLimits())
+		if err != nil || run.Status != StatusCompleted {
+			t.Fatalf("run %s, %v", run.Status, err)
+		}
+		steps, err := st.ListSteps(ctx, run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var c map[string]string
+		json.Unmarshal(steps[0].Observation.Content, &c)
+		if steps[0].Observation.Kind != ObserveToolError || c["content"] != content || c["failure"] != "invalid_content" {
+			t.Fatalf("step 0 = %s %.80s", steps[0].Observation.Kind, steps[0].Observation.Content)
+		}
+	})
+	t.Run("capability", func(t *testing.T) {
+		st := memStore(t)
+		push := objectTool("push", RemoteMutation)
+		policy := PolicyFunc(func(context.Context, ToolRequest, RunView) (PolicyDecision, error) {
+			return PolicyDecision{Outcome: RequireApproval, Kind: "k", Capability: []byte(`{"n":1e-10000000}`)}, nil
+		})
+		agent := &listAgent{decisions: []Decision{{Kind: DecideToolCall, Tool: "push", Args: []byte(`{}`)}}}
+		run, err := mustDriver(t, Config{Store: st, Agent: agent, Policy: policy, Tools: []Tool{push}}).Start(ctx, "g", leaseLimits())
+		if err != nil || run.Status != StatusFailed || run.Reason != ReasonInternalError || push.calls != 0 {
+			t.Fatalf("run %s/%s, %v", run.Status, run.Reason, err)
+		}
+	})
+	t.Run("schema", func(t *testing.T) {
+		for _, schema := range []string{`{"type":"object","properties":{"n":{"type":"number","minimum":1e-10000000}}}`,
+			`{"type":"object","properties":{"n":{"type":"number","multipleOf":0.1e-9223372036854775808}}}`} {
+			tool := &stubTool{spec: ToolSpec{Name: "t", Description: "t", InputSchema: []byte(schema), SideEffect: ReadOnly, Timeout: time.Second}}
+			if _, err := NewDriver(Config{Store: memStore(t), Agent: &listAgent{}, Policy: DefaultPolicy(), Tools: []Tool{tool}}); err == nil || !strings.Contains(err.Error(), "exponent beyond") {
+				t.Errorf("%s: %v", schema, err)
+			}
+		}
+	})
+}
+
 // oldApprovalHash is approvalHash as it was: a request that would not
 // encode was hashed as the error message that replaced it, the same for
 // every such request.

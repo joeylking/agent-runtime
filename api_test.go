@@ -307,3 +307,22 @@ func TestCheckArgs_IsTheDriversAcceptance(t *testing.T) {
 		}
 	}
 }
+
+// CheckArgs refuses a number past the bound with the boundary's reason,
+// against every keyword whose validation panicked on one.
+func TestCheckArgs_RefusesNumbersPastTheBound(t *testing.T) {
+	for _, keyword := range []string{`"minimum":0`, `"maximum":0`, `"exclusiveMinimum":0`, `"exclusiveMaximum":0`, `"multipleOf":0.5`} {
+		spec := agentrt.ToolSpec{Name: "t", SideEffect: agentrt.RemoteMutation, Timeout: time.Second,
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"n":{"type":"number",` + keyword + `},"l":{"type":"array","uniqueItems":true}}}`)}
+		for _, args := range []string{`{"n":1e-10000000}`, `{"n":1e-1000000000}`, `{"n":0.1e-9223372036854775808}`, `{"n":-1E-1000001}`,
+			`{"l":[1e-10000000` + strings.Repeat(`,1`, 30) + `]}`} {
+			err := agentrt.CheckArgs(spec, json.RawMessage(args))
+			if err == nil || !strings.HasPrefix(err.Error(), "arguments are not usable JSON: number ") {
+				t.Errorf("%s %.40s: %v", keyword, args, err)
+			}
+		}
+		if err := agentrt.CheckArgs(spec, json.RawMessage(`{"n":1e-10000}`)); err != nil && !strings.Contains(err.Error(), "do not match schema") {
+			t.Errorf("%s: a number at the bound: %v", keyword, err)
+		}
+	}
+}

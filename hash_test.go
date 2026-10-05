@@ -221,3 +221,32 @@ func TestApprovalHash_ErrorsRatherThanSubstituting(t *testing.T) {
 		t.Fatalf("hashes %q %v, %q %v; want errors", a, errA, b, errB)
 	}
 }
+
+// A number whose exponent, written or implied by its digits, is past what
+// the schema library can read made validation panic. A number past the
+// bound is refused where it enters, wherever it sits and however its
+// exponent is spelled; one at the bound, or text in a string, is not.
+func TestCheckJSON_RefusesNumbersPastTheBound(t *testing.T) {
+	long := func(n int) string { return "0." + strings.Repeat("1", n-2) }
+	for _, ok := range []string{`1e308`, `-4.9e-324`, `1e10000`, `{"n":1e-10000}`, `1E+10000`, `{"n":-1e-000000000010000}`,
+		`{"n":` + long(maxNumberLength) + `}`, `"1e-10000000"`, `{"1e-10000000":0}`, `{"n":12345678901234567890123456789012345678901234567890}`} {
+		if err := checkJSON(json.RawMessage(ok)); err != nil {
+			t.Errorf("%.40s: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{`{"n":1e-10000000}`, `{"n":1e-1000000000}`, `{"n":0.1e-9223372036854775808}`, `[1e-9223372036854775808]`,
+		`1e9223372036854775807`, `1e10001`, `{"n":[{"m":-2E-10001}]}`, `{"n":1e-0000000000000010001}`, `1e-99999999999999999999999`} {
+		if err := checkJSON(json.RawMessage(bad)); err == nil || !strings.Contains(err.Error(), "exponent beyond ±10000") {
+			t.Errorf("%.40s: %v", bad, err)
+		}
+	}
+	for _, bad := range []string{`{"n":` + long(maxNumberLength+1) + `}`, `{"n":0.` + strings.Repeat("0", 1000000) + `1}`} {
+		if err := checkJSON(json.RawMessage(bad)); err == nil || !strings.Contains(err.Error(), "longer than 10000 characters") {
+			t.Errorf("%.40s: %v", bad, err)
+		}
+	}
+	// A value refused before the bound existed keeps its reason.
+	if err := checkJSON(json.RawMessage(`{"n":1e10001}`)); err == nil || strings.Contains(err.Error(), "exponent") {
+		t.Errorf("a number past float64 nested in an object: %v", err)
+	}
+}

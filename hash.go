@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -195,13 +196,96 @@ func checkDepth(raw []byte) error {
 	return nil
 }
 
+// maxNumberLength and maxNumberExponent bound a JSON number the runtime
+// accepts from a consumer: its literal at most 10000 bytes, and the
+// exponent written after its e or E at most 10000 in absolute value. The
+// schema validator reads a number as a big.Rat, which refuses a decimal
+// exponent, written or implied by the digits after the point, past a
+// million and leaves nil for it, and validation against minimum, maximum,
+// the exclusive bounds, multipleOf, or uniqueItems then dereferences that
+// nil and panics: a single argument such as 1e-10000000 brought the
+// process down. Below the library's limit a number still costs time in
+// proportion to its exponent. float64 reaches 1e308, and IEEE decimal128,
+// the widest exponent range in common use, 1e6144, so no number a tool
+// legitimately takes comes near either bound, and together they keep the
+// implied exponent fifty times inside the library's limit.
+const (
+	maxNumberLength   = 10000
+	maxNumberExponent = 10000
+)
+
+// checkNumbers rejects a number past maxNumberLength or maxNumberExponent.
+// It reads number literals outside strings and needs no valid input.
+func checkNumbers(raw []byte) error {
+	inString := false
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if inString {
+			switch c {
+			case '\\':
+				i++
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+			continue
+		}
+		if c != '-' && (c < '0' || c > '9') {
+			continue
+		}
+		start := i
+		for i < len(raw) && strings.IndexByte("0123456789+-.eE", raw[i]) >= 0 {
+			i++
+		}
+		if err := checkNumber(raw[start:i]); err != nil {
+			return err
+		}
+		i--
+	}
+	return nil
+}
+
+func checkNumber(lit []byte) error {
+	quoted := lit
+	if len(quoted) > 24 {
+		quoted = append(append([]byte(nil), lit[:24]...), "..."...)
+	}
+	if len(lit) > maxNumberLength {
+		return fmt.Errorf("number %s is longer than %d characters", quoted, maxNumberLength)
+	}
+	e := bytes.IndexAny(lit, "eE")
+	if e < 0 {
+		return nil
+	}
+	exp := bytes.TrimLeft(bytes.TrimLeft(lit[e+1:], "+-"), "0")
+	// Five digits hold every exponent up to the bound, and more cannot.
+	if len(exp) > 5 {
+		return fmt.Errorf("number %s has an exponent beyond ±%d", quoted, maxNumberExponent)
+	}
+	n := 0
+	for _, d := range exp {
+		n = n*10 + int(d-'0')
+	}
+	if n > maxNumberExponent {
+		return fmt.Errorf("number %s has an exponent beyond ±%d", quoted, maxNumberExponent)
+	}
+	return nil
+}
+
 // checkJSON is the boundary check for JSON a consumer hands the runtime:
 // decision arguments and results, tool content, approval capabilities and
 // presentations, and a reconciliation's result. It requires exactly one
 // well-formed value nested no deeper than maxJSONDepth, valid UTF-8
-// throughout, no escaped surrogate outside a pair, and no object with a
-// repeated key. The last three are accepted by encoding/json but decoded
-// lossily, which would let two different documents share a hash.
+// throughout, no escaped surrogate outside a pair, no object with a
+// repeated key, and no number past maxNumberLength or maxNumberExponent.
+// Invalid UTF-8, lone surrogates, and repeated keys are accepted by
+// encoding/json but decoded lossily, which would let two different
+// documents share a hash; such a number makes the schema validator panic.
+// The number bound is checked last, so a value refused before it existed
+// is refused with the same reason.
 func checkJSON(raw json.RawMessage) error {
 	if err := checkDepth(raw); err != nil {
 		return err
@@ -215,6 +299,16 @@ func checkJSON(raw json.RawMessage) error {
 	if err := checkSurrogates(raw); err != nil {
 		return err
 	}
+	if err := checkKeys(raw); err != nil {
+		return err
+	}
+	return checkNumbers(raw)
+}
+
+// checkKeys rejects an object with a repeated key in valid JSON. Its
+// tokens decode numbers as float64, so a number past float64's range
+// nested in an array or object is refused here too, as it always was.
+func checkKeys(raw json.RawMessage) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	// A stack of the keys seen in each open object; nil marks an array.
 	var stack []map[string]bool

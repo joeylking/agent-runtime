@@ -1202,3 +1202,35 @@ func TestGate_ClosedSessionsLeaveNoGoroutine(t *testing.T) {
 	}
 	settled(t, base)
 }
+
+// A number past the bound proposed through a gate is an invalid decision,
+// as through the Driver: before the bound, validating it against a
+// minimum panicked inside Propose and took down whatever ran the gate.
+func TestGate_HugeNumberIsAnInvalidDecision(t *testing.T) {
+	ctx := context.Background()
+	w := newTwin(t)
+	pay := counted("pay", RemoteMutation)
+	pay.spec.InputSchema = []byte(`{"type":"object","properties":{"n":{"type":"number","minimum":0,"multipleOf":0.01}},"additionalProperties":false}`)
+	g := w.gate(t, []Tool{pay}, PolicyFunc(func(context.Context, ToolRequest, RunView) (PolicyDecision, error) {
+		return PolicyDecision{Outcome: Allow}, nil
+	}))
+	s, err := g.Begin(ctx, "r", "g", leaseLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for i, n := range []string{`1e-10000000`, `0.1e-9223372036854775808`} {
+		st, err := s.Step(ctx)
+		if err != nil || st == nil || st.Index() != i {
+			t.Fatalf("step %d: %v %v", i, st, err)
+		}
+		v, err := st.Propose(ctx, call("pay", `{"n":`+n+`}`))
+		if err != nil || v.Outcome != VerdictDenied || v.Observation == nil || v.Observation.Kind != ObserveInvalidDecision ||
+			!strings.Contains(v.Observation.Summary, "exponent beyond") {
+			t.Fatalf("%s: %+v %v", n, v, err)
+		}
+	}
+	if pay.calls.Load() != 0 {
+		t.Fatal("the tool ran")
+	}
+}
