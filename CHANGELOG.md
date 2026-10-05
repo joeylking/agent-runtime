@@ -13,10 +13,21 @@ entry names a specific module only when the change is not in the core.
 
 ## [Unreleased]
 
+## [v0.4.0] - 2026-10-05
+
+Nested modules `mcp` released at v0.2.1, `export/otel` at v0.1.1, and
+`proxy` at v0.1.0, its first tag; all pin this core release. `providers/ollama`,
+`providers/anthropic`, `providers/openai`, and `bench` are re-pinned to it
+without a new tag, because their code did not change.
+
 Everything here is additive, except that a number past the new bound is
-refused where consumer JSON enters (see Security). A consumer that runs on
-`Driver` calls nothing that changes, and no migration or operator step is
-needed.
+refused where consumer JSON enters (see Security). An upgrade from v0.3.x
+needs nothing beyond re-pinning: a consumer that runs on `Driver` calls
+nothing that changes, and no migration or operator step is needed. The
+number bound is the one behaviour a consumer could notice, and the first
+Security entry is a reason to upgrade, because the crash it fixes is in every
+release through v0.3.2. The minor bump marks the change of identity recorded
+in ADR 7, not an incompatible change.
 
 ### Added
 
@@ -59,7 +70,7 @@ needed.
   its policy and the tool start, and `AfterAttachAllowed`, which abandons an
   approved step after `Attach` allowed it. `Result.Inputs` is empty for a
   `Loop`, and `SameRenders` still needs an agent.
-- **`proxy` (new nested module, not yet tagged): `agentrt-proxy`, the gate
+- **`proxy` (new nested module, first tagged at v0.1.0): `agentrt-proxy`, the gate
   in front of an MCP host.** A local MCP proxy over stdio: a host starts it as
   its MCP server, it loads the upstream servers through `mcp`, offers only
   their classified, pinned tools and a status tool, and routes every
@@ -91,8 +102,9 @@ needed.
   `check`. The configuration is one JSON file with unknown fields refused.
   It keeps an index of its calls in a table of its own, `proxy_calls`, in the
   same database, under its own migrations; the runtime's schema is
-  unchanged. It needs the unreleased `Gate` and `mcp.ReadOwned`, so it builds
-  only in a workspace until both are released. [docs/proxy.md](docs/proxy.md)
+  unchanged. It needs `Gate` and `mcp.ReadOwned`, which are in core v0.4.0
+  and `mcp/v0.2.1`, and it pins them, so it builds on its own, with no
+  workspace. [docs/proxy.md](docs/proxy.md)
   and [ADR 8](docs/decisions/0008-mcp-proxy.md) say what it does and does not
   govern. `go run ./proxy/example` demonstrates it with no model.
 - **`agentrt.CanonicalJSON` returns the form the runtime hashes.** Object
@@ -103,7 +115,7 @@ needed.
 - **`mcp`: `ReadOwned`, `OwnedPrivately`, `ReadManifest`, `ReadRules`, and
   `FileRule`.** The operator-file readers `examples/mcp` has, added to the
   module so the proxy reads the same files under the same rule (the example
-  keeps its own copies until an `mcp` release carries these): a manifest or
+  keeps its own copies): a manifest or
   rules file is read only when the current user owns it and its group and
   others cannot write it, and a rules file with a field the format does not
   know is refused. `examples/mcp` is unchanged and still uses its own
@@ -799,7 +811,8 @@ step, failure, loop, call, token, cost, and time limits, an accounting
 model caller with retries, record and replay models, and an audit log
 written with the state. See `docs/architecture.md` and `docs/status.md`.
 
-[Unreleased]: https://github.com/joeylking/agent-runtime/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/joeylking/agent-runtime/compare/v0.4.0...HEAD
+[v0.4.0]: https://github.com/joeylking/agent-runtime/compare/v0.3.2...v0.4.0
 [v0.3.2]: https://github.com/joeylking/agent-runtime/compare/v0.3.1...v0.3.2
 [v0.3.1]: https://github.com/joeylking/agent-runtime/compare/v0.3.0...v0.3.1
 [v0.3.0]: https://github.com/joeylking/agent-runtime/compare/v0.2.1...v0.3.0

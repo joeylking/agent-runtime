@@ -33,7 +33,7 @@ Pre-1.0, so only the current release line is fixed:
 | `github.com/joeylking/agent-runtime/mcp` | the latest tag |
 | `github.com/joeylking/agent-runtime/bench` | the latest tag |
 | `github.com/joeylking/agent-runtime/export/otel` | the latest tag |
-| `github.com/joeylking/agent-runtime/proxy` | not yet released |
+| `github.com/joeylking/agent-runtime/proxy` | the latest tag |
 
 Older minors and older nested-module tags get no fixes. A nested module names
 the core version it requires, so a core fix may need that module re-tagged too.

@@ -269,7 +269,7 @@ for a caller's loop, with the `Driver` running on the same code,
 **Done when** a loop written outside the runtime leaves the same record as
 the `Driver`, and the crash harness runs over it.
 
-**Status.** Built and verified, not yet released. ADR 7 has the
+**Status.** Built, verified, and released in v0.4.0. ADR 7 has the
 reasoning and the limits: a fresh step's gap between `Propose` and
 `Execute` bounded by the lease and nothing else. The language-neutral
 question ADR 7 left open was researched on 2026-10-05, with an inventory
@@ -279,7 +279,8 @@ a measurement of how models answer a pending result. Its first form is
 which routes an MCP host's tool calls through a `Gate`, one run per call.
 It is built as a small, scoped experiment, with what it cannot govern
 stated first ([docs/proxy.md](proxy.md), [ADR 8](decisions/0008-mcp-proxy.md)),
-and is not yet released. The Go library remains the full form.
+and is released as `proxy/v0.1.0`, alongside core v0.4.0. The Go library
+remains the full form.
 
 ### 10. Re-checkable decisions
 
@@ -324,6 +325,6 @@ small additions the consumers' adoption asked for. Item 7 stays open for
 each idea built from here.
 
 The gate, item 9, was added on 2026-10-05 after the research pass ADR 7
-records, and is not yet released; its first form outside Go, the stdio MCP
-proxy of ADR 8, followed the same day and is not released either. The order from there is items 10, 11,
+records, and is released in v0.4.0; its first form outside Go, the stdio MCP
+proxy of ADR 8, followed the same day and is released as `proxy/v0.1.0`. The order from there is items 10, 11,
 and 12, with item 12 as research.

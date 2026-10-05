@@ -124,8 +124,13 @@ already have. It exists for the controls around each action.
 
 ## Status
 
-The current release is v0.3.2. Both consumers run on v0.3.1, and v0.3.2
-only adds to it. The runtime includes the packages that both consumers had
+The current release is v0.4.0. Both consumers still run on v0.3.x, and v0.4.0
+only adds to it: an upgrade needs nothing beyond re-pinning. It carries the
+gate, which lets a program with its own loop use the runtime's controls, the
+exported `agentrt.CanonicalJSON`, and a security fix for numbers that crashed
+schema validation, present in every release through v0.3.2. The nested module
+`proxy`, a local MCP proxy built on the gate, is tagged at v0.1.0 as an
+experiment. The runtime includes the packages that both consumers had
 written separately, an adapter that puts the tools of any MCP server behind
 the policy, and the groundwork for outside contributors. These are items 1,
 2, and 8 of the [roadmap](docs/roadmap.md). Items 3 to 6, the evaluation
@@ -287,7 +292,7 @@ hands it each decision. A `Gate` takes the place of the driver: it records,
 checks, and authorizes each proposed action, pauses for an approval when
 policy asks, and runs the tool itself, so an action runs only when the
 policy allows it, once per approval, however the loop is written. The gate
-is not in a release yet.
+is in v0.4.0.
 [ADR 7](docs/decisions/0007-own-the-effect-not-the-loop.md) explains why it
 exists and what it does not cover, and the [architecture](docs/architecture.md)
 describes the session and what an abandoned one leaves behind.
@@ -340,7 +345,7 @@ It governs only the calls that go through it. A host that also gives the
 model a shell or file access lets the model go around it, and even approve
 its own request. [docs/proxy.md](docs/proxy.md) says what it does and does not
 do, and `go run ./proxy/example` shows it with no model at all. It is an
-experiment, not yet released; the Go library is the full form.
+experiment, released as `proxy/v0.1.0`; the Go library is the full form.
 
 ## What a consumer no longer has to write
 

@@ -590,8 +590,8 @@ report; with the file above it registers `fs_list_directory`,
 `fs_read_text_file`, and `fs_write_file` and lists the server's other eleven
 tools as unclassified. It exits non-zero when a server registers nothing.
 
-Until the proxy is released it is built from this repository, with the
-workspace [CONTRIBUTING.md](../CONTRIBUTING.md) describes:
+The proxy builds standalone against the versions its `go.mod` pins, with no
+workspace; from this repository:
 
 ```sh
 (cd proxy && go build -o ~/bin/agentrt-proxy ./cmd/agentrt-proxy)

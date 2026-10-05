@@ -388,7 +388,7 @@ research pass and not by a consumer, and the roadmap says so.
 ## The MCP proxy
 
 See ADR 8 and [proxy.md](proxy.md). The first form of the gate outside Go, a
-nested module, not yet released.
+nested module, released as `proxy/v0.1.0`.
 
 | Capability | Status | Reference |
 |---|---|---|
