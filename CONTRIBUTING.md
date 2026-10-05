@@ -6,7 +6,10 @@
 added when a consumer demonstrates the need, not before. The two consumers are
 [repo-steward](https://github.com/joeylking/repo-steward) and
 [casework](https://github.com/joeylking/casework). Everything public in the
-runtime today exists because one of them wrote it first, or wrote it twice.
+runtime today exists because one of them wrote it first, or wrote it twice,
+with one deliberate exception: the `Gate`, which came from outside research,
+and which [ADR 7](docs/decisions/0007-own-the-effect-not-the-loop.md)
+records. It does not loosen the rule for anything else.
 
 So a change starts with the need, not the code. Open an issue with the
 **consumer need** template: who the consumer is, what it had to build itself,
@@ -230,7 +233,8 @@ Read a neighbouring file first; these are the rules it follows.
 - Doc comments are terse and say why, not what the code already says. Every
   exported symbol has one.
 - Every exported symbol is justified by a consumer requirement. If you cannot
-  name the consumer, keep it unexported.
+  name the consumer, keep it unexported. The `Gate` and what came with it are
+  the one recorded exception.
 - No speculative abstraction: no interface with one implementation and no
   option nobody passes.
 - Tests are named `TestX_Behaviour`, where `X` is the thing under test and the

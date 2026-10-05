@@ -13,6 +13,71 @@ entry names a specific module only when the change is not in the core.
 
 ## [Unreleased]
 
+Everything here is additive. A consumer that runs on `Driver` calls nothing
+that changes, and no migration or operator step is needed.
+
+### Added
+
+- **The runtime's controls for a loop it does not own: `Gate`.** A caller's
+  loop proposes each action and the gate records it, validates its
+  arguments, evaluates policy, pauses on a hash-bound approval, enforces the
+  limits, takes the run's lease, executes the tool, and writes the
+  observation and the audit events in the same transactions. `NewGate`
+  takes a `GateConfig`, which is `Config` without an agent. `Gate.Begin`
+  creates a run with a caller-chosen id and `Gate.Attach` takes an existing
+  one, each returning a `Session`. `Session.Step` starts a step, and
+  `OpenStep.Propose`, `Execute`, and `Fail` decide it, run it, and end it
+  when the decision could not be made; `OpenStep.Model` is the step's
+  accounting `ModelCaller`. `Propose` answers with a `Verdict` whose outcome
+  is `VerdictAllowed`, `VerdictDenied`, `VerdictPending`, or
+  `VerdictEnded`, and a session that is over refuses further calls, with
+  `ErrSessionClosed` after `Close` or a failed call. The gate executes the
+  tool itself: a path where the caller runs it and reports back does not
+  exist. A session abandoned at any point leaves the record a crash would,
+  and `Attach` handles it by the interrupted-side-effect contract of ADR 6.
+  [ADR 7](docs/decisions/0007-own-the-effect-not-the-loop.md) has the
+  reasoning and the limits: Go only, and a fresh step's gap between
+  `Propose` and `Execute` covered by the lease and no other limit.
+- **`Decision.Origin` records who proposed a step.** `OriginModel`,
+  `OriginPlan`, and `OriginOperator` are the known values. An empty origin is
+  not stored, so a decision without one is recorded exactly as before, and
+  the approval hash is unchanged; an unknown value makes the decision
+  invalid, recorded verbatim with an `invalid_decision` observation. Policy
+  does not see it. `export/otel` carries it as the span attribute
+  `agentrt.decision.origin` when set. Nothing sets `plan` yet.
+- **`Session.Input` gives a loop that decides from the run's record what an
+  agent is handed.** It returns a `StepInput` of copies: for an open step,
+  exactly what `Decide` receives at that step, and with no step open the run
+  as the session last wrote it and every recorded step. It reads no clock,
+  and after its first call reads nothing from the store.
+- **`testkit.Scenario.Loop` runs the crash and resume harness over a
+  caller's own loop on a `Gate`,** in place of a `Driver` and its agent. It
+  adds two crash points: `AfterAllowed`, which abandons a loop holding an
+  allowed verdict before `Execute` and which a `Driver` reaches too between
+  its policy and the tool start, and `AfterAttachAllowed`, which abandons an
+  approved step after `Attach` allowed it. `Result.Inputs` is empty for a
+  `Loop`, and `SameRenders` still needs an agent.
+
+### Changed
+
+- **The `Driver` runs on the gate's code.** `Start` and `Resume` are now a
+  session and the same sequence a `Gate` runs, so there is one
+  implementation of it. Nothing a consumer sees changes: the rows, events,
+  payloads, transaction boundaries, and clock readings are the same, and
+  `TestGate_ExternalLoopMatchesTheDriver` holds a loop outside the runtime
+  to them.
+
+### Security
+
+- **A grant is judged against `Limits.GrantTTL` again at `Execute`.** A
+  caller of a gate holding an approved step, which `Attach` had allowed,
+  could execute it after the grant's TTL had passed, because the TTL was
+  judged only at `Attach`. `Execute` now reads the clock again, expires the
+  approval, cancels the run as `approval_expired`, executes nothing, and ends
+  the session with an error matching `ErrApprovalExpired`. This was never in
+  a release, because the gate is new, and the `Driver` is unaffected: it
+  acts on a grant in the call that judged it.
+
 ## [v0.3.2] - 2026-10-03
 
 Nested module `bench` released at v0.1.1; `export/otel` v0.1.0 and the

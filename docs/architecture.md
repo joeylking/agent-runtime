@@ -1,7 +1,9 @@
 # Architecture
 
-agent-runtime is a library. A consumer supplies an agent, a set of tools,
-and a policy; the runtime supplies the loop and every control around it.
+agent-runtime is a library. A consumer supplies a set of tools and a
+policy, and either an agent, for which the runtime supplies the loop, or a
+loop of its own, which the runtime gates. The controls around each action
+are the same.
 
 ## The loop
 
@@ -43,6 +45,10 @@ A loop loads its run's steps and approvals once, when `Start` or `Resume`
 enters it, and keeps them. After each write commits, the loop decodes the
 columns that write stored, so what it keeps equals a fresh load. It still
 reads the run row at every step. `docs/performance.md` has the numbers.
+
+The `Driver` is a gate with an agent: its loop asks the agent to decide and
+passes each decision through the same session a `Gate` hands to a caller,
+so the sequence above is written once. See [The gate](#the-gate).
 
 JSON a consumer supplies is checked where it enters: decision arguments
 and results, tool content, approval capabilities and presentations, and a
@@ -133,7 +139,8 @@ it was requested; it bounds only the wait for a decision, never a grant.
 With `Limits.GrantTTL` set, a grant expires that long after it was
 decided if `Resume` has not acted on it by then: `Resume` finds it
 expired and cancels the run as `approval_expired`, as it does a stale
-pending one, and nothing executes. `GrantTTL` is zero by default, which
+pending one, and nothing executes. A gate's `Attach` judges it the same
+way, and its `Execute` judges it again. `GrantTTL` is zero by default, which
 is no expiry, and a run stored before it existed reads it as zero; a
 consumer that refuses a stale grant in its own tool, as casework does,
 leaves it unset.
@@ -212,6 +219,106 @@ again, under an approval that says the first attempt's outcome is
 unknown. A resume that marked the step interrupted and stopped before
 pausing it leaves it for the next resume to pause.
 
+## The gate
+
+A `Gate` is the runtime's controls for a loop the runtime does not own.
+`GateConfig` is `Config` without an agent: a store, a policy, tools, and
+the same observer, model configuration, reconciliation, clocks, and lease
+settings. The caller decides what to do next, and the gate decides whether
+each action runs, runs it, and records it. A gate executes the tool
+itself; there is no path where the caller runs it and reports back,
+because at-most-once would then be the caller's promise and not something
+the runtime enforces. ADR 7 has the reasoning.
+
+`Begin` creates a run with a caller-chosen id and `Attach` takes an
+existing one, doing what `Start` and `Resume` do before their loops. Each
+returns a `Session`, one hold on a run with its lease, renewed by a
+heartbeat for as long as the session is open. A session has at most one
+open step and its calls are serialised. `Step` checks the limits and
+starts a step as the driver does before asking its agent; a limit ends the
+run there, and `Step` returns no step and no error. On the open step,
+`Propose` takes the decision, `Execute` runs what it allowed, and `Fail`
+ends it when the decision could not be made, as the driver ends a run whose
+agent returned an error. `OpenStep.Model` is the step's accounting
+`ModelCaller`, held to the run's limits, for a loop that calls a model
+through the runtime. The caller's code is trusted as an `Agent` is: the
+gate bounds what it can make happen, not what it proposes.
+
+`Propose` records the decision verbatim, validates it, and evaluates policy,
+and answers with a `Verdict`:
+
+- `allowed`: the request may run. `Execute` runs exactly it, and the
+  verdict's request is a copy, so changing it changes nothing.
+- `denied`: the policy denied the request, or the decision was invalid. The
+  step ended with a failure observation, which counts toward the
+  consecutive failure limit, and the session continues with the next step.
+- `pending`: the policy required approval. The run is WAITING on a
+  hash-bound approval and the session is over; approve it, then `Attach`.
+- `ended`: the run reached a terminal status, by a complete or fail
+  decision or a policy abort. A terminal tool ends it at `Execute`, after
+  which `Done` reports the session over and `Run` the run.
+
+A session that is over refuses every later call: with `ErrRunState` when the
+run paused or ended, `ErrLeaseLost` when the lease was lost, and
+`ErrSessionClosed` after `Close` or a failed call. `Attach` after an
+approval returns the verdict for the recorded request, with policy
+re-evaluated as `Resume` does; `allowed` leaves that step open as
+`Session.Current`, for `Execute`, with the run still WAITING until `Execute`
+moves it to RUNNING, taking the lease, as it starts the tool. A caller's
+`Close` releases the lease, so another process need not wait for it to
+expire; a session left open holds a heartbeat until closed.
+
+What an abandoned session leaves is what a crash would, and `Attach`
+treats it so:
+
+- After `Step` and before `Propose`: the step is deciding. `Attach` marks it
+  interrupted and the loop goes on.
+- After an `allowed` verdict from `Propose`, before `Execute`: nothing about
+  the request is written but its decision, so the step is still deciding.
+  `Attach` marks it interrupted and runs nothing, and the abandoned step
+  can no longer execute once another session holds the run.
+- During `Execute`: the step is executing, and what follows is ADR 6's
+  contract. With no `GateConfig.Reconcile`, `Attach` pauses the run as
+  `interrupted_side_effect` for a tool that is not `ReadOnly`, and the tool
+  runs again only if an operator approves. The tool already running is not
+  recalled, and its outcome is recorded only if its session still holds the
+  lease.
+- After `Attach` returned `allowed` for an approved step, before `Execute`:
+  nothing was written. The approval is still approved and the run still
+  WAITING, and the next `Attach` finds the grant and runs it once.
+- After `pending` or `ended`: the session is already over and there is
+  nothing to abandon.
+
+The `Propose` to `Execute` gap of a fresh step is covered by the session's
+lease and by no other limit, as an agent's slow `Decide` is: the time limits
+are checked at `Step`. An approved step holds no lease while it waits, so
+`Limits.GrantTTL` bounds it. `Attach` judges the grant's age when it allows
+it, and `Execute` judges it again on a fresh reading of `Now`: a grant that
+expired since cancels the run as `approval_expired`, executes nothing, and
+ends the session with an error that matches `ErrApprovalExpired`. The
+`Driver` acts on a grant in the call that judged it, so only a gate's caller
+can wait.
+
+`Session.Input` returns what an agent deciding at that point would be handed
+as `StepInput`, for a loop that decides from the run's record. With a step
+open it is that step's input, as `Decide` receives it. With none open it is
+the run as the session last wrote it and every recorded step. It is a copy,
+served from the steps and approvals the session already keeps, so a call
+reads no clock and nothing from the store after the first.
+
+`Decision.Origin` records who proposed a step: `model`, `plan`, or
+`operator`. The runtime records it and attaches no behaviour to it, and
+policy does not see it. Empty is not stored, so a decision without an origin
+is recorded as before it existed, and an unknown value is an invalid
+decision. `export/otel` carries it as `agentrt.decision.origin`. Nothing
+sets `plan` yet.
+
+`testkit.Scenario.Loop` runs the crash harness over a caller's own loop on a
+gate, with two crash points that only a caller of a gate has:
+`AfterAllowed`, an abandoned `allowed` verdict, which a `Driver` reaches
+too between its policy and the tool start, and `AfterAttachAllowed`, an
+abandoned approved step, which only a `Loop` reaches.
+
 ## Time
 
 Two clocks are read. `Config.Now` stamps what is recorded and judges
@@ -227,7 +334,8 @@ affects them differently:
 - Approval expiry is judged at the next touch, by the clock of whoever
   touches it: the driver's `Now` for `Driver.Approve` and `Resume`, the
   wall clock for the package functions. A grant's `GrantTTL` is judged
-  only by `Resume`, with the driver's `Now`, against the grant's
+  only where a grant is acted on, by `Resume`, or by a gate's `Attach` and
+  `Execute`, with the driver's or gate's `Now`, against the grant's
   `DecidedAt`. A suspension neither extends nor
   shortens an expiry; a deterministic `Now` that does not advance never
   expires anything.
@@ -330,8 +438,9 @@ core.
   - `export`: a read-only follower of the events table that hands each event,
     in commit order and from a cursor, to a sink, with a JSON Lines sink.
   - `testkit`: what a consumer's tests use without a model: a crash and
-    resume harness, a policy conformance table, schema fuzzing of tool
-    arguments, and a render equivalence check.
+    resume harness, which also runs over a caller's own loop on a `Gate`, a
+    policy conformance table, schema fuzzing of tool arguments, and a render
+    equivalence check.
   - `approver`: the interface an operator surface decides approvals
     through, bound to the hash it showed, and its store-backed
     implementation.

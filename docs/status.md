@@ -351,6 +351,39 @@ casework's server decide through the approver, bound to the hash shown.
 | `Store.ApprovalReason` returns the pausing policy's reason even after a resume-time decision | Verified | `TestStore_ApprovalReasonIsThePausingPolicys` |
 | `CompileTool`, `ToolSchema.Check`, and `CheckArgs` give exactly the driver's acceptance and refusal text, compiling a spec once | Verified | `TestCheckArgs_IsTheDriversAcceptance`, `TestCheckArgs_CompilesOnceForASpec` |
 
+## The gate
+
+See ADR 7. Not an item of the roadmap's first eight: it was justified by a
+research pass and not by a consumer, and the roadmap says so.
+
+| Capability | Status | Reference |
+|---|---|---|
+| A loop written outside the runtime, driven through a `Gate`, leaves the same rows, events, payloads, transactions, and clock readings as the `Driver` running the same decisions; the `Driver` runs on the gate's code | Verified | `gate.go`, `loop.go`, `TestGate_ExternalLoopMatchesTheDriver` |
+| `NewGate` checks what `NewDriver` checks, without an agent | Verified | `TestGate_ConfigIsValidated` |
+| A denial is an observation and the session goes on; an abort ends the run and the session refuses every call after it | Verified | `TestGate_DenyContinuesAndAbortEnds` |
+| A request that needs approval pauses the run and ends the session; after approval `Attach` returns the step allowed and `Execute` runs exactly the recorded request, whatever the caller does to the verdict it was shown | Verified | `TestGate_ApprovedStepExecutesTheRecordedRequest` |
+| Policy is re-evaluated at `Attach`: a different required approval pauses again and nothing runs, and rejecting it cancels the run | Verified | `TestGate_ChangedPolicyRepausesAndRejectCancels` |
+| The step, consecutive failure, and loop limits fire in `Step`, which returns no step and no error | Verified | `TestGate_LimitsFireThroughStep` |
+| The call, token, and cost limits fire in the step's `ModelCaller` before anything is sent, and `Fail` ends the run with the limit's reason | Verified | `TestGate_ModelLimitsFireThroughTheStepsModel` |
+| A session refuses, with typed errors and without changing anything, a second open step, an `Execute` with no allowed verdict, a second `Execute`, a second decision, and every call after `Close` | Verified | `TestGate_MisuseIsRefused` |
+| A session whose lease was lost refuses every call with `ErrLeaseLost` and starts nothing | Verified | `TestGate_CallsAfterTheLeaseIsLostAreRefused` |
+| While one session holds a run another `Begin` or `Attach` of it is refused and changes nothing; after `Close` the run is free without waiting for the lease | Verified | `TestGate_SecondSessionIsRefused` |
+| A session abandoned between an allowed verdict and `Execute` runs nothing: a fresh gate marks the step interrupted, and the abandoned step cannot execute | Verified | `TestGate_AbandonedAfterAllowedRunsNothing` |
+| A session abandoned during `Execute` pauses the run as `interrupted_side_effect` for a fresh gate with no `Reconcile`; the tool runs again only when an operator approves, and the abandoned session cannot record over the run | Verified | `TestGate_AbandonedDuringExecutePausesForAnOperator` |
+| An approved step `Attach` left allowed and the caller abandoned is still approved and the run still WAITING with nothing written; the next `Attach` runs it once | Verified | `TestGate_AbandonedApprovedStepStaysApproved` |
+| A gate with every session over, ended or closed, holds no goroutine | Verified | `TestGate_ClosedSessionsLeaveNoGoroutine` |
+| `Limits.GrantTTL` is judged again at `Execute`: a grant that expired while the caller waited cancels the run as `approval_expired`, executes nothing, and ends the session with `ErrApprovalExpired`; within the TTL, or with none, it executes however long the wait | Verified | `TestGate_GrantTTLHoldsUntilExecute` |
+| `Decision.Origin` is recorded with the decision and changes nothing else: a decision without one encodes as before, and the approval hash is the same with or without it | Verified | `TestDecision_OriginIsRecordedAndChangesNothingElse` |
+| An unknown origin is an invalid decision through a gate and a `Driver` alike; each known origin is accepted | Verified | `TestDecision_UnknownOriginIsInvalid` |
+| `export/otel` carries a decision's origin as `agentrt.decision.origin` when the payload names one, and omits it otherwise | Verified | `export/otel/otel.go`, `TestExporter_DecisionOrigin` |
+| `Session.Input` while a step is open is exactly what a `Driver`'s agent is handed at that step, and reads no clock | Verified | `TestGate_InputMatchesTheAgentsStepInput` |
+| Between steps `Session.Input` is the run as the session left it and every recorded step; after the first call none loads the steps again | Verified | `TestGate_InputAtEveryPointOfASession` |
+| What `Session.Input` returns is the caller's copy: writing into it changes neither the session's state nor the record | Verified | `TestGate_InputIsACopy` |
+| `testkit.Scenario.Loop` runs the crash harness over a caller's loop on a gate through every crash point, and every invariant of the run's record holds | Verified | `testkit/testkit.go`, `TestRun_GateLoopKeepsTheContractAtEveryCrash` |
+| Crash point `AfterAttachAllowed` abandons an approved step after `Attach`; the next `Attach` runs the grant once | Verified | `TestRun_GateLoopAbandonedAfterAttachRunsTheGrantOnce` |
+| Crash point `AfterAllowed` stops a `Driver` between its policy and the tool start, and runs nothing | Verified | `TestRun_DriverStopsAfterAllowed` |
+| A broken loop is reported: one that ignores the approved step, one that stops mid-step, and an error the loop returns | Verified | `TestRun_BrokenGateLoopsAreReported` |
+
 ## Not implemented
 
 | Capability | Where it is planned |

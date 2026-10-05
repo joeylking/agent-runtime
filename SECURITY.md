@@ -63,7 +63,19 @@ cannot influence.
   `Limits.GrantTTL`, zero by default, bounds how long an approved grant
   may wait for `Resume`, measured from its decision; a grant older than
   that is expired at `Resume`, the run is cancelled as `approval_expired`,
-  and nothing executes.
+  and nothing executes. A `Gate` judges it at `Attach` and again at
+  `Execute`, because its caller can hold an approved step and wait.
+- A `Gate` ([ADR 7](docs/decisions/0007-own-the-effect-not-the-loop.md))
+  holds the same bounds for a loop the runtime does not own: the caller
+  proposes, and the gate validates the arguments, evaluates policy, binds
+  approvals by hash, enforces the limits, takes the lease, and executes the
+  tool itself: what runs is the recorded or approved request, and not a
+  copy the caller changed. A caller that calls its own tools outside the
+  gate is outside every control here, as an agent's tool code is. The
+  caller's loop is the consumer's own code, trusted as an `Agent`
+  implementation is: the gate bounds what it can make happen, not what it
+  proposes, and a loop that is steered by untrusted content is bounded as a
+  steered model is.
 - `cmd/agentrt approve` and `reject` bind the decision to the hash of the
   approval they read and printed: they pass it to `agentrt.ApproveShown`
   or `RejectShown`, which compare it with the stored hash inside the
@@ -311,7 +323,7 @@ cannot influence.
   a database is not supported either: expiry and lease logic reads the
   local clock, and a host whose clock disagrees can misjudge how old a
   record is.
-- **The process.** The consumer's agent, tools, policy, and the runtime share
+- **The process.** The consumer's agent or gate loop, tools, policy, and the runtime share
   one address space. There is no sandbox: a tool can do whatever the process
   can, and a tool's side-effect class is a claim the operator makes about it,
   not something the runtime verifies. The database driver

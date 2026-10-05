@@ -68,6 +68,13 @@ deployment needs:
 | A database only its owner can use | The database file is created so that only its owner can read or write it. One that other users can write is refused, because anyone who can write it could forge an approval. These checks are skipped on Windows. |
 | Repeatable tests | The whole loop runs against a scripted agent or recorded model replies, so tests give the same result every time and never call a paid service. |
 
+These controls do not depend on the runtime running the loop. A program that
+already has its own loop, from another agent kit or written by hand, can
+hand each action it wants to take to the runtime, which checks it, asks the
+policy, pauses for approval when needed, runs it, and records it, in the
+same way. The program decides what to try next, and the runtime decides
+whether it happens.
+
 ## An example
 
 The demo in `examples/mcp` gives a local model access to a folder of files.
@@ -96,8 +103,9 @@ shows the need for it, and not before.
 
 agent-runtime runs one agent at a time and is a library, not a service. It
 does not coordinate several agents, schedule work, manage prompts, or give
-a model memory. The model loop is not the point either, since any vendor's
-kit has one. This library exists for the controls around the loop.
+a model memory. The loop is not the point either, since any vendor's kit
+has one. The library includes one, and its controls also work for a loop you
+already have. It exists for the controls around each action.
 
 ## Terms used on this page
 
@@ -107,6 +115,7 @@ kit has one. This library exists for the controls around the loop.
 | Agent | The program that asks the model for a decision at each step. |
 | Tool | One action the agent can request. Each tool declares the inputs it accepts and the kind of effect it has: read only, a local change, a remote change, or destructive. |
 | Policy | The rules, written as code, that decide whether a requested action runs. |
+| Gate | The part of the runtime that takes each action a program's own loop proposes, applies the controls, runs the action, and records it. |
 | Run | One execution of an agent toward a goal, from start to a final state. |
 | Step | One decision by the agent and what came of it. |
 | Approval | A person's decision to allow one specific request. |
@@ -270,6 +279,50 @@ model calls, tokens, spend, and time are off until the consumer sets them.
 A spend cap only works for a model in the price table. A model missing from
 the table is counted as free. Model calls are not retried unless
 `ModelConfig.MaxRetries` is set.
+
+## Using the gate from your own loop
+
+A program with its own loop gives the runtime the tools and the policy and
+hands it each decision. A `Gate` takes the place of the driver: it records,
+checks, and authorizes each proposed action, pauses for an approval when
+policy asks, and runs the tool itself, so an action runs only when the
+policy allows it, once per approval, however the loop is written. The gate
+is not in a release yet.
+[ADR 7](docs/decisions/0007-own-the-effect-not-the-loop.md) explains why it
+exists and what it does not cover, and the [architecture](docs/architecture.md)
+describes the session and what an abandoned one leaves behind.
+
+```go
+gate, _ := agentrt.NewGate(agentrt.GateConfig{
+    Store: store, Policy: agentrt.DefaultPolicy(), Tools: tools,
+})
+s, _ := gate.Begin(ctx, "run-1", "goal", agentrt.DefaultLimits())
+defer s.Close()
+for !s.Done() {
+    step, _ := s.Step(ctx)           // nil when a limit has ended the run
+    if step == nil {
+        break
+    }
+    v, _ := step.Propose(ctx, yourLoopDecides(s)) // an agentrt.Decision
+    if v.Outcome == agentrt.VerdictAllowed {
+        step.Execute(ctx)            // runs the allowed request, once
+    }
+    // VerdictPending: the run waits on an approval, and the session is over
+}
+
+// After an operator approves, in this process or another:
+s, v, _ := gate.Attach(ctx, "run-1")
+if v.Outcome == agentrt.VerdictAllowed {
+    s.Current().Execute(ctx)         // exactly the request that was approved
+}
+```
+
+`Propose` answers with a verdict: allowed, denied, pending, or ended. A
+denial is an observation and the loop continues. `Session.Input` returns
+what an agent would be handed, for a loop that decides from the run's
+record. `testkit.Scenario.Loop` runs the crash and resume harness over a
+loop like this one. `ExampleGate` in `example_test.go` is the complete,
+tested version.
 
 ## What a consumer no longer has to write
 

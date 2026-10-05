@@ -1,18 +1,28 @@
 # Roadmap
 
-agent-runtime is a library for running one tool-using agent under
-deterministic control. Two consumers, [repo-steward](https://github.com/joeylking/repo-steward)
+agent-runtime is a library that puts the actions of one tool-using agent
+under deterministic control, whether the runtime runs the agent's loop or
+the loop is the caller's own. Two consumers, [repo-steward](https://github.com/joeylking/repo-steward)
 and [casework](https://github.com/joeylking/casework), run on the current
 release. This roadmap turns what those consumers demonstrated into things
 other people can use. It is ordered by leverage, and every item names the
 consumer evidence that justifies it, because the rule from
 [ADR 1](decisions/0001-custom-runtime.md) still holds: abstractions are
-added when a consumer demonstrates the need, not before.
+added when a consumer demonstrates the need, not before. One exception is
+recorded: the gate, the first addition justified by outside research and
+not by a consumer, which [ADR 7](decisions/0007-own-the-effect-not-the-loop.md)
+explains. The rule still governs every other abstraction in the runtime.
 
 ## What the runtime is for
 
 Teams who need one agent to touch a real system and later show what it
-did and who authorized it. The controls that are not readily available
+did and who authorized it. The loop, durable state, a pause for approval,
+budgets, and tracing are standard in agent frameworks and in durable
+execution engines, so owning the loop is not what this project is for: it
+owns the effect, the moment a tool is called and something outside
+changes. Any loop proposes an action, and the runtime decides, executes,
+and records it. The `Driver` is the reference loop, and a `Gate` serves a
+loop the runtime does not own. The controls that are not readily available
 elsewhere, and that this project exists to provide:
 
 - approvals bound by hash to the exact request, durable across process
@@ -31,9 +41,11 @@ elsewhere, and that this project exists to provide:
 
 Not a workflow engine, not a multi-agent orchestrator, not a prompt or
 memory framework, not a service. Timers, fan-out, distributed workers,
-memory, and retrieval belong to other tools. The runtime stays a library
-that those tools could embed. Items that would move it off this line are
-refused, not deferred.
+memory, and retrieval belong to other tools, and so does deciding what an
+agent does next: the runtime does not have to run the loop, and it does not
+have to be the only thing that does. It stays a library that those tools
+could embed. Items that would move it off this line are refused, not
+deferred.
 
 ## Module layout
 
@@ -238,6 +250,59 @@ functions for pkg.go.dev, a stated pre-1.0 compatibility promise, a
 public roadmap issue mirroring this file, and support for the current
 and previous Go release.
 
+## Direction
+
+The gate is the first of a planned order of work. These are intentions, not
+promises, and they are in this order. The exception ADR 7 records is for
+the gate alone; each later item is justified when it is taken up.
+
+### 9. The gate
+
+**Problem.** The controls were available only to a loop the runtime owns,
+which stopped anyone with a loop of their own from using them.
+
+**Scope.** `Gate`, `Session`, `OpenStep`, and `Verdict`: the same controls
+for a caller's loop, with the `Driver` running on the same code,
+`Decision.Origin`, `Session.Input`, a `GrantTTL` re-check at `Execute`, and
+`testkit.Scenario.Loop`.
+
+**Done when** a loop written outside the runtime leaves the same record as
+the `Driver`, and the crash harness runs over it.
+
+**Status.** Built and verified, not yet released. ADR 7 has the
+reasoning and the limits: Go only, and a fresh step's gap between `Propose`
+and `Execute` bounded by the lease and nothing else. Whether a
+language-neutral form, such as an MCP proxy, should exist is being
+researched separately and is undecided.
+
+### 10. Re-checkable decisions
+
+**Problem.** An audit log says what was decided. It does not show that the
+same policy would decide it again.
+
+**Scope.** Each step records its tool spec by hash and the policy's
+identity, events are hash-chained, and a finished run can be replayed
+through a policy to show the same decisions.
+
+### 11. Argument-source rules
+
+**Problem.** A tool's arguments can carry authority, such as a path or a
+recipient, and a model can be steered into supplying the wrong one.
+
+**Scope.** Tool results an operator labels untrusted reach the loop as
+opaque handles, and arguments that carry authority must come from the run's
+goal, a trusted tool's result, or an approval. This constrains values. It
+does not prevent prompt injection, and the documentation says so.
+
+### 12. Policy-gated promotion
+
+**Problem.** A step an agent repeats could run without a model call.
+
+**Scope.** Research. Repeated agent steps may run as deterministic plan
+steps under the same gate, where promotion is itself an approved, recorded,
+reversible action. `Decision.Origin` exists for this: `plan` is a valid
+origin and nothing uses it yet.
+
 ## Sequence
 
 Items 1 and 2 shipped in v0.2.0 (core) with the nested modules at
@@ -251,3 +316,7 @@ The first six essays of item 7 were published the same day, in
 `docs/essays` and on the wiki; v0.3.2 and `bench/v0.1.1` collected the
 small additions the consumers' adoption asked for. Item 7 stays open for
 each idea built from here.
+
+The gate, item 9, was added on 2026-10-05 after the research pass ADR 7
+records, and is not yet released. The order from there is items 10, 11,
+and 12, with item 12 as research.
