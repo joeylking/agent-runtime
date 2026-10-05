@@ -38,7 +38,7 @@ Nested modules pin the core to its release tag, so working across them needs a
 workspace, which resolves the in-tree core instead:
 
 ```sh
-go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./bench ./export/otel ./examples/live ./examples/mcp
+go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./bench ./export/otel ./proxy ./examples/live ./examples/mcp
 ```
 
 `go.work` is not committed.
@@ -63,7 +63,7 @@ GOWORK=off go test -race -count=1 ./...
 Each nested module, through the workspace:
 
 ```sh
-for m in providers/ollama providers/anthropic providers/openai mcp bench export/otel examples/live examples/mcp; do
+for m in providers/ollama providers/anthropic providers/openai mcp bench export/otel proxy examples/live examples/mcp; do
   (cd "$m" && go vet ./... && go test -race -count=1 ./...)
 done
 ```
@@ -99,7 +99,7 @@ version belongs to the release check below, not here, because the
 workspace overrides that pin):
 
 ```sh
-for m in providers/ollama providers/anthropic providers/openai mcp bench export/otel examples/live examples/mcp; do
+for m in providers/ollama providers/anthropic providers/openai mcp bench export/otel proxy examples/live examples/mcp; do
   (cd "$m" && staticcheck ./... && govulncheck ./...)
 done
 ```
@@ -170,7 +170,9 @@ tagged:
    `export/otel` must be re-pinned to a core release that contains the
    `export` package its example imports. `bench` has no requirements at all,
    not even the core, so it has nothing to re-pin: it is tagged after the
-   core like the others, and this step does not apply to it.
+   core like the others, and this step does not apply to it. `proxy`
+   requires `mcp` as well as the core, so like the examples it is re-pinned
+   only once the new `mcp` tag exists, in step 5, and tagged after that.
 
    ```sh
    # Wait until the proxy serves the tag just pushed.
@@ -203,9 +205,13 @@ tagged:
    Push the tags one at a time: GitHub creates no push event when more
    than three tags arrive in one push, so the release check would not run
    for any of them.
-5. **Re-pin the examples** (`examples/live`, `examples/mcp`) to the new
-   nested-module tags, tidy, and push. Then run the release check once
-   more with its default inputs, which includes the examples.
+5. **Re-pin the examples** (`examples/live`, `examples/mcp`) and `proxy` to
+   the new nested-module tags, tidy, and push. Then run the release check once
+   more with its default inputs, which includes the examples, and once it is
+   green for that commit tag `proxy`. Until `proxy` first builds against
+   released versions, it is not in the release check's module list: the
+   first release that carries the `Gate` and `mcp.ReadOwned` adds it there
+   in this step (see the note in `.github/workflows/release-check.yml`).
 6. **Create a GitHub release for every tag** — the core's and each nested
    module's. The changelog's `## [Unreleased]` section becomes that
    release's dated section in `CHANGELOG.md`, and the GitHub release body

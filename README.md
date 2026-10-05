@@ -215,7 +215,7 @@ pinned by version and integrity hash in `examples/mcp/package-lock.json`, an
 because the example and the MCP adapter are nested modules:
 
 ```sh
-go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./bench ./export/otel ./examples/live ./examples/mcp
+go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./bench ./export/otel ./proxy ./examples/live ./examples/mcp
 (cd examples/mcp && npm ci --ignore-scripts)   # once: the pinned server, no install scripts
 go run ./examples/mcp pin      # hash the server's tools, print the hints it claims
 go run ./examples/mcp run      # load the operator's rules, run to the first write
@@ -323,6 +323,24 @@ what an agent would be handed, for a loop that decides from the run's
 record. `testkit.Scenario.Loop` runs the crash and resume harness over a
 loop like this one. `ExampleGate` in `example_test.go` is the complete,
 tested version.
+
+## The gate in front of an MCP host
+
+A program that is not written in Go can still have its actions go through
+the gate, if it is an MCP host: an application that runs a model and gives it
+tools from MCP servers. `agentrt-proxy` is a small local program the host
+starts in place of those servers. It offers the host only the tools the
+operator classified and pinned, and every call the model makes passes the
+gate: it is recorded, checked, held to the policy, and executed only when the
+policy allows it or an operator approved that exact call. A call waiting for
+approval tells the model so in plain words, and the operator decides with
+`agentrt`, outside the host. Each call is its own run.
+
+It governs only the calls that go through it. A host that also gives the
+model a shell or file access lets the model go around it, and even approve
+its own request. [docs/proxy.md](docs/proxy.md) says what it does and does not
+do, and `go run ./proxy/example` shows it with no model at all. It is an
+experiment, not yet released; the Go library is the full form.
 
 ## What a consumer no longer has to write
 
@@ -447,7 +465,7 @@ build tag that skips unless a server answers. Working on the nested modules
 needs a workspace, which is what CI builds:
 
 ```sh
-go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./bench ./export/otel ./examples/live ./examples/mcp
+go work init . ./providers/ollama ./providers/anthropic ./providers/openai ./mcp ./bench ./export/otel ./proxy ./examples/live ./examples/mcp
 ```
 
 ## MCP servers behind the policy

@@ -35,3 +35,5 @@ node_modules/
 /examples/live/live
 /examples/mcp/mcp
 /examples/scripted/scripted
+/proxy/cmd/agentrt-proxy/agentrt-proxy
+/proxy/example/example

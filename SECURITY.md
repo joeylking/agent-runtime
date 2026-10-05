@@ -33,6 +33,7 @@ Pre-1.0, so only the current release line is fixed:
 | `github.com/joeylking/agent-runtime/mcp` | the latest tag |
 | `github.com/joeylking/agent-runtime/bench` | the latest tag |
 | `github.com/joeylking/agent-runtime/export/otel` | the latest tag |
+| `github.com/joeylking/agent-runtime/proxy` | not yet released |
 
 Older minors and older nested-module tags get no fixes. A nested module names
 the core version it requires, so a core fix may need that module re-tagged too.
@@ -135,9 +136,28 @@ cannot influence.
   result) and every tool's input schema are refused when nested deeper
   than 256 levels (`maxJSONDepth` in `hash.go`), before anything recurses
   over them, as are malformed JSON, invalid UTF-8, an unpaired escaped
-  surrogate, and a repeated key. What is refused is recorded as an
-  invalid decision or a tool error, or fails the run as `internal_error`;
+  surrogate, a repeated key, and a number whose literal is longer than
+  10,000 characters or whose exponent is beyond ±10,000
+  (`maxNumberLength` and `maxNumberExponent`). What is refused is recorded
+  as an invalid decision or a tool error, or fails the run as
+  `internal_error`, or, in a tool's input schema, fails registration;
   nothing that is stored or hashed is replaced by a stand-in.
+- **A model-chosen number could end the process, in every release through
+  v0.3.2.** The schema library reads a number as a `big.Rat`, which cannot
+  hold an exponent, written or implied by the digits after the point,
+  beyond a million; validating such a number against `minimum`,
+  `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, or
+  `uniqueItems` dereferenced the nil it left and panicked. Arguments such
+  as `{"n":1e-10000000}` crashed a `Driver` consumer from inside `Start`
+  or `Resume`, and `CheckArgs` and `ToolSchema.Check` the same way,
+  whenever a tool's schema bounds a number; nothing recovered it. A
+  schema's own bound past that reach was silently dropped, or made every
+  validation against it panic. The bound above now refuses such numbers
+  where they enter, as an `invalid_decision` for arguments, and validation
+  recovers a panic inside the library as a refusal of the arguments
+  (`validateDoc` in `schema.go`). Upgrade; until then, a consumer whose
+  tools bound a number should recover around `Start`, `Resume`, and
+  `CheckArgs`, and treat a recovered panic as a refusal.
 - A tool's input schema is compiled from itself and the standard
   metaschemas only: a `$ref`, `$schema`, or `$id` naming a file or a URL
   fails registration (`schema.go`), and nothing is read or fetched.
@@ -294,6 +314,52 @@ cannot influence.
   Duplicate tool names, runaway pagination, and an HTTP response body
   over 16 MiB are refused rather than accepted or hung on.
 
+### The MCP proxy
+
+`agentrt-proxy` ([ADR 8](docs/decisions/0008-mcp-proxy.md),
+[docs/proxy.md](docs/proxy.md)) applies the gate to the tool calls of an MCP
+host, a program the operator runs and the proxy does not control.
+
+- What it trusts: its configuration file and the manifests, read only when
+  the current user owns them and their group and others cannot write them
+  (`mcp.ReadOwned`), and refused with a repeated key, because whoever writes
+  them chooses how every tool is classified; the database, under the rules
+  above, and its file's owner, which the proxy also checks before and after
+  opening it, refusing a symbolic link as `agentrt` does; the operator's
+  decisions, made with `agentrt` or the webhook approver on that database.
+- The upstream servers run as the same user as the proxy. No server's
+  reach, such as a filesystem server's root, may include the proxy's
+  configuration, manifests, or database: a server that can write them can
+  rewrite the policy or forge an approval. The proxy refuses to start a
+  stdio server whose arguments name one of them or a directory holding one,
+  compared as resolved absolute paths, unless the configuration sets
+  `skip_path_check` for it. That is a best-effort check of the
+  configuration, not of what a server can reach.
+- What it does not trust: the host and the model behind it, whose calls are
+  requests the gate decides, and the upstream servers, as for `mcp`. Every
+  call is checked against the pinned, restricted schema and evaluated by the
+  policy; what executes after an approval is the recorded request, under the
+  operator's fixed values as they were approved, never the bytes of a later
+  call. Nothing the model is shown names the operator command, the
+  database, the configuration, or a run id, and the proxy offers no tool
+  that approves and asks the host nothing (no elicitation or sampling).
+- Calls are matched by `agentrt.CanonicalJSON` of their arguments, the
+  form an approval's hash binds, so only an identical request collects an
+  approval or counts as a repeat; arguments the runtime refuses as JSON
+  match nothing and are recorded invalid.
+- A call that executed is not executed again for an identical call within
+  the repeat window, so a host's blind retry does not repeat a side effect.
+  A mutating call whose outcome is unknown, cut off by a crash, timed out,
+  or failed with no answer from the server, is not run again without an
+  operator's approval, at any age and after a rejection, and every other
+  mutating call to its tool is refused while the approval waits.
+- Text the model, a server, or the operator chose is escaped with
+  `trace.Sanitize` in the prose the proxy writes, to the model and to
+  stderr; a tool's result returned to the model is passed back as the
+  server sent it, as data. stdout carries the protocol only.
+- It opens no network listener: the host reaches it over its own stdin and
+  stdout.
+
 ### Files the runtime writes besides the database
 
 - `replay.Recorder` creates its directory `0700` and writes each
@@ -305,6 +371,9 @@ cannot influence.
   a fixed name in the shared temporary directory, and `examples/mcp`
   refuses to read a manifest or rules file that group or others can
   write.
+- `agentrt-proxy pin` writes each manifest `0600`, and the proxy refuses a
+  configuration, manifest, or database another user owns or its group or
+  others can write.
 
 ## What it does not defend against
 
@@ -350,6 +419,14 @@ cannot influence.
   server as to the operator, as does the network. A streamable-HTTP
   server is reached over whatever network access the process has, and
   this process's HTTP clients honour the proxy variables.
+- **What an MCP host lets the model do besides the proxy.** The proxy
+  governs only calls that go through it. A host that gives the model a
+  shell, file access, or tools of its own lets the model bypass the proxy,
+  and approve its own request with the operator command or by writing the
+  database. The proxy does not separate the host's user from the operator,
+  sees no model call or prompt, and has no limit or policy over a
+  conversation, since each call is its own run. These are its scope, stated
+  first in docs/proxy.md and in its help.
 - **Re-running an interrupted side effect.** An operator who approves an
   `interrupted_side_effect` runs a call that may already have taken
   effect. The runtime cannot tell; the approval says so, and the choice

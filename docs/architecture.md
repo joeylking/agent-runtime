@@ -53,13 +53,17 @@ so the sequence above is written once. See [The gate](#the-gate).
 JSON a consumer supplies is checked where it enters: decision arguments
 and results, tool content, approval capabilities and presentations, and a
 reconciliation's result must be one well-formed value nested no deeper
-than 256 levels, valid UTF-8, with no escaped surrogate outside a pair and
-no repeated object key, because anything else would be stored or hashed
-lossily. The depth bound is far below encoding/json's 10,000: the runtime
+than 256 levels, valid UTF-8, with no escaped surrogate outside a pair,
+no repeated object key, and no number whose literal is longer than 10,000
+characters or whose exponent is beyond ±10,000. The first three would be
+stored or hashed lossily; such a number made the schema validator panic,
+and a validator panic that gets past the boundary is a refusal of the
+arguments, never an acceptance. The depth bound is far below encoding/json's 10,000: the runtime
 stores and hashes a consumer's value inside objects of its own, and a
 value that passed at 10,000 failed once wrapped, unencodable on Go 1.27
 and unreadable from the store on Go 1.26. A tool's input schema is held
-to the same depth, because it is part of every approval request. What
+to the same depth, because it is part of every approval request, and to
+the same number bound, because a bound past it is dropped or panics. What
 fails is observed (`invalid_decision` for a decision, whose bytes are
 kept verbatim beside it in `Decision.InvalidArgs` or `InvalidResult` with
 `Args` or `Result` left empty, so the record of a call that could not be
@@ -319,6 +323,25 @@ gate, with two crash points that only a caller of a gate has:
 too between its policy and the tool start, and `AfterAttachAllowed`, an
 abandoned approved step, which only a `Loop` reaches.
 
+## The MCP proxy
+
+`agentrt-proxy`, in the nested module `proxy`, is the gate for an MCP host: a
+program that runs a model and calls MCP tools, in any language. The host
+starts it as an MCP server over stdio; it loads the upstream servers through
+`mcp`, offers the host only their registered tools and a status tool of its
+own, and hands every `tools/call` to a `Gate`, which records, validates,
+evaluates policy, pauses on an approval, executes the upstream call, and
+records its outcome. Each call is its own run, `<session>.<suffix>`: a
+terminal tool step, and when the call did not complete, a `fail` decision of
+origin `operator` that ends the run. A call that needs approval answers that
+it is pending, and the identical call collects the approval later, in the same
+process or another. The proxy keeps the rules across calls in a table of its
+own in the same database, `proxy_calls`, under its own migrations; a row is
+written before its run begins and is never taken as evidence that anything
+executed. [docs/proxy.md](proxy.md) is the full account, and
+[ADR 8](decisions/0008-mcp-proxy.md) the reasoning, including what the proxy
+cannot govern.
+
 ## Time
 
 Two clocks are read. `Config.Now` stamps what is recorded and judges
@@ -459,6 +482,9 @@ core.
 - `export/otel`: an exporter that turns the events `export` delivers into
   OpenTelemetry spans, and the provider an operator's `OTEL_*` environment
   configures.
+- `proxy`: `agentrt-proxy`, a local MCP proxy over stdio that routes an MCP
+  host's tool calls through a `Gate`, one run per call, with a demonstration
+  against a bundled fake payment server.
 - `examples/live`: one live model run against in-memory tools that stops
   for an operator before the first change.
 - `examples/mcp`: the same controls over the MCP filesystem server,
@@ -472,5 +498,6 @@ Multi-agent orchestration, a planning DSL, prompt templates, memory or
 retrieval, a multi-provider abstraction, a service mode, and a UI. Each
 would be added when a consumer demonstrates the need, not before.
 
-The MCP adapter covers tools only: resources, prompts, sampling,
-elicitation, and the server side of MCP are out of scope.
+The MCP adapter covers tools only: resources, prompts, sampling, and
+elicitation are out of scope. The server side of MCP exists only in the
+proxy, which serves tools and nothing else, over stdio, with no listener.

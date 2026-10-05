@@ -5,7 +5,7 @@ described by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 The core module (`github.com/joeylking/agent-runtime`) and its nested
 modules (`mcp`, `providers/ollama`, `providers/anthropic`,
-`providers/openai`, `bench`, `export/otel`) version independently — see docs/roadmap.md's "Module
+`providers/openai`, `bench`, `export/otel`, `proxy`) version independently — see docs/roadmap.md's "Module
 layout" — but the nested modules have so far always been re-tagged and
 released alongside the core release they pin, so each dated section below
 covers both together and says which nested-module tag shipped with it. An
@@ -13,8 +13,10 @@ entry names a specific module only when the change is not in the core.
 
 ## [Unreleased]
 
-Everything here is additive. A consumer that runs on `Driver` calls nothing
-that changes, and no migration or operator step is needed.
+Everything here is additive, except that a number past the new bound is
+refused where consumer JSON enters (see Security). A consumer that runs on
+`Driver` calls nothing that changes, and no migration or operator step is
+needed.
 
 ### Added
 
@@ -57,6 +59,48 @@ that changes, and no migration or operator step is needed.
   its policy and the tool start, and `AfterAttachAllowed`, which abandons an
   approved step after `Attach` allowed it. `Result.Inputs` is empty for a
   `Loop`, and `SameRenders` still needs an agent.
+- **`proxy` (new nested module, not yet tagged): `agentrt-proxy`, the gate
+  in front of an MCP host.** A local MCP proxy over stdio: a host starts it as
+  its MCP server, it loads the upstream servers through `mcp`, offers only
+  their classified, pinned tools and a status tool, and routes every
+  `tools/call` through a `Gate`. Each call is its own run, `<session>.<suffix>`.
+  A call that needs approval is held for `hold` (15s by default) and then
+  answers `PENDING_APPROVAL` in prose; the identical call collects the
+  approval, in this process or another, and executes the recorded request.
+  A request is keyed on `agentrt.CanonicalJSON` of its arguments, so it
+  matches only an identical request as an approval hash would; arguments the
+  runtime refuses as JSON are `INVALID` and match nothing. An identical
+  mutating call within `repeat_window` (10m) is refused as `DUPLICATE` with
+  the earlier outcome, a rejected or expired request is not asked for again
+  within it, and a mutating call whose outcome is unknown, cut off by a
+  crash, timed out, or left without an answer from the server, waits on an
+  `interrupted_side_effect` approval, answers `INTERRUPTED` or
+  `UNKNOWN_OUTCOME`, blocks other mutating calls to its tool, and is never
+  run again on the policy alone, even after a rejection. `max_pending` (5)
+  caps the approvals waiting. A stdio server whose arguments reach the
+  proxy's own files is refused at startup. `gate_status`
+  reports approvals and executes nothing. Approvals are decided with
+  `agentrt` or the webhook approver, outside the host. Subcommands `pin` and
+  `check`. The configuration is one JSON file with unknown fields refused.
+  It keeps an index of its calls in a table of its own, `proxy_calls`, in the
+  same database, under its own migrations; the runtime's schema is
+  unchanged. It needs the unreleased `Gate` and `mcp.ReadOwned`, so it builds
+  only in a workspace until both are released. [docs/proxy.md](docs/proxy.md)
+  and [ADR 8](docs/decisions/0008-mcp-proxy.md) say what it does and does not
+  govern. `go run ./proxy/example` demonstrates it with no model.
+- **`agentrt.CanonicalJSON` returns the form the runtime hashes.** Object
+  keys sorted, no insignificant whitespace, numbers as written, strings by
+  their contents in one escaping; what the runtime refuses where consumer
+  JSON enters it refuses with the reason. It is the existing encoder,
+  exported, and every hash is unchanged (`TestContentHash_Golden`).
+- **`mcp`: `ReadOwned`, `OwnedPrivately`, `ReadManifest`, `ReadRules`, and
+  `FileRule`.** The operator-file readers `examples/mcp` has, added to the
+  module so the proxy reads the same files under the same rule (the example
+  keeps its own copies until an `mcp` release carries these): a manifest or
+  rules file is read only when the current user owns it and its group and
+  others cannot write it, and a rules file with a field the format does not
+  know is refused. `examples/mcp` is unchanged and still uses its own
+  copies.
 
 ### Changed
 
@@ -69,6 +113,23 @@ that changes, and no migration or operator step is needed.
 
 ### Security
 
+- **A model-chosen number could crash the process, in every release
+  through v0.3.2.** The schema library panicked validating a number whose
+  exponent, written or implied, is beyond its reach, such as
+  `{"n":1e-10000000}` or `0.1e-9223372036854775808`, against `minimum`,
+  `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, or
+  `uniqueItems`, and nothing recovered it: one argument ended a `Driver`
+  consumer, or anything calling `CheckArgs` or `ToolSchema.Check`, whenever
+  a tool's schema bounds a number. JSON a consumer hands the runtime is now
+  refused where it enters when a number's literal is longer than 10,000
+  characters or its exponent is beyond ±10,000: arguments become an
+  `invalid_decision`, tool content a `tool_error`, a capability fails the
+  run, and a tool's input schema with such a number fails registration. A
+  panic inside validation is recovered as a refusal of the arguments, never
+  an acceptance. Nothing stored or hashed changes, and arguments that
+  passed before still pass unless they carry such a number. A consumer
+  should upgrade; until then, recover around `Start`, `Resume`, and
+  `CheckArgs` and treat a panic as a refusal.
 - **A grant is judged against `Limits.GrantTTL` again at `Execute`.** A
   caller of a gate holding an approved step, which `Attach` had allowed,
   could execute it after the grant's TTL had passed, because the TTL was

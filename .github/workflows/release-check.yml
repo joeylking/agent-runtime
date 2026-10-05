@@ -75,6 +75,12 @@ jobs:
         env:
           WITH_EXAMPLES: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.examples) }}
         run: |
+          # proxy is deliberately not listed yet. It needs the Gate, which
+          # no core release carries (v0.3.2 is the latest), and
+          # mcp.ReadOwned and its readers, which no mcp release carries
+          # (mcp/v0.2.0), so it cannot build with GOWORK=off until both are
+          # released and its go.mod is re-pinned to them. Add it here in
+          # that same commit.
           modules="providers/ollama providers/anthropic providers/openai mcp bench export/otel"
           if [ "$WITH_EXAMPLES" = "true" ]; then
             modules="$modules examples/live examples/mcp"
