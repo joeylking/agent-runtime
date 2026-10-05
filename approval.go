@@ -43,14 +43,15 @@ func verifyHash(a Approval) error {
 }
 
 // pause records a hash-bound approval for the step's request and parks
-// the run, which must be in one of from. The step moves to
-// awaiting_approval from whatever status it holds, and step.policy
-// precedes approval.requested.
-func (d *Driver) pause(ctx context.Context, c *runCache, runID string, step *Step, req ToolRequest, pd PolicyDecision, from []RunStatus, policyAt time.Time) (Run, error) {
+// the run, which must be in one of from, returning the run and the
+// approval. The step moves to awaiting_approval from whatever status it
+// holds, and step.policy precedes approval.requested.
+func (d *Driver) pause(ctx context.Context, c *runCache, runID string, step *Step, req ToolRequest, pd PolicyDecision, from []RunStatus, policyAt time.Time) (Run, Approval, error) {
 	now := d.now()
 	fromStep := step.Status
 	step.Status, step.Policy = StepAwaitingApproval, &pd
 	var out Run
+	var paused Approval
 	err := d.write(ctx, c, func(t *txn) error {
 		r, err := t.requireRun(ctx, runID, from...)
 		if err != nil {
@@ -76,15 +77,15 @@ func (d *Driver) pause(ctx context.Context, c *runCache, runID string, step *Ste
 		if err := t.insertApproval(ctx, a); err != nil {
 			return err
 		}
-		out = r
+		out, paused = r, a
 		return t.emit(ctx, Event{RunID: runID, StepID: step.ID, At: now, Type: EventApprovalRequested}, map[string]any{
 			"approval_id": a.ID, "kind": pd.Kind, "reason": pd.Reason, "capability": a.Capability, "presentation": a.Presentation, "hash": a.Hash,
 		})
 	})
 	if err != nil {
-		return Run{}, err
+		return Run{}, Approval{}, err
 	}
-	return out, nil
+	return out, paused, nil
 }
 
 // ErrApprovalHash means a stored approval no longer matches its own fields.

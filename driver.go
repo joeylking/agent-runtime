@@ -42,6 +42,10 @@ type Config struct {
 
 // Driver runs the step loop. It is safe to reuse for many runs but a single
 // run is executed by one call at a time.
+//
+// The loop is the agent's decisions passed through a Session, the same one
+// a Gate hands to a loop the runtime does not own; a Gate is a Driver with
+// no agent.
 type Driver struct {
 	store     *Store
 	agent     Agent
@@ -71,9 +75,9 @@ type Driver struct {
 	// renewEvery overrides the renewal interval of a third of the TTL, so
 	// a test can renew often under a lease long enough for a slow runner.
 	renewEvery time.Duration
-	// active holds the runs a call of this driver is executing, so a second
-	// Start or Resume of one of them here is refused rather than taking
-	// over the lease this driver itself holds.
+	// active holds the runs a call or session of this driver is executing,
+	// so a second Start, Resume, Begin, or Attach of one of them here is
+	// refused rather than taking over the lease this driver itself holds.
 	mu     sync.Mutex
 	active map[string]bool
 }
@@ -86,6 +90,21 @@ func NewDriver(cfg Config) (*Driver, error) {
 	if cfg.Agent == nil {
 		return nil, errors.New("agentrt: agent is required")
 	}
+	d, err := newDriver(GateConfig{Store: cfg.Store, Policy: cfg.Policy, Tools: cfg.Tools, Observer: cfg.Observer, Model: cfg.Model,
+		Reconcile: cfg.Reconcile, Now: cfg.Now, NewID: cfg.NewID, LeaseTTL: cfg.LeaseTTL, LeaseOwner: cfg.LeaseOwner})
+	if err != nil {
+		return nil, err
+	}
+	d.agent = cfg.Agent
+	return d, nil
+}
+
+// newDriver is NewDriver without an agent: a Gate is a driver whose loop
+// belongs to its caller.
+func newDriver(cfg GateConfig) (*Driver, error) {
+	if cfg.Store == nil {
+		return nil, errors.New("agentrt: store is required")
+	}
 	if cfg.Policy == nil {
 		return nil, errors.New("agentrt: policy is required")
 	}
@@ -94,7 +113,6 @@ func NewDriver(cfg Config) (*Driver, error) {
 	}
 	d := &Driver{
 		store:     cfg.Store,
-		agent:     cfg.Agent,
 		policy:    cfg.Policy,
 		tools:     map[string]Tool{},
 		schemas:   map[string]*compiledSchema{},
@@ -145,43 +163,13 @@ func (d *Driver) Start(ctx context.Context, goal string, limits Limits) (Run, er
 
 // StartWithID is Start with a caller-chosen run id, so a consumer can key
 // its own tables by the same identifier. The id must be unique.
-func (d *Driver) StartWithID(ctx context.Context, id, goal string, limits Limits) (out Run, err error) {
-	if err := limits.validate(); err != nil {
-		return Run{}, fmt.Errorf("agentrt: %w", err)
-	}
-	if id == "" {
-		return Run{}, errors.New("agentrt: run id is required")
-	}
-	if !d.claim(id) {
-		return Run{}, d.busy(ctx, id)
-	}
-	defer d.unclaim(id)
-	now := d.now()
-	run := Run{
-		ID:        id,
-		Goal:      goal,
-		Status:    StatusRunning,
-		Limits:    limits,
-		CreatedAt: now,
-		StartedAt: now,
-	}
-	at := d.wall()
-	err = d.write(ctx, nil, func(t *txn) error {
-		if err := t.insertRun(ctx, run); err != nil {
-			return err
-		}
-		if err := t.emit(ctx, Event{RunID: run.ID, At: now, Type: EventRunCreated}, map[string]any{"goal": goal, "limits": limits}); err != nil {
-			return err
-		}
-		return t.appendEvent(ctx, Event{RunID: run.ID, At: now, Type: EventRunStarted})
-	})
+func (d *Driver) StartWithID(ctx context.Context, id, goal string, limits Limits) (Run, error) {
+	s, err := d.begin(ctx, id, goal, limits)
 	if err != nil {
-		return Run{}, fmt.Errorf("agentrt: start run: %w", err)
+		return Run{}, err
 	}
-	l := d.newLease(run.ID)
-	defer func() { l.stop(out, err) }()
-	l.start(at)
-	return d.loop(ctx, l)
+	defer s.Close()
+	return d.loop(ctx, s)
 }
 
 // claim marks a run as executing in a call of this driver, and reports

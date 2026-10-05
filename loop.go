@@ -14,134 +14,183 @@ import (
 
 var running = []RunStatus{StatusRunning}
 
-// loop executes steps until the run leaves RUNNING. It reads the run at
-// every step, because model calls and an operator change it, and loads its
-// steps and approvals once, keeping them as it writes. It holds the run's
-// lease, and stops when it has lost it.
-func (d *Driver) loop(ctx context.Context, l *lease) (Run, error) {
-	runID := l.runID
-	var c *runCache
-	for {
-		run, err := d.store.GetRun(ctx, runID)
-		if err != nil {
-			return Run{}, err
+// loop executes steps until the session ends: the run leaves RUNNING,
+// pauses, or the lease is lost. Each step is the agent's decision passed
+// through the session, which a Gate hands to a loop the runtime does not
+// own, so the two run one sequence.
+func (d *Driver) loop(ctx context.Context, s *Session) (Run, error) {
+	for !s.ended {
+		st := s.step(ctx)
+		if st == nil {
+			break
 		}
-		if run.Status != StatusRunning {
-			return run, nil
-		}
-		if !l.ok() {
-			return d.lost(ctx, runID, l.err())
-		}
-		if c == nil || c.stale || d.reload {
-			if c, err = d.load(ctx, runID); err != nil {
-				return Run{}, err
-			}
-			if derr := decodeErrors(c.steps, c.approvals); derr != nil {
-				// A record that cannot be read is not continued from.
-				return d.failInternal(ctx, runID, running, derr)
-			}
-		}
-		n := len(c.steps)
-		steps := c.steps[:n:n]
-
-		// Limits are checked before a step is started.
-		if run.StepCount >= run.Limits.MaxSteps {
-			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: ReasonLimitSteps,
-				detail: fmt.Sprintf("step limit %d reached", run.Limits.MaxSteps), limit: true})
-		}
-		if n := consecutiveFailures(steps); n >= run.Limits.MaxConsecutiveToolFailures {
-			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: ReasonRepeatedToolFailures,
-				detail: fmt.Sprintf("%d consecutive failed steps", n), limit: true})
-		}
-		if l := run.Limits; l.MaxActiveTime > 0 && run.ActiveTime >= l.MaxActiveTime {
-			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: ReasonLimitActiveTime,
-				detail: fmt.Sprintf("active time %s reached limit %s", run.ActiveTime.Round(time.Millisecond), l.MaxActiveTime), limit: true})
-		}
-		if l := run.Limits; l.MaxElapsedTime > 0 && d.now().Sub(run.CreatedAt) >= l.MaxElapsedTime {
-			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: ReasonLimitElapsedTime,
-				detail: fmt.Sprintf("elapsed time reached limit %s", l.MaxElapsedTime), limit: true})
-		}
-		if n, sig := repeatedOutcome(steps); n >= run.Limits.LoopThreshold {
-			at := d.now()
-			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: ReasonLoopDetected,
-				detail: fmt.Sprintf("%s produced the same observation %d times in a row", sig.tool, n),
-				pre: func(t *txn) error {
-					return t.emit(ctx, Event{RunID: runID, At: at, Type: EventLoopDetected}, map[string]any{"repeats": n, "tool": sig.tool, "args_hash": sig.args, "observation_hash": sig.obs})
-				}})
-		}
-
-		step, err := d.startStep(ctx, c, run)
-		if err != nil {
-			return d.lost(ctx, runID, err)
-		}
-		run.StepCount++
-
-		var mc ModelCaller
-		if d.model != nil {
-			mc = &caller{d: d, cfg: *d.model, runID: run.ID, stepID: step.ID, started: step.StartedAt, lease: l}
-		}
-		in := StepInput{Run: run, Tools: slices.Clone(d.specs), Model: mc}
-		in.Steps, in.Approvals = c.agent.view(c, n)
+		in := StepInput{Run: st.run, Tools: slices.Clone(d.specs), Model: st.mc}
+		in.Steps, in.Approvals = s.c.agent.view(s.c, st.n)
 		decision, err := d.agent.Decide(ctx, in)
 		if err != nil {
-			if cerr := ctx.Err(); cerr != nil {
-				// Cancelled while deciding: the step stays in flight and
-				// Resume treats it as interrupted.
-				return Run{}, cerr
-			}
-			if errors.Is(err, ErrLeaseLost) || !l.ok() {
-				// The run is no longer this loop's to fail.
-				return d.lost(ctx, runID, l.err())
-			}
-			reason := ReasonAgentError
-			var lim ErrLimit
-			var unavailable ErrModelUnavailable
-			switch {
-			case errors.As(err, &lim):
-				reason = lim.Reason
-			case errors.As(err, &unavailable):
-				reason = ReasonModelUnavailable
-			}
-			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: reason, detail: err.Error(), limit: reason != ReasonAgentError,
-				step: &step, stepStatus: StepFailed, stepDetail: "agent error: " + err.Error()})
+			st.fail(ctx, err)
+			break
 		}
-
-		// The decision is recorded verbatim before validation so the audit log
-		// shows what the agent asked for even when the request was invalid.
-		// JSON that cannot be stored as JSON is kept as a string beside it.
-		decision = blankAsAbsent(decision)
-		recorded := recordable(decision)
-		step.Decision = &recorded
-		if err := d.recordDecision(ctx, c, &step); err != nil {
-			return d.lost(ctx, runID, err)
-		}
-
-		if verr := d.validateDecision(decision); verr != nil {
-			obs := observation(ObserveInvalidDecision, map[string]string{"error": verr.Error()}, "invalid decision: "+verr.Error())
-			if err := d.endStep(ctx, c, &step, StepFailed, &obs, verr.Error()); err != nil {
-				return d.lost(ctx, runID, err)
-			}
-			continue
-		}
-
-		switch decision.Kind {
-		case DecideComplete:
-			return d.settle(ctx, c, runID, running, ending{status: StatusCompleted, reason: ReasonGoalCompleted, result: decision.Result,
-				step: &step, stepStatus: StepDone})
-		case DecideFail:
-			return d.settle(ctx, c, runID, running, ending{status: StatusFailed, reason: ReasonGoalFailed, detail: decision.Message,
-				step: &step, stepStatus: StepDone})
-		}
-
-		// tool_call
-		req := ToolRequest{RunID: run.ID, StepID: step.ID, Spec: d.tools[decision.Tool].Spec(), Args: orEmptyObject(decision.Args)}
-		view := RunView{Run: run}
-		view.Steps, view.Approvals = c.policy.view(c, n)
-		pd, perr := d.policy.Evaluate(ctx, req, view)
-		if fin, r, err := d.apply(ctx, c, l, run, &step, req, pd, perr, nil, time.Time{}); err != nil || fin {
-			return r, err
+		if v := st.propose(ctx, decision); v.Outcome == VerdictAllowed {
+			st.execute(ctx)
 		}
 	}
+	return s.out, s.err
+}
+
+// step checks the limits and starts the next step. It reads the run at
+// every step, because model calls and an operator change it, and loads
+// the run's steps and approvals once, keeping them as it writes. It
+// returns nil when the session has ended: the run left RUNNING, a limit
+// ended it, or the lease is lost.
+func (s *Session) step(ctx context.Context) *OpenStep {
+	d, runID := s.d, s.runID
+	run, err := d.store.GetRun(ctx, runID)
+	if err != nil {
+		s.end(Run{}, err)
+		return nil
+	}
+	if run.Status != StatusRunning {
+		s.end(run, nil)
+		return nil
+	}
+	if !s.l.ok() {
+		s.end(d.lost(ctx, runID, s.l.err()))
+		return nil
+	}
+	if s.c == nil || s.c.stale || d.reload {
+		if s.c, err = d.load(ctx, runID); err != nil {
+			s.end(Run{}, err)
+			return nil
+		}
+		if derr := decodeErrors(s.c.steps, s.c.approvals); derr != nil {
+			// A record that cannot be read is not continued from.
+			s.end(d.failInternal(ctx, runID, running, derr))
+			return nil
+		}
+	}
+	c := s.c
+	n := len(c.steps)
+	steps := c.steps[:n:n]
+	settle := func(e ending) *OpenStep {
+		s.end(d.settle(ctx, c, runID, running, e))
+		return nil
+	}
+
+	// Limits are checked before a step is started.
+	if run.StepCount >= run.Limits.MaxSteps {
+		return settle(ending{status: StatusFailed, reason: ReasonLimitSteps,
+			detail: fmt.Sprintf("step limit %d reached", run.Limits.MaxSteps), limit: true})
+	}
+	if n := consecutiveFailures(steps); n >= run.Limits.MaxConsecutiveToolFailures {
+		return settle(ending{status: StatusFailed, reason: ReasonRepeatedToolFailures,
+			detail: fmt.Sprintf("%d consecutive failed steps", n), limit: true})
+	}
+	if l := run.Limits; l.MaxActiveTime > 0 && run.ActiveTime >= l.MaxActiveTime {
+		return settle(ending{status: StatusFailed, reason: ReasonLimitActiveTime,
+			detail: fmt.Sprintf("active time %s reached limit %s", run.ActiveTime.Round(time.Millisecond), l.MaxActiveTime), limit: true})
+	}
+	if l := run.Limits; l.MaxElapsedTime > 0 && d.now().Sub(run.CreatedAt) >= l.MaxElapsedTime {
+		return settle(ending{status: StatusFailed, reason: ReasonLimitElapsedTime,
+			detail: fmt.Sprintf("elapsed time reached limit %s", l.MaxElapsedTime), limit: true})
+	}
+	if n, sig := repeatedOutcome(steps); n >= run.Limits.LoopThreshold {
+		at := d.now()
+		return settle(ending{status: StatusFailed, reason: ReasonLoopDetected,
+			detail: fmt.Sprintf("%s produced the same observation %d times in a row", sig.tool, n),
+			pre: func(t *txn) error {
+				return t.emit(ctx, Event{RunID: runID, At: at, Type: EventLoopDetected}, map[string]any{"repeats": n, "tool": sig.tool, "args_hash": sig.args, "observation_hash": sig.obs})
+			}})
+	}
+
+	step, err := d.startStep(ctx, c, run)
+	if err != nil {
+		s.end(d.lost(ctx, runID, err))
+		return nil
+	}
+	run.StepCount++
+	s.run = run
+
+	st := &OpenStep{s: s, step: step, run: run, n: n}
+	if d.model != nil {
+		st.mc = &caller{d: d, cfg: *d.model, runID: run.ID, stepID: step.ID, started: step.StartedAt, lease: s.l}
+	}
+	s.open = st
+	return st
+}
+
+// fail ends a step whose decision could not be made: an agent's Decide,
+// or the model calls behind a Gate caller's decision, returned err. A
+// cancelled ctx leaves the step in flight, and Resume treats it as
+// interrupted; a lost lease leaves the run to its next owner. A limit the
+// step's ModelCaller enforced ends the run with its reason, an unavailable
+// model as model_unavailable, and anything else as agent_error.
+func (st *OpenStep) fail(ctx context.Context, err error) {
+	s, d := st.s, st.s.d
+	if cerr := ctx.Err(); cerr != nil {
+		// Cancelled while deciding: the step stays in flight and
+		// Resume treats it as interrupted.
+		s.end(Run{}, cerr)
+		return
+	}
+	if errors.Is(err, ErrLeaseLost) || !s.l.ok() {
+		// The run is no longer this loop's to fail.
+		s.end(d.lost(ctx, s.runID, s.l.err()))
+		return
+	}
+	reason := ReasonAgentError
+	var lim ErrLimit
+	var unavailable ErrModelUnavailable
+	switch {
+	case errors.As(err, &lim):
+		reason = lim.Reason
+	case errors.As(err, &unavailable):
+		reason = ReasonModelUnavailable
+	}
+	s.end(d.settle(ctx, s.c, s.runID, running, ending{status: StatusFailed, reason: reason, detail: err.Error(), limit: reason != ReasonAgentError,
+		step: &st.step, stepStatus: StepFailed, stepDetail: "agent error: " + err.Error()}))
+}
+
+// propose records a decision, validates it, and evaluates policy on a tool
+// call, acting on every outcome up to, and not including, running the
+// tool: an Allowed verdict leaves the step for execute.
+func (st *OpenStep) propose(ctx context.Context, decision Decision) Verdict {
+	s, d := st.s, st.s.d
+	st.proposed = true
+	// The decision is recorded verbatim before validation so the audit log
+	// shows what the agent asked for even when the request was invalid.
+	// JSON that cannot be stored as JSON is kept as a string beside it.
+	decision = blankAsAbsent(decision)
+	recorded := recordable(decision)
+	st.step.Decision = &recorded
+	if err := d.recordDecision(ctx, s.c, &st.step); err != nil {
+		return s.lose(ctx, err)
+	}
+
+	if verr := d.validateDecision(decision); verr != nil {
+		obs := observation(ObserveInvalidDecision, map[string]string{"error": verr.Error()}, "invalid decision: "+verr.Error())
+		if err := d.endStep(ctx, s.c, &st.step, StepFailed, &obs, verr.Error()); err != nil {
+			return s.lose(ctx, err)
+		}
+		s.open = nil
+		return Verdict{Outcome: VerdictDenied, Observation: &obs}
+	}
+
+	switch decision.Kind {
+	case DecideComplete:
+		return s.settle(ctx, running, ending{status: StatusCompleted, reason: ReasonGoalCompleted, result: decision.Result,
+			step: &st.step, stepStatus: StepDone})
+	case DecideFail:
+		return s.settle(ctx, running, ending{status: StatusFailed, reason: ReasonGoalFailed, detail: decision.Message,
+			step: &st.step, stepStatus: StepDone})
+	}
+
+	// tool_call
+	req := ToolRequest{RunID: st.run.ID, StepID: st.step.ID, Spec: d.tools[decision.Tool].Spec(), Args: orEmptyObject(decision.Args)}
+	view := RunView{Run: st.run}
+	view.Steps, view.Approvals = s.c.policy.view(s.c, st.n)
+	pd, perr := d.policy.Evaluate(ctx, req, view)
+	return st.apply(ctx, req, pd, perr, nil, time.Time{})
 }
 
 // lost is how the loop answers a write that failed or a lease it no longer
@@ -320,53 +369,44 @@ func checkPolicy(pd PolicyDecision) error {
 // both and anything unrecognised fails the run as internal_error. granted
 // is the approval being resumed, nil in the loop: the run is then WAITING
 // rather than RUNNING, and a require_approval outcome whose hash matches
-// the granted approval executes. The policy decision is recorded on the
+// the granted approval is allowed. The policy decision is recorded on the
 // step, with a step.policy event, in the same transaction as what it
-// caused. finished reports that the run stopped, returning it.
+// caused; for an allowed request that is the tool start, which execute
+// writes, so apply writes nothing for it and the move to RUNNING, the
+// policy decision, and the tool start still commit together on resume.
 //
 // Each write takes its times from the clock in the order and number the
 // runtime always has, one reading per recorded state change, because a
 // consumer with a deterministic clock keys its own records on that
 // sequence. resumedAt is the reading Resume took for run.resumed.
 //
-// l is the lease the caller holds or, on resume, takes with the move to
-// RUNNING. In the loop a tool is not started once the lease is lost.
-func (d *Driver) apply(ctx context.Context, c *runCache, l *lease, run Run, step *Step, req ToolRequest, pd PolicyDecision, perr error, granted *Approval, resumedAt time.Time) (finished bool, out Run, err error) {
+// The session's lease is the one the caller holds or, on resume, takes
+// with the move to RUNNING.
+func (st *OpenStep) apply(ctx context.Context, req ToolRequest, pd PolicyDecision, perr error, granted *Approval, resumedAt time.Time) Verdict {
+	s, d := st.s, st.s.d
+	c, run, step := s.c, st.run, &st.step
+	st.granted, st.resumedAt = granted, resumedAt
 	from, suffix := running, ""
 	if granted != nil {
-		from, suffix = []RunStatus{StatusWaitingForApproval}, " on resume"
+		from, suffix = waiting, " on resume"
 	}
-	// fail answers a write that failed. The first write of a resume decides
-	// the race between two resumers, so its loser gets ErrRunState.
-	fail := func(err error) (bool, Run, error) {
-		if granted != nil {
-			if errors.Is(err, errEncode) {
-				r, err := d.failInternal(ctx, run.ID, from, err)
-				return true, r, err
-			}
-			return true, Run{}, err
-		}
-		r, err := d.lost(ctx, run.ID, err)
-		return true, r, err
-	}
-	settle := func(e ending) (bool, Run, error) {
+	settle := func(e ending) Verdict {
 		r, err := d.settle(ctx, c, run.ID, from, e)
 		if err != nil && granted == nil {
-			return fail(err)
+			return st.lose(ctx, err)
 		}
-		return true, r, err
+		s.end(r, err)
+		return s.ending()
 	}
 	if perr != nil {
 		return settle(ending{status: StatusFailed, reason: ReasonInternalError, detail: "policy: " + perr.Error(),
 			step: step, stepStatus: StepFailed, stepDetail: "policy error: " + perr.Error()})
 	}
-	policyAt := resumedAt
+	st.policyAt = resumedAt
 	if granted == nil {
-		policyAt = d.now()
+		st.policyAt = d.now()
 	}
-	policyEvent := func(t *txn) error {
-		return t.emit(ctx, Event{RunID: run.ID, StepID: step.ID, At: policyAt, Type: EventStepPolicy}, step.Policy)
-	}
+	policyEvent := st.policyEvent(ctx)
 	if cerr := checkPolicy(pd); cerr != nil {
 		step.Policy = &PolicyDecision{Outcome: pd.Outcome, Reason: pd.Reason, Kind: pd.Kind}
 		return settle(ending{status: StatusFailed, reason: ReasonInternalError, detail: "policy: " + cerr.Error(), pre: policyEvent,
@@ -378,53 +418,19 @@ func (d *Driver) apply(ctx context.Context, c *runCache, l *lease, run Run, step
 	if pd.Outcome == RequireApproval && granted != nil {
 		h, err := approvalHash(pd.Kind, pd.Capability, pd.Presentation, req)
 		if err != nil {
-			return fail(err)
+			return st.lose(ctx, err)
 		}
 		allowed = h == granted.Hash
 	}
 	switch {
 	case allowed:
-		startAt := policyAt
-		if granted == nil && !l.ok() {
-			// The tool is not started: the step stays in flight for the
-			// next owner, who finds it was never executed.
-			return fail(l.err())
-		}
-		fromStep := step.Status
-		step.Status = StepExecuting
-		if granted != nil {
-			// The step's clock restarts here: the wait for the human is not
-			// active time.
-			startAt = d.now()
-			step.StartedAt = startAt
-		}
-		at := d.wall()
-		if err := d.write(ctx, c, func(t *txn) error {
-			// In the loop the lease must be unexpired as well as held: a
-			// side effect starts only inside a live lease.
-			if granted == nil {
-				if err := t.requireLease(ctx, run.ID); err != nil {
-					return err
-				}
-			} else if err := d.enter(ctx, t, run, granted, resumedAt); err != nil {
-				return err
-			}
-			if err := t.updateStep(ctx, *step, fromStep); err != nil {
-				return err
-			}
-			if err := policyEvent(t); err != nil {
-				return err
-			}
-			payload := map[string]any{"tool": req.Spec.Name, "args": req.Args}
-			if granted != nil {
-				payload["approval_id"] = granted.ID
-			}
-			return t.emit(ctx, Event{RunID: run.ID, StepID: step.ID, At: startAt, Type: EventStepToolStarted}, payload)
-		}); err != nil {
-			return fail(err)
-		}
-		l.start(at)
-		return d.runTool(ctx, c, run, step, req)
+		// Nothing is written until execute starts the tool. The verdict
+		// carries a copy: what the caller does with it cannot change the
+		// request that runs.
+		st.allowed, st.req = true, req
+		shown := req
+		shown.Args, shown.Spec.InputSchema = cloneBytes(req.Args), cloneBytes(req.Spec.InputSchema)
+		return Verdict{Outcome: VerdictAllowed, Request: &shown}
 	case pd.Outcome == Deny:
 		obs := observation(ObservePolicyDenied, map[string]string{"tool": req.Spec.Name, "reason": pd.Reason}, "denied"+suffix+": "+pd.Reason)
 		stepAt := d.now()
@@ -438,10 +444,11 @@ func (d *Driver) apply(ctx context.Context, c *runCache, l *lease, run Run, step
 			}
 			return d.endStepTx(ctx, t, step, StepFailed, &obs, obs.Summary, stepAt)
 		}); err != nil {
-			return fail(err)
+			return st.lose(ctx, err)
 		}
-		l.start(at)
-		return false, Run{}, nil
+		s.l.start(at)
+		s.open = nil
+		return Verdict{Outcome: VerdictDenied, Observation: &obs}
 	case pd.Outcome == Abort:
 		obs := observation(ObservePolicyDenied, map[string]string{"tool": req.Spec.Name, "reason": pd.Reason}, "aborted"+suffix+": "+pd.Reason)
 		return settle(ending{status: StatusFailed, reason: ReasonPolicyAbort, detail: pd.Reason, pre: policyEvent,
@@ -450,15 +457,102 @@ func (d *Driver) apply(ctx context.Context, c *runCache, l *lease, run Run, step
 		// In the loop this is the first request; on resume the policy now
 		// wants something other than what was granted, so the run pauses
 		// again.
-		r, err := d.pause(ctx, c, run.ID, step, req, pd, from, policyAt)
+		r, a, err := d.pause(ctx, c, run.ID, step, req, pd, from, st.policyAt)
 		if err != nil {
-			return fail(err)
+			return st.lose(ctx, err)
 		}
-		return true, r, nil
+		s.approval = &a
+		s.end(r, nil)
+		return s.ending()
 	default:
 		return settle(ending{status: StatusFailed, reason: ReasonInternalError, detail: fmt.Sprintf("unknown policy outcome %q", pd.Outcome), pre: policyEvent,
 			step: step, stepStatus: StepFailed, stepDetail: "unknown policy outcome"})
 	}
+}
+
+// policyEvent appends the step's policy decision as step.policy, at the
+// reading apply took for it.
+func (st *OpenStep) policyEvent(ctx context.Context) func(t *txn) error {
+	return func(t *txn) error {
+		return t.emit(ctx, Event{RunID: st.run.ID, StepID: st.step.ID, At: st.policyAt, Type: EventStepPolicy}, st.step.Policy)
+	}
+}
+
+// lose answers a write of the step that failed. The first write of a
+// resume decides the race between two resumers, so its loser gets
+// ErrRunState; in the loop it is the session's lose.
+func (st *OpenStep) lose(ctx context.Context, err error) Verdict {
+	s := st.s
+	if st.granted == nil {
+		return s.lose(ctx, err)
+	}
+	if errors.Is(err, errEncode) {
+		s.end(s.d.failInternal(ctx, s.runID, waiting, err))
+	} else {
+		s.end(Run{}, err)
+	}
+	return s.ending()
+}
+
+// execute starts the request an Allowed verdict let through and records
+// what it did. The policy decision and step.tool_started commit with the
+// step's move to executing and, on resume, with the run's move to
+// RUNNING, which takes the lease. In the loop a tool is not started once
+// the lease is lost, and the write that starts it requires the lease
+// unexpired.
+func (st *OpenStep) execute(ctx context.Context) Observation {
+	s, d := st.s, st.s.d
+	c, l, run, step, req, granted := s.c, s.l, st.run, &st.step, st.req, st.granted
+	st.executed = true
+	startAt := st.policyAt
+	if granted == nil && !l.ok() {
+		// The tool is not started: the step stays in flight for the
+		// next owner, who finds it was never executed.
+		st.lose(ctx, l.err())
+		return Observation{}
+	}
+	fromStep := step.Status
+	step.Status = StepExecuting
+	if granted != nil {
+		// The step's clock restarts here: the wait for the human is not
+		// active time.
+		startAt = d.now()
+		step.StartedAt = startAt
+	}
+	policyEvent := st.policyEvent(ctx)
+	at := d.wall()
+	if err := d.write(ctx, c, func(t *txn) error {
+		// In the loop the lease must be unexpired as well as held: a
+		// side effect starts only inside a live lease.
+		if granted == nil {
+			if err := t.requireLease(ctx, run.ID); err != nil {
+				return err
+			}
+		} else if err := d.enter(ctx, t, run, granted, st.resumedAt); err != nil {
+			return err
+		}
+		if err := t.updateStep(ctx, *step, fromStep); err != nil {
+			return err
+		}
+		if err := policyEvent(t); err != nil {
+			return err
+		}
+		payload := map[string]any{"tool": req.Spec.Name, "args": req.Args}
+		if granted != nil {
+			payload["approval_id"] = granted.ID
+		}
+		return t.emit(ctx, Event{RunID: run.ID, StepID: step.ID, At: startAt, Type: EventStepToolStarted}, payload)
+	}); err != nil {
+		st.lose(ctx, err)
+		return Observation{}
+	}
+	l.start(at)
+	s.open = nil
+	obs, finished, out, err := d.runTool(ctx, c, run, step, req)
+	if err != nil || finished {
+		s.end(out, err)
+	}
+	return obs
 }
 
 // enter checks inside a transaction that the run may take the step's next
@@ -477,12 +571,13 @@ func (d *Driver) enter(ctx context.Context, t *txn, run Run, granted *Approval, 
 }
 
 // runTool executes a request whose step is already recorded as executing,
-// and records the outcome. It returns finished=true with the final run
-// when the tool ended the run, either as a terminal tool or by aborting.
+// and records the outcome, which it returns. finished=true comes with the
+// final run when the tool ended the run, either as a terminal tool or by
+// aborting.
 // The tool has had its effect by the time it returns, so the outcome is
 // recorded even when ctx was cancelled meanwhile; the cancellation is then
 // returned.
-func (d *Driver) runTool(ctx context.Context, c *runCache, run Run, step *Step, req ToolRequest) (bool, Run, error) {
+func (d *Driver) runTool(ctx context.Context, c *runCache, run Run, step *Step, req ToolRequest) (Observation, bool, Run, error) {
 	obs, abort := d.execute(ctx, req)
 	rctx, cancel := afterEffect(ctx)
 	defer cancel()
@@ -510,12 +605,12 @@ func (d *Driver) runTool(ctx context.Context, c *runCache, run Run, step *Step, 
 			d.recordLate(rctx, step, obs)
 		}
 		r, err := d.lost(ctx, run.ID, err)
-		return true, r, err
+		return obs, true, r, err
 	}
 	if cerr := ctx.Err(); cerr != nil {
-		return true, out, cerr
+		return obs, true, out, cerr
 	}
-	return finished, out, nil
+	return obs, finished, out, nil
 }
 
 // execute runs the tool with its timeout and converts the outcome into an

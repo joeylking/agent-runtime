@@ -148,3 +148,60 @@ func ExampleNeedApproval() {
 	// WAITING_FOR_APPROVAL release {"tool":"push"}
 	// joeylking/repo-steward 3
 }
+
+// A loop the runtime does not own proposes each action to a Gate, which
+// records it, checks it, and runs what policy allows. A remote mutation
+// pauses the run on an approval; once it is approved, Attach hands back
+// exactly the approved request to execute, and the loop goes on.
+func ExampleGate() {
+	ctx := context.Background()
+	store := must(agentrt.OpenStore(":memory:"))
+	defer store.Close()
+
+	g := must(agentrt.NewGate(agentrt.GateConfig{
+		Store: store, Policy: agentrt.DefaultPolicy(),
+		Tools: []agentrt.Tool{newExampleTool("read", agentrt.ReadOnly), newExampleTool("push", agentrt.RemoteMutation)},
+		NewID: exampleIDs(),
+	}))
+	// The external loop's decisions, by step index.
+	plan := []agentrt.Decision{
+		scripted.ToolCall("read", `{"n":1}`, "look first"),
+		scripted.ToolCall("push", `{"n":7}`, "publish the counter"),
+		scripted.Complete(`{"pushed":7}`),
+	}
+
+	s := must(g.Begin(ctx, "run-1", "publish the counter", agentrt.DefaultLimits()))
+	var v agentrt.Verdict
+	for v.Outcome != agentrt.VerdictPending {
+		step := must(s.Step(ctx))
+		v = must(step.Propose(ctx, plan[step.Index()]))
+		fmt.Println(step.Index(), v.Outcome)
+		if v.Outcome == agentrt.VerdictAllowed {
+			fmt.Println(must(step.Execute(ctx)).Summary)
+		}
+	}
+	fmt.Println(v.Run.Status, v.Approval.Kind)
+
+	if err := agentrt.Approve(ctx, store, nil, "run-1", v.Approval.ID, "joey", "looks right"); err != nil {
+		panic(err)
+	}
+	s, v, err := g.Attach(ctx, "run-1")
+	if err != nil {
+		panic(err)
+	}
+	defer s.Close()
+	fmt.Println(v.Outcome, v.Request.Spec.Name, string(v.Request.Args))
+	fmt.Println(must(s.Current().Execute(ctx)).Summary)
+
+	step := must(s.Step(ctx))
+	v = must(step.Propose(ctx, plan[step.Index()]))
+	fmt.Println(step.Index(), v.Outcome, v.Run.Status, string(v.Run.Result))
+	// Output:
+	// 0 allowed
+	// echoed read
+	// 1 pending
+	// WAITING_FOR_APPROVAL remote_mutation
+	// allowed push {"n":7}
+	// echoed push
+	// 2 ended COMPLETED {"pushed":7}
+}

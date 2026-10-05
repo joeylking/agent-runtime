@@ -24,39 +24,56 @@ import (
 // while executing a tool that is not ReadOnly waits for an operator
 // before it can run again; anything else continues.
 func (d *Driver) Resume(ctx context.Context, runID string) (Run, error) {
-	if !d.claim(runID) {
-		return Run{}, d.busy(ctx, runID)
+	s, v := d.attach(ctx, runID)
+	defer s.Close()
+	if v.Outcome == VerdictAllowed {
+		s.open.execute(ctx)
 	}
-	defer d.unclaim(runID)
+	return d.loop(ctx, s)
+}
+
+// attach is what Resume does before its loop, and all a Gate's Attach
+// does: it returns a session that holds the run, or one that has already
+// ended with what Resume returns. An approved request the policy still
+// allows is left open in the session for execute, with the run WAITING.
+func (d *Driver) attach(ctx context.Context, runID string) (*Session, Verdict) {
+	s := &Session{d: d, runID: runID, l: d.newLease(runID)}
+	if !d.claim(runID) {
+		s.end(Run{}, d.busy(ctx, runID))
+		return s, Verdict{}
+	}
+	s.claimed = true
 	run, err := d.store.GetRun(ctx, runID)
 	if err != nil {
-		return Run{}, err
+		s.end(Run{}, err)
+		return s, Verdict{}
 	}
+	s.run = run
 	switch run.Status {
 	case StatusWaitingForApproval:
-		return d.resumeApproved(ctx, run)
+		return s, s.resumeApproved(ctx, run)
 	case StatusRunning, StatusInterrupted:
-		return d.resumeInterrupted(ctx, run)
+		return s, s.resumeInterrupted(ctx, run)
 	default:
-		return Run{}, fmt.Errorf("%w: run %s is %s and cannot be resumed", ErrRunState, runID, run.Status)
+		s.end(Run{}, fmt.Errorf("%w: run %s is %s and cannot be resumed", ErrRunState, runID, run.Status))
+		return s, Verdict{}
 	}
 }
 
 var waiting = []RunStatus{StatusWaitingForApproval}
 
-func (d *Driver) resumeApproved(ctx context.Context, run Run) (out Run, err error) {
-	l := d.newLease(run.ID)
-	defer func() { l.stop(out, err) }()
+func (s *Session) resumeApproved(ctx context.Context, run Run) Verdict {
+	d := s.d
 	steps, err := d.store.ListSteps(ctx, run.ID)
 	if err != nil {
-		return Run{}, err
+		return s.finish(Run{}, err)
 	}
 	approvals, err := d.store.ListApprovals(ctx, run.ID)
 	if err != nil {
-		return Run{}, err
+		return s.finish(Run{}, err)
 	}
 	if derr := decodeErrors(steps, approvals); derr != nil {
-		return d.failInternal(ctx, run.ID, waiting, derr)
+		return s.finish(d.failInternal(ctx, run.ID, waiting, derr))
 	}
 	var step *Step
 	for i := range steps {
@@ -65,7 +82,7 @@ func (d *Driver) resumeApproved(ctx context.Context, run Run) (out Run, err erro
 		}
 	}
 	if step == nil {
-		return Run{}, fmt.Errorf("%w: run %s is waiting but has no awaiting step", ErrRunState, run.ID)
+		return s.finish(Run{}, fmt.Errorf("%w: run %s is waiting but has no awaiting step", ErrRunState, run.ID))
 	}
 	// Only the step's latest approval, in insertion order, counts: a step
 	// paused again has a newer approval, and an older grant is spent.
@@ -76,23 +93,23 @@ func (d *Driver) resumeApproved(ctx context.Context, run Run) (out Run, err erro
 		}
 	}
 	if granted == nil {
-		return Run{}, fmt.Errorf("%w: run %s has no approval for step %s", ErrRunState, run.ID, step.ID)
+		return s.finish(Run{}, fmt.Errorf("%w: run %s has no approval for step %s", ErrRunState, run.ID, step.ID))
 	}
 	if granted.Status == ApprovalPending && !granted.ExpiresAt.IsZero() && d.now().After(granted.ExpiresAt) {
 		if err := expireApproval(ctx, d.store, d.observer, run, *granted, d.now()); err != nil {
-			return Run{}, err
+			return s.finish(Run{}, err)
 		}
-		return d.store.GetRun(ctx, run.ID)
+		return s.finish(d.store.GetRun(ctx, run.ID))
 	}
 	if granted.Status != ApprovalApproved {
-		return Run{}, fmt.Errorf("%w: run %s: the latest approval for step %s is %s, not approved", ErrRunState, run.ID, step.ID, granted.Status)
+		return s.finish(Run{}, fmt.Errorf("%w: run %s: the latest approval for step %s is %s, not approved", ErrRunState, run.ID, step.ID, granted.Status))
 	}
 	if err := verifyHash(*granted); err != nil {
-		return Run{}, err
+		return s.finish(Run{}, err)
 	}
 	req := granted.Request
 	if _, ok := d.tools[req.Spec.Name]; !ok {
-		return Run{}, fmt.Errorf("agentrt: approved tool %q is not registered", req.Spec.Name)
+		return s.finish(Run{}, fmt.Errorf("agentrt: approved tool %q is not registered", req.Spec.Name))
 	}
 	req.Spec = d.tools[req.Spec.Name].Spec()
 	resumedAt := d.now()
@@ -101,31 +118,31 @@ func (d *Driver) resumeApproved(ctx context.Context, run Run) (out Run, err erro
 		// as stale. ApprovalTTL does not reach here: it bounds only how
 		// long an approval may stay pending.
 		if err := expireApproval(ctx, d.store, d.observer, run, *granted, resumedAt); err != nil {
-			return Run{}, err
+			return s.finish(Run{}, err)
 		}
-		return d.store.GetRun(ctx, run.ID)
+		return s.finish(d.store.GetRun(ctx, run.ID))
 	}
 	// The arguments are checked against the schema registered now, as the
 	// loop checks a fresh decision, before policy sees them.
 	if verr := d.schemas[req.Spec.Name].validate(req.Args); verr != nil {
-		return d.resumeInvalid(ctx, l, run, step, granted, resumedAt, verr)
+		return s.resumeInvalid(ctx, run, step, granted, resumedAt, verr)
 	}
 	prior := steps[:step.Index]
 	// Policy is evaluated while the run is still WAITING, so the move to
 	// RUNNING and what the policy decided commit together: a crash between
 	// them cannot drop the approved request.
 	pd, perr := d.policy.Evaluate(ctx, req, RunView{Run: run, Steps: cloneSteps(prior), Approvals: cloneApprovals(approvals)})
-	if fin, r, err := d.apply(ctx, nil, l, run, step, req, pd, perr, granted, resumedAt); err != nil || fin {
-		return r, err
-	}
-	return d.loop(ctx, l)
+	st := &OpenStep{s: s, step: *step, run: run, proposed: true}
+	s.open = st
+	return st.apply(ctx, req, pd, perr, granted, resumedAt)
 }
 
 // resumeInvalid moves a WAITING run whose approved request no longer
 // matches its tool's schema back to RUNNING and ends the step as an
 // invalid decision, as the loop would have ended it; the agent decides
 // again.
-func (d *Driver) resumeInvalid(ctx context.Context, l *lease, run Run, step *Step, granted *Approval, resumedAt time.Time, verr error) (Run, error) {
+func (s *Session) resumeInvalid(ctx context.Context, run Run, step *Step, granted *Approval, resumedAt time.Time, verr error) Verdict {
+	d := s.d
 	obs := observation(ObserveInvalidDecision, map[string]string{"error": verr.Error()}, "invalid decision on resume: "+verr.Error())
 	stepAt := d.now()
 	at := d.wall()
@@ -135,30 +152,31 @@ func (d *Driver) resumeInvalid(ctx context.Context, l *lease, run Run, step *Ste
 		}
 		return d.endStepTx(ctx, t, step, StepFailed, &obs, obs.Summary, stepAt)
 	}); err != nil {
-		return Run{}, err
+		return s.finish(Run{}, err)
 	}
-	l.start(at)
-	return d.loop(ctx, l)
+	s.l.start(at)
+	return Verdict{Outcome: VerdictDenied, Observation: &obs}
 }
 
 var resumable = []RunStatus{StatusRunning, StatusInterrupted}
 
-func (d *Driver) resumeInterrupted(ctx context.Context, run Run) (out Run, err error) {
+func (s *Session) resumeInterrupted(ctx context.Context, run Run) Verdict {
+	d := s.d
 	// A live lease is refused before anything is read from the clock.
 	owner, until, err := d.store.lease(ctx, run.ID)
 	if err != nil {
-		return Run{}, err
+		return s.finish(Run{}, err)
 	}
 	if owner != "" && owner != d.terms.owner && until.After(d.wall()) {
-		return Run{}, ErrRunLeased{RunID: run.ID, Owner: owner, ExpiresAt: until}
+		return s.finish(Run{}, ErrRunLeased{RunID: run.ID, Owner: owner, ExpiresAt: until})
 	}
 	steps, err := d.store.ListSteps(ctx, run.ID)
 	if err != nil {
-		return Run{}, err
+		return s.finish(Run{}, err)
 	}
 	approvals, err := d.store.ListApprovals(ctx, run.ID)
 	if err != nil {
-		return Run{}, err
+		return s.finish(Run{}, err)
 	}
 	now := d.now()
 	// A damaged row is not rewritten: the run is taken and failed.
@@ -178,8 +196,6 @@ func (d *Driver) resumeInterrupted(ctx context.Context, run Run) (out Run, err e
 		// acting on it: the step is still the one whose outcome is unknown.
 		executing = &steps[len(steps)-1]
 	}
-	l := d.newLease(run.ID)
-	defer func() { l.stop(out, err) }()
 	// The lease is taken, and the steps in flight marked interrupted, in
 	// one transaction: of two resumers one takes the run and the other
 	// gets ErrRunLeased. Taking over a lease another owner let expire, or
@@ -212,39 +228,39 @@ func (d *Driver) resumeInterrupted(ctx context.Context, run Run) (out Run, err e
 		}
 		return nil
 	}); err != nil {
-		return Run{}, err
+		return s.finish(Run{}, err)
 	}
-	l.start(at)
+	s.l.start(at)
 	if damaged != nil {
-		return d.failInternal(ctx, run.ID, resumable, damaged)
+		return s.finish(d.failInternal(ctx, run.ID, resumable, damaged))
 	}
 	if d.reconcile != nil {
 		rec, err := d.reconcile(ctx, RunView{Run: run, Steps: cloneSteps(steps), Approvals: cloneApprovals(approvals)})
 		if err != nil {
-			return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: "reconcile: " + err.Error()})
+			return s.finish(d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: "reconcile: " + err.Error()}))
 		}
 		switch rec.Outcome {
 		case ReconcileContinue:
 		case ReconcileCompleted:
 			if len(bytes.TrimSpace(rec.Result)) > 0 {
 				if cerr := checkJSON(rec.Result); cerr != nil {
-					return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: "reconcile: result is not usable JSON: " + cerr.Error()})
+					return s.finish(d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: "reconcile: result is not usable JSON: " + cerr.Error()}))
 				}
 			}
-			return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusCompleted, reason: ReasonGoalCompleted, detail: "completed by reconciliation: " + rec.Detail, result: rec.Result})
+			return s.finish(d.settle(ctx, nil, run.ID, resumable, ending{status: StatusCompleted, reason: ReasonGoalCompleted, detail: "completed by reconciliation: " + rec.Detail, result: rec.Result}))
 		case ReconcileConflict:
-			return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonReconcileConflict, detail: rec.Detail})
+			return s.finish(d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonReconcileConflict, detail: rec.Detail}))
 		case ReconcileWaiting:
-			return d.reconcilePause(ctx, run, executing, rec, now)
+			return s.reconcilePause(ctx, run, executing, rec, now)
 		default:
-			return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: fmt.Sprintf("reconcile: unknown outcome %q", rec.Outcome)})
+			return s.finish(d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: fmt.Sprintf("reconcile: unknown outcome %q", rec.Outcome)}))
 		}
 	} else if executing != nil {
 		if spec, ok := d.specOf(executing); !ok || spec.SideEffect != ReadOnly {
 			// Without reconciliation nobody knows whether the side effect
 			// happened, and the agent would ask for it again in a new
 			// step. It is re-run only if an operator approves.
-			return d.interruptedPause(ctx, run, executing, now)
+			return s.interruptedPause(ctx, run, executing, now)
 		}
 	}
 	run.Status = StatusRunning
@@ -254,9 +270,10 @@ func (d *Driver) resumeInterrupted(ctx context.Context, run Run) (out Run, err e
 		}
 		return t.emit(ctx, Event{RunID: run.ID, At: now, Type: EventRunResumed}, map[string]any{"after": "interruption"})
 	}); err != nil {
-		return Run{}, err
+		return s.finish(Run{}, err)
 	}
-	return d.loop(ctx, l)
+	s.run = run
+	return Verdict{}
 }
 
 // interruptedExecuting reports a step Resume marked interrupted while it
@@ -311,22 +328,23 @@ func (d *Driver) pausable(run Run, st *Step) (ToolRequest, error) {
 // tool call whose arguments still pass the schema, the run fails as a
 // conflict rather than waiting on nothing; a step whose arguments fail the
 // schema is ended as an invalid decision.
-func (d *Driver) reconcilePause(ctx context.Context, run Run, executing *Step, rec Reconciliation, now time.Time) (Run, error) {
-	conflict := func(detail string, e ending) (Run, error) {
+func (s *Session) reconcilePause(ctx context.Context, run Run, executing *Step, rec Reconciliation, now time.Time) Verdict {
+	d := s.d
+	conflict := func(detail string, e ending) Verdict {
 		if rec.Detail != "" {
 			detail += ": " + rec.Detail
 		}
 		e.status, e.reason, e.detail = StatusFailed, ReasonReconcileConflict, detail
-		return d.settle(ctx, nil, run.ID, resumable, e)
+		return s.finish(d.settle(ctx, nil, run.ID, resumable, e))
 	}
 	if rec.Pause == nil {
 		return conflict("reconciliation asked to wait but gave no approval to wait for", ending{})
 	}
 	if rec.Pause.Outcome != RequireApproval {
-		return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: fmt.Sprintf("reconcile: waiting needs a require_approval decision, got %q", rec.Pause.Outcome)})
+		return s.finish(d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: fmt.Sprintf("reconcile: waiting needs a require_approval decision, got %q", rec.Pause.Outcome)}))
 	}
 	if err := checkPolicy(*rec.Pause); err != nil {
-		return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: "reconcile: " + err.Error()})
+		return s.finish(d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonInternalError, detail: "reconcile: " + err.Error()}))
 	}
 	req, err := d.pausable(run, executing)
 	if err != nil {
@@ -338,7 +356,7 @@ func (d *Driver) reconcilePause(ctx context.Context, run Run, executing *Step, r
 		return conflict("reconciliation asked to wait but no interrupted tool call can be paused ("+err.Error()+")", e)
 	}
 	executing.Observation, executing.FinishedAt = nil, time.Time{}
-	return d.pause(ctx, nil, run.ID, executing, req, *rec.Pause, resumable, now)
+	return s.pause(d.pause(ctx, nil, run.ID, executing, req, *rec.Pause, resumable, now))
 }
 
 // InterruptedSideEffect is the approval kind a run pauses on when Resume,
@@ -352,24 +370,25 @@ const InterruptedSideEffect = "interrupted_side_effect"
 // that cannot wait, because its tool is gone or its arguments no longer
 // pass the schema, ends the run as a conflict instead: it is never left
 // for the agent to ask for again.
-func (d *Driver) interruptedPause(ctx context.Context, run Run, st *Step, now time.Time) (Run, error) {
+func (s *Session) interruptedPause(ctx context.Context, run Run, st *Step, now time.Time) Verdict {
+	d := s.d
 	req, err := d.pausable(run, st)
 	if err != nil {
-		return d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonReconcileConflict,
-			detail: fmt.Sprintf("step %d was interrupted while executing a tool call whose outcome is unknown, and it cannot wait for an operator: %v", st.Index, err)})
+		return s.finish(d.settle(ctx, nil, run.ID, resumable, ending{status: StatusFailed, reason: ReasonReconcileConflict,
+			detail: fmt.Sprintf("step %d was interrupted while executing a tool call whose outcome is unknown, and it cannot wait for an operator: %v", st.Index, err)}))
 	}
 	capability, err := toJSON(map[string]any{"tool": req.Spec.Name, "args": req.Args})
 	if err != nil {
-		return d.failInternal(ctx, run.ID, resumable, err)
+		return s.finish(d.failInternal(ctx, run.ID, resumable, err))
 	}
 	presentation, err := toJSON(map[string]any{
 		"tool": req.Spec.Name, "args": req.Args, "side_effect": req.Spec.SideEffect,
 		"notice": "This tool call started, and the process stopped before its outcome was recorded, so whether it took effect is unknown. Approving runs it again with these arguments; rejecting ends the run.",
 	})
 	if err != nil {
-		return d.failInternal(ctx, run.ID, resumable, err)
+		return s.finish(d.failInternal(ctx, run.ID, resumable, err))
 	}
 	pd := PolicyDecision{Outcome: RequireApproval, Reason: "interrupted while executing; outcome unknown", Kind: InterruptedSideEffect, Capability: capability, Presentation: presentation}
 	st.Observation, st.FinishedAt = nil, time.Time{}
-	return d.pause(ctx, nil, run.ID, st, req, pd, resumable, now)
+	return s.pause(d.pause(ctx, nil, run.ID, st, req, pd, resumable, now))
 }

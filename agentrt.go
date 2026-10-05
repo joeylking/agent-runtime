@@ -9,8 +9,11 @@
 // through an accounting caller that enforces the run's limits; repeated
 // failures and repeated identical outcomes stop the run; a run interrupted
 // mid-step is reconciled by the consumer on Resume, and a lease keeps two
-// processes from executing one run. docs/architecture.md describes the
-// design and docs/status.md what is verified.
+// processes from executing one run. A Gate holds the same controls for a
+// loop the runtime does not own: the caller decides, and the gate records,
+// checks, and executes each proposed action, as the Driver, which runs on
+// it, does for its agent. docs/architecture.md describes the design and
+// docs/status.md what is verified.
 package agentrt
 
 import (
