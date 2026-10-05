@@ -5,12 +5,10 @@ module github.com/joeylking/agent-runtime/proxy
 go 1.26.0
 
 require (
-	// These are the latest releases. The proxy needs the Gate, which no core
-	// release carries yet, and mcp.ReadOwned and its readers, which no mcp
-	// release carries yet, so until both are released it builds only
-	// through a workspace of this repository; see CONTRIBUTING.md.
-	github.com/joeylking/agent-runtime v0.3.2
-	github.com/joeylking/agent-runtime/mcp v0.2.0
+	// The proxy needs the Gate, in core v0.4.0, and mcp.ReadOwned and its
+	// readers, in mcp/v0.2.1.
+	github.com/joeylking/agent-runtime v0.4.0
+	github.com/joeylking/agent-runtime/mcp v0.2.1
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 )
 

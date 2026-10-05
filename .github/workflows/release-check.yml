@@ -69,19 +69,13 @@ jobs:
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
       # The examples pin the nested modules' own tags, so they can only be
       # re-pinned after those tags exist. A nested tag's push, and the
-      # manual run that precedes it, therefore check the six library
+      # manual run that precedes it, therefore check the seven library
       # modules; the schedule and an ordinary manual run check everything.
       - name: nested modules against their pinned core
         env:
           WITH_EXAMPLES: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.examples) }}
         run: |
-          # proxy is deliberately not listed yet. It needs the Gate, which
-          # no core release carries (v0.3.2 is the latest), and
-          # mcp.ReadOwned and its readers, which no mcp release carries
-          # (mcp/v0.2.0), so it cannot build with GOWORK=off until both are
-          # released and its go.mod is re-pinned to them. Add it here in
-          # that same commit.
-          modules="providers/ollama providers/anthropic providers/openai mcp bench export/otel"
+          modules="providers/ollama providers/anthropic providers/openai mcp bench export/otel proxy"
           if [ "$WITH_EXAMPLES" = "true" ]; then
             modules="$modules examples/live examples/mcp"
           fi

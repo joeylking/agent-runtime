@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	// Sibling modules are pinned to their release tags; the workspace
 	// the README builds overrides these for development inside the repository.
-	github.com/joeylking/agent-runtime v0.3.0
+	github.com/joeylking/agent-runtime v0.4.0
 	github.com/joeylking/agent-runtime/providers/ollama v0.2.0
 	github.com/joeylking/agent-runtime/providers/openai v0.2.0
 )
