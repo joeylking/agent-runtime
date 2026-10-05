@@ -608,6 +608,30 @@ func TestExporter_RecordsACappedPayload(t *testing.T) {
 	}
 }
 
+// A decision's origin is an attribute of its step when the payload names
+// one, and absent when it does not, as for every decision the fixtures
+// recorded.
+func TestExporter_DecisionOrigin(t *testing.T) {
+	mem := tracetest.NewInMemoryExporter()
+	tp := otel.NewTracerProvider(sdktrace.WithSyncer(mem))
+	defer tp.Shutdown(context.Background())
+	x := &otel.Exporter{TracerProvider: tp}
+	now := time.Now()
+	x.Handle(agentrt.Event{Seq: 1, RunID: "r", At: now, Type: agentrt.EventRunCreated, Payload: []byte(`{"goal":"g"}`)})
+	x.Handle(agentrt.Event{Seq: 2, RunID: "r", StepID: "s0", At: now, Type: agentrt.EventStepStarted, Payload: []byte(`{"index":0}`)})
+	x.Handle(agentrt.Event{Seq: 3, RunID: "r", StepID: "s0", At: now, Type: agentrt.EventStepDecided, Payload: []byte(`{"kind":"complete","origin":"operator"}`)})
+	x.Handle(agentrt.Event{Seq: 4, RunID: "r", At: now.Add(time.Second), Type: agentrt.EventRunFinished, Payload: []byte(`{"status":"COMPLETED","reason":"goal_completed","steps":1}`)})
+	steps := named(mem.GetSpans(), otel.SpanStep)
+	if len(steps) != 1 || str(t, steps[0], "agentrt.decision.origin") != "operator" || str(t, steps[0], "agentrt.decision.kind") != "complete" {
+		t.Fatalf("step spans %v", steps)
+	}
+
+	f := loadFixtures(t)
+	for _, s := range named(ofRun(exportAll(t, f, nil), f.completed), otel.SpanStep) {
+		noAttr(t, s, "agentrt.decision.origin")
+	}
+}
+
 // Provider reads the standard environment: none and console build, the
 // deterministic ids are installed, and a protocol this module does not
 // carry is refused by name.

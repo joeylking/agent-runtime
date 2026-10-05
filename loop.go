@@ -318,6 +318,9 @@ func repeatedOutcome(steps []Step) (int, outcomeSignature) {
 }
 
 func (d *Driver) validateDecision(dec Decision) error {
+	if !dec.Origin.valid() {
+		return fmt.Errorf("unknown decision origin %q", dec.Origin)
+	}
 	switch dec.Kind {
 	case DecideComplete:
 		if len(bytes.TrimSpace(dec.Result)) > 0 {

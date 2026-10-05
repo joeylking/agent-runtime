@@ -2,9 +2,11 @@ package agentrt
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -740,4 +742,463 @@ func TestGate_AbandonedApprovedStepStaysApproved(t *testing.T) {
 	if got, _ := w.store.GetRun(ctx, "r"); got.Status != StatusRunning {
 		t.Fatalf("run is %s after the approved step", got.Status)
 	}
+}
+
+// grantPaused is a gate session paused on a push that an operator then
+// approved on the twin's clock, and the Attach that allowed it.
+func grantPaused(t *testing.T, w *twin, tools []Tool, l Limits) (*Gate, *Session, Verdict) {
+	t.Helper()
+	ctx := context.Background()
+	g := w.gate(t, tools, DefaultPolicy())
+	s, err := g.Begin(ctx, "r", "g", l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, _ := s.Step(ctx)
+	v, err := st.Propose(ctx, call("push", `{"n":7}`))
+	if err != nil || v.Outcome != VerdictPending {
+		t.Fatalf("pause: %+v %v", v, err)
+	}
+	if err := (Operator{Store: w.store, Now: w.now}).Approve(ctx, "r", v.Approval.ID, "joey", ""); err != nil {
+		t.Fatal(err)
+	}
+	s, v, err = g.Attach(ctx, "r")
+	if err != nil || v.Outcome != VerdictAllowed {
+		t.Fatalf("attach: %+v %v", v, err)
+	}
+	return g, s, v
+}
+
+// A grant Attach allowed is judged against GrantTTL again at Execute: a
+// caller that waits past it executes nothing, and the run is cancelled as
+// approval_expired exactly as Attach would have cancelled it; within the
+// TTL, or with none, the grant executes however long the wait.
+func TestGate_GrantTTLHoldsUntilExecute(t *testing.T) {
+	ctx := context.Background()
+	withTTL := leaseLimits()
+	withTTL.GrantTTL = time.Minute
+	t.Run("expired", func(t *testing.T) {
+		w := newTwin(t)
+		tools := gateTools()
+		push := tools[1].(*countedTool)
+		g, s, _ := grantPaused(t, w, tools, withTTL)
+		defer s.Close()
+		w.at = w.at.Add(2 * time.Minute)
+		_, err := s.Current().Execute(ctx)
+		if !errors.Is(err, ErrApprovalExpired) || !errors.Is(err, ErrNotPending) || push.calls.Load() != 0 {
+			t.Fatalf("execute of an expired grant: %v, %d calls", err, push.calls.Load())
+		}
+		run, _ := w.store.GetRun(ctx, "r")
+		if run.Status != StatusCancelled || run.Reason != ReasonApprovalExpired || !s.Done() || s.Run().Reason != ReasonApprovalExpired {
+			t.Fatalf("run %s %s, session run %s, done %v", run.Status, run.Reason, s.Run().Reason, s.Done())
+		}
+		approvals, _ := w.store.ListApprovals(ctx, "r")
+		if approvals[0].Status != ApprovalExpired || approvals[0].DecidedBy != "joey" {
+			t.Fatalf("approval %+v", approvals[0])
+		}
+		events, _ := w.store.ListEvents(ctx, "r")
+		for _, e := range events {
+			if e.Type == EventStepToolStarted || e.Type == EventRunResumed {
+				t.Fatalf("an expired grant left %s", e.Type)
+			}
+		}
+		if _, err := s.Step(ctx); !errors.Is(err, ErrSessionClosed) || !errors.Is(err, ErrApprovalExpired) {
+			t.Fatalf("step after the expiry: %v", err)
+		}
+		if _, _, err := g.Attach(ctx, "r"); !errors.Is(err, ErrRunState) {
+			t.Fatalf("attach of the cancelled run: %v", err)
+		}
+	})
+	for name, c := range map[string]struct {
+		limits Limits
+		wait   time.Duration
+	}{
+		"within the TTL": {withTTL, 30 * time.Second},
+		"no TTL":         {leaseLimits(), 10 * time.Hour},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newTwin(t)
+			tools := gateTools()
+			push := tools[1].(*countedTool)
+			_, s, _ := grantPaused(t, w, tools, c.limits)
+			defer s.Close()
+			w.at = w.at.Add(c.wait)
+			if obs, err := s.Current().Execute(ctx); err != nil || obs.Kind != ObserveToolResult || push.calls.Load() != 1 {
+				t.Fatalf("execute: %+v %v, %d calls", obs, err, push.calls.Load())
+			}
+			if run, _ := w.store.GetRun(ctx, "r"); run.Status != StatusRunning {
+				t.Fatalf("run is %s", run.Status)
+			}
+		})
+	}
+}
+
+// Origin is recorded with the decision and nothing else: a decision
+// without one encodes exactly as before Origin existed, and the approval a
+// request pauses on hashes the same with or without it, because the hash
+// covers the tool request and not the decision.
+func TestDecision_OriginIsRecordedAndChangesNothingElse(t *testing.T) {
+	ctx := context.Background()
+	b, err := json.Marshal(Decision{Kind: DecideToolCall, Tool: "push", Args: []byte(`{"n":7}`), Reason: "r"})
+	if err != nil || string(b) != `{"kind":"tool_call","tool":"push","args":{"n":7},"reason":"r"}` {
+		t.Fatalf("encoded %s %v", b, err)
+	}
+	paused := func(origin DecisionOrigin) (*twin, Approval) {
+		w := newTwin(t)
+		s, err := w.gate(t, gateTools(), DefaultPolicy()).Begin(ctx, "r", "g", leaseLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, _ := s.Step(ctx)
+		d := call("push", `{"n":7}`)
+		d.Origin = origin
+		v, err := st.Propose(ctx, d)
+		if err != nil || v.Outcome != VerdictPending {
+			t.Fatalf("pause: %+v %v", v, err)
+		}
+		return w, *v.Approval
+	}
+	plain, a := paused("")
+	_, b2 := paused(OriginModel)
+	if a.Hash != b2.Hash || !reflect.DeepEqual(a, b2) {
+		t.Fatalf("approvals differ with an origin:\n %+v\n %+v", a, b2)
+	}
+	events, _ := plain.store.ListEvents(ctx, "r")
+	for _, e := range events {
+		if e.Type == EventStepDecided && string(e.Payload) != `{"kind":"tool_call","tool":"push","args":{"n":7}}` {
+			t.Fatalf("step.decided payload %s", e.Payload)
+		}
+	}
+	var stored string
+	if err := plain.store.DB().QueryRow(`SELECT decision_json FROM steps WHERE run_id = 'r'`).Scan(&stored); err != nil || stored != `{"kind":"tool_call","tool":"push","args":{"n":7}}` {
+		t.Fatalf("stored decision %s %v", stored, err)
+	}
+}
+
+// An origin outside the known set is an invalid decision, recorded
+// verbatim and ended with an invalid_decision observation, through a gate
+// and a Driver alike; each known origin is accepted.
+func TestDecision_UnknownOriginIsInvalid(t *testing.T) {
+	ctx := context.Background()
+	w := newTwin(t)
+	tools := gateTools()
+	s, err := w.gate(t, tools, DefaultPolicy()).Begin(ctx, "r", "g", leaseLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for i, origin := range []DecisionOrigin{"robot", OriginModel, OriginPlan, OriginOperator} {
+		st, _ := s.Step(ctx)
+		d := call("read", fmt.Sprintf(`{"n":%d}`, i))
+		d.Origin = origin
+		v, err := st.Propose(ctx, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			if v.Outcome != VerdictDenied || v.Observation.Kind != ObserveInvalidDecision || !strings.Contains(v.Observation.Summary, `unknown decision origin "robot"`) {
+				t.Fatalf("unknown origin: %+v", v)
+			}
+			continue
+		}
+		if v.Outcome != VerdictAllowed {
+			t.Fatalf("origin %s: %+v", origin, v)
+		}
+		if _, err := st.Execute(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	steps, _ := w.store.ListSteps(ctx, "r")
+	if steps[0].Decision.Origin != "robot" || steps[3].Decision.Origin != OriginOperator || tools[0].(*countedTool).calls.Load() != 3 {
+		t.Fatalf("recorded %+v / %+v", steps[0].Decision, steps[3].Decision)
+	}
+
+	driven := newTwin(t)
+	d := mustDriver(t, Config{Store: driven.store, Agent: &listAgent{decisions: []Decision{{Kind: DecideComplete, Origin: "robot"}, {Kind: DecideComplete}}}, Tools: gateTools(), Now: driven.now, NewID: driven.newID})
+	run, err := d.Start(ctx, "g", leaseLimits())
+	if err != nil || run.Status != StatusCompleted {
+		t.Fatalf("driver: %s %v", run.Status, err)
+	}
+	steps, _ = driven.store.ListSteps(ctx, run.ID)
+	if steps[0].Observation == nil || steps[0].Observation.Kind != ObserveInvalidDecision {
+		t.Fatalf("driver step 0 = %+v", steps[0])
+	}
+}
+
+// inputAgent records what a Driver hands its agent at every decision.
+type inputAgent struct {
+	listAgent
+	inputs []StepInput
+}
+
+func (a *inputAgent) Decide(ctx context.Context, in StepInput) (Decision, error) {
+	a.inputs = append(a.inputs, in)
+	return a.listAgent.Decide(ctx, in)
+}
+
+// Session.Input while a step is open is exactly what a Driver's agent is
+// handed at that step, through a denial, an invalid decision, a pause, the
+// approval, and the approved request; asking for it reads no clock, so the
+// two runs stay reading for reading alike.
+func TestGate_InputMatchesTheAgentsStepInput(t *testing.T) {
+	ctx := context.Background()
+	decisions := []Decision{
+		call("read", `{"n":1}`),
+		call("wipe", `{}`),
+		call("nope", `{}`),
+		call("push", `{"n":7}`),
+		call("read", `{"n":2}`),
+		call("finish", `{}`),
+	}
+	l := Limits{MaxSteps: 10, MaxConsecutiveToolFailures: 5, LoopThreshold: 3}
+
+	driven := newTwin(t)
+	agent := &inputAgent{listAgent: listAgent{decisions: decisions}}
+	d := mustDriver(t, Config{Store: driven.store, Agent: agent, Tools: gateTools(), Observer: driven.observe, Now: driven.now, NewID: driven.newID})
+	if _, err := d.StartWithID(ctx, "r", "g", l); err != nil {
+		t.Fatal(err)
+	}
+	approvals, _ := driven.store.ListApprovals(ctx, "r")
+	if err := d.Approve(ctx, "r", approvals[0].ID, "joey", ""); err != nil {
+		t.Fatal(err)
+	}
+	if run, err := d.Resume(ctx, "r"); err != nil || run.Status != StatusCompleted {
+		t.Fatalf("resume: %s %v", run.Status, err)
+	}
+
+	gated := newTwin(t)
+	g := gated.gate(t, gateTools(), DefaultPolicy())
+	var inputs []StepInput
+	loop := func(s *Session) Verdict {
+		var v Verdict
+		for !s.Done() {
+			st, err := s.Step(ctx)
+			if err != nil || st == nil {
+				t.Fatalf("step: %v", err)
+			}
+			in, err := s.Input(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			inputs = append(inputs, in)
+			if v, err = st.Propose(ctx, decisions[st.Index()]); err != nil {
+				t.Fatal(err)
+			}
+			if v.Outcome == VerdictAllowed {
+				if _, err := st.Execute(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		return v
+	}
+	s, err := g.Begin(ctx, "r", "g", l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := loop(s)
+	if err := (Operator{Store: gated.store, Observer: gated.observe, Now: gated.now}).Approve(ctx, "r", v.Approval.ID, "joey", ""); err != nil {
+		t.Fatal(err)
+	}
+	s, _, err = g.Attach(ctx, "r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.Current().Execute(ctx); err != nil {
+		t.Fatal(err)
+	}
+	loop(s)
+
+	if len(inputs) != len(agent.inputs) || len(inputs) != 6 {
+		t.Fatalf("%d inputs, the agent was handed %d", len(inputs), len(agent.inputs))
+	}
+	for i := range inputs {
+		if !reflect.DeepEqual(inputs[i], agent.inputs[i]) {
+			t.Errorf("input %d differs:\n gate  %+v\n agent %+v", i, inputs[i], agent.inputs[i])
+		}
+	}
+	if gated.reads != driven.reads || snapshot(t, gated.store, "r") != snapshot(t, driven.store, "r") {
+		t.Errorf("asking for input changed the run: %d readings, the driver took %d", gated.reads, driven.reads)
+	}
+}
+
+// Between steps Input is the run as the session left it and every step
+// recorded, as the store has them: before the first step, after a denial,
+// and after Execute. For the approved step Attach left open, it is the
+// WAITING run and the steps before it. After the first call no call loads
+// the steps again.
+func TestGate_InputAtEveryPointOfASession(t *testing.T) {
+	ctx := context.Background()
+	w := newTwin(t)
+	g := w.gate(t, gateTools(), DefaultPolicy())
+	s, err := g.Begin(ctx, "r", "g", leaseLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(at string, wantRun Run, n int) {
+		t.Helper()
+		in, err := s.Input(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		steps, _ := w.store.ListSteps(ctx, "r")
+		approvals, _ := w.store.ListApprovals(ctx, "r")
+		var want []Step
+		if n > 0 {
+			want = steps[:n]
+		}
+		if !reflect.DeepEqual(in.Run, wantRun) || !reflect.DeepEqual(in.Steps, want) || !reflect.DeepEqual(in.Approvals, approvals) || !reflect.DeepEqual(in.Tools, g.d.specs) {
+			t.Fatalf("%s: input %+v\n want run %+v, %d steps, approvals %+v", at, in, wantRun, n, approvals)
+		}
+	}
+	check("before the first step", s.Run(), 0)
+	c := s.c
+	st, _ := s.Step(ctx)
+	check("open", st.run, 0)
+	if v, err := st.Propose(ctx, call("wipe", `{}`)); err != nil || v.Outcome != VerdictDenied {
+		t.Fatalf("deny: %+v %v", v, err)
+	}
+	check("after a denial", s.Run(), 1)
+	st, _ = s.Step(ctx)
+	if v, err := st.Propose(ctx, call("read", `{"n":1}`)); err != nil || v.Outcome != VerdictAllowed {
+		t.Fatalf("allow: %+v %v", v, err)
+	}
+	check("allowed", st.run, 1)
+	if _, err := st.Execute(ctx); err != nil {
+		t.Fatal(err)
+	}
+	check("after Execute", s.Run(), 2)
+	if s.c != c {
+		t.Fatal("Input loaded the steps again")
+	}
+	st, _ = s.Step(ctx)
+	v, err := st.Propose(ctx, call("push", `{"n":7}`))
+	if err != nil || v.Outcome != VerdictPending {
+		t.Fatalf("pause: %+v %v", v, err)
+	}
+	if err := Approve(ctx, w.store, nil, "r", v.Approval.ID, "joey", ""); err != nil {
+		t.Fatal(err)
+	}
+	s, _, err = g.Attach(ctx, "r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	waiting, _ := w.store.GetRun(ctx, "r")
+	check("approved and open", waiting, 2)
+	if _, err := s.Current().Execute(ctx); err != nil {
+		t.Fatal(err)
+	}
+	running, _ := w.store.GetRun(ctx, "r")
+	if run := s.Run(); run.Status != StatusWaitingForApproval || running.Status != StatusRunning {
+		t.Fatalf("session run %s, stored %s", run.Status, running.Status)
+	}
+	check("after the approved step", s.Run(), 3)
+}
+
+// What Input returns is the caller's: writing into it changes neither the
+// session's copy, which the policy's view and the next write rest on, nor
+// the record.
+func TestGate_InputIsACopy(t *testing.T) {
+	ctx := context.Background()
+	w := newTwin(t)
+	g := w.gate(t, gateTools(), DefaultPolicy())
+	s, err := g.Begin(ctx, "r", "g", leaseLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	st, _ := s.Step(ctx)
+	v, _ := st.Propose(ctx, call("push", `{"n":7}`))
+	if err := Approve(ctx, w.store, nil, "r", v.Approval.ID, "joey", ""); err != nil {
+		t.Fatal(err)
+	}
+	s, _, err = g.Attach(ctx, "r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.Current().Execute(ctx); err != nil {
+		t.Fatal(err)
+	}
+	in, err := s.Input(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(in.Steps[0].Decision.Args, "XXXXXXX")
+	copy(in.Steps[0].Observation.Content, "XXXXXXX")
+	in.Steps[0].Decision.Tool = "wipe"
+	copy(in.Approvals[0].Request.Args, "XXXXXXX")
+	copy(in.Approvals[0].Capability, "XXXXXXX")
+	copy(in.Tools[0].InputSchema, "XXXXXXX")
+	in.Tools[0].Name = "x"
+	steps, _ := w.store.ListSteps(ctx, "r")
+	approvals, _ := w.store.ListApprovals(ctx, "r")
+	if !reflect.DeepEqual(s.c.steps, steps) || !reflect.DeepEqual(s.c.approvals, approvals) || g.d.specs[0].Name != "finish" || string(g.d.specs[0].InputSchema[:1]) != "{" {
+		t.Fatal("writing into the input changed the session's copy")
+	}
+	pv, pa := s.c.policy.view(s.c, 1)
+	if !reflect.DeepEqual(pv, steps[:1]) || !reflect.DeepEqual(pa, approvals) {
+		t.Fatal("writing into the input changed the policy's view")
+	}
+	st, _ = s.Step(ctx)
+	if v, err := st.Propose(ctx, Decision{Kind: DecideComplete}); err != nil || v.Run.Status != StatusCompleted {
+		t.Fatalf("complete: %+v %v", v, err)
+	}
+	if err := verifyHash(approvals[0]); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A Gate whose sessions are all over, ended by the run or closed by the
+// caller, holds no goroutine: each session's heartbeat stops with it.
+func TestGate_ClosedSessionsLeaveNoGoroutine(t *testing.T) {
+	ctx := context.Background()
+	w := newTwin(t)
+	tools := gateTools()
+	g := w.gate(t, tools, DefaultPolicy())
+	g.d.renewEvery = 5 * time.Millisecond
+	base := runtime.NumGoroutine()
+	var sessions []*Session
+	for i := range 3 {
+		id := fmt.Sprintf("r%d", i)
+		s, err := g.Begin(ctx, id, "g", leaseLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		sessions = append(sessions, s)
+		switch i {
+		case 0:
+			// Completed: the run ends the session.
+			drive(t, ctx, s, []Decision{call("read", `{"n":1}`), {Kind: DecideComplete}})
+		case 1:
+			// Paused, approved, and executed under a second session.
+			v := drive(t, ctx, s, []Decision{call("push", `{"n":1}`)})
+			if err := Approve(ctx, w.store, nil, id, v.Approval.ID, "joey", ""); err != nil {
+				t.Fatal(err)
+			}
+			s, v, err = g.Attach(ctx, id)
+			if err != nil || v.Outcome != VerdictAllowed {
+				t.Fatalf("attach: %+v %v", v, err)
+			}
+			sessions = append(sessions, s)
+			if _, err := s.Current().Execute(ctx); err != nil {
+				t.Fatal(err)
+			}
+		case 2:
+			// Left mid-step.
+			st, _ := s.Step(ctx)
+			if _, err := st.Propose(ctx, call("read", `{"n":1}`)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if runtime.NumGoroutine() <= base {
+		t.Fatal("no heartbeat is running; the test would prove nothing")
+	}
+	for _, s := range sessions {
+		s.Close()
+	}
+	settled(t, base)
 }

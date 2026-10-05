@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 )
@@ -75,6 +76,11 @@ func (g *Gate) Begin(ctx context.Context, runID, goal string, limits Limits) (*S
 // ReadOnly pauses as interrupted_side_effect. A verdict of Pending or
 // Ended comes with a session that is already over; a zero verdict means
 // the session is open with no step, ready for Step.
+//
+// An Allowed verdict is the policy's answer at the time it was given, and
+// GrantTTL is judged here against the grant's decision. The approved step
+// may wait for Execute, which judges GrantTTL again, so a grant is never
+// executed after it expired however long the caller waits.
 func (g *Gate) Attach(ctx context.Context, runID string) (*Session, Verdict, error) {
 	s, v := g.d.attach(ctx, runID)
 	if s.ended && s.err != nil {
@@ -185,6 +191,58 @@ func (s *Session) Current() *OpenStep {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.open
+}
+
+// Input is what an agent deciding at this point of the session would be
+// handed in StepInput, for a loop that decides from the run's record as
+// an agent does: copies, which the caller may change without changing the
+// run's record or any later view but its own. While a step is open it is
+// that step's input, as Decide receives it: the run as the step started,
+// the steps before it, every approval, the tools, and the step's Model;
+// for the approved step Attach left open, the run is the WAITING run and
+// the steps those before it. With no step open it is the run as the
+// session last read or wrote it and every step it has recorded, before
+// the first Step none. It is served from the copy of the run's steps and
+// approvals the session keeps as it writes: the first call of a session,
+// or the first after a write the copy could not apply, loads them, which
+// the next Step would otherwise have done and then does not, and a later
+// call copies only the steps that changed since the previous one, so a
+// call costs one shallow copy of each step and reads nothing from the
+// store. A run whose stored rows cannot be decoded returns an error, and
+// the next Step fails the run as it would have.
+func (s *Session) Input(ctx context.Context) (StepInput, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil || s.c.stale {
+		c, err := s.d.load(ctx, s.runID)
+		if err != nil {
+			return StepInput{}, err
+		}
+		if derr := decodeErrors(c.steps, c.approvals); derr != nil {
+			// Left for Step, which fails the run on it.
+			return StepInput{}, fmt.Errorf("agentrt: run %s: %w", s.runID, derr)
+		}
+		s.c = c
+	}
+	in := StepInput{Run: s.run, Tools: cloneSpecs(s.d.specs)}
+	n := len(s.c.steps)
+	if st := s.open; st != nil {
+		in.Run, n, in.Model = st.run, st.n, st.mc
+		if st.granted != nil {
+			n = st.step.Index
+		}
+	}
+	in.Steps, in.Approvals = s.c.agent.view(s.c, n)
+	return in, nil
+}
+
+// cloneSpecs copies tool specs and their schemas.
+func cloneSpecs(specs []ToolSpec) []ToolSpec {
+	out := slices.Clone(specs)
+	for i := range out {
+		out[i].InputSchema = cloneBytes(out[i].InputSchema)
+	}
+	return out
 }
 
 // Run is the run as the session last read or wrote it: after the call
@@ -360,6 +418,16 @@ func (st *OpenStep) Propose(ctx context.Context, decision Decision) (Verdict, er
 // unexpired. A terminal tool that succeeds completes the run, and one
 // that returns ErrAbortRun fails it; Done then reports the session over
 // and Run the run.
+//
+// The Allowed verdict is the policy's answer when it was given. For a
+// step Propose allowed, the gap until Execute is covered by the session's
+// lease and by no other limit, exactly as an agent's slow Decide is: the
+// time limits are checked at Step. For the approved step Attach allowed,
+// which holds no lease, Execute judges Limits.GrantTTL again on a fresh
+// reading of GateConfig.Now: a grant that expired since is expired as
+// Attach would have expired it, the run cancelled as approval_expired,
+// nothing executed, and the session ended with an error that matches
+// ErrApprovalExpired.
 func (st *OpenStep) Execute(ctx context.Context) (Observation, error) {
 	s := st.s
 	s.mu.Lock()
@@ -367,11 +435,41 @@ func (st *OpenStep) Execute(ctx context.Context) (Observation, error) {
 	if err := st.usable(true); err != nil {
 		return Observation{}, err
 	}
+	if err := st.grantExpired(ctx); err != nil {
+		return Observation{}, err
+	}
 	obs := st.execute(ctx)
 	if s.ended && s.err != nil {
 		return obs, s.err
 	}
 	return obs, nil
+}
+
+// grantExpired ends the session when the grant of an approved step has
+// passed its GrantTTL since Attach allowed it, expiring the grant and
+// cancelling the run as Attach does, and returns why. The Driver executes
+// the grant in the call that judged it, so only a gate's caller can wait,
+// and only it reads the clock again here.
+func (st *OpenStep) grantExpired(ctx context.Context) error {
+	s, d, granted := st.s, st.s.d, st.granted
+	ttl := st.run.Limits.GrantTTL
+	if granted == nil || ttl <= 0 {
+		return nil
+	}
+	now := d.now()
+	if !now.After(granted.DecidedAt.Add(ttl)) {
+		return nil
+	}
+	if err := expireApproval(ctx, d.store, d.observer, st.run, *granted, now); err != nil {
+		// Another process executed or cancelled the run meanwhile.
+		s.end(Run{}, err)
+		return err
+	}
+	err := fmt.Errorf("%w: run %s: approval %s was granted at %s and its grant TTL of %s passed before Execute", ErrApprovalExpired,
+		s.runID, granted.ID, granted.DecidedAt.Format(time.RFC3339), ttl)
+	out, _ := d.store.GetRun(ctx, s.runID)
+	s.end(out, err)
+	return err
 }
 
 // Fail ends a step whose decision could not be made, because the model

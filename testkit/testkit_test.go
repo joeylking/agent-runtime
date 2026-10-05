@@ -638,3 +638,143 @@ func TestSameRenders_FailsOnANondeterministicOpening(t *testing.T) {
 		t.Fatalf("errors = %q", r.joined())
 	}
 }
+
+// ---- gate loops -------------------------------------------------------------
+
+// gateLoop is a consumer's own loop over a Gate that decides by step index,
+// as a replayer does: it executes the approved step Attach left open, then
+// proposes each decision and executes what is allowed until the session
+// is over.
+func gateLoop(decisions ...agentrt.Decision) func(context.Context, *agentrt.Session) error {
+	return func(ctx context.Context, s *agentrt.Session) error {
+		if st := s.Current(); st != nil {
+			if _, err := st.Execute(ctx); err != nil {
+				return err
+			}
+		}
+		for !s.Done() {
+			st, err := s.Step(ctx)
+			if err != nil || st == nil {
+				return err
+			}
+			v, err := st.Propose(ctx, decisions[min(st.Index(), len(decisions)-1)])
+			if err != nil {
+				return err
+			}
+			if v.Outcome == agentrt.VerdictAllowed {
+				if _, err := st.Execute(ctx); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+}
+
+func gateScenario(loop func(context.Context, *agentrt.Session) error, tools ...agentrt.Tool) testkit.Scenario {
+	return testkit.Scenario{Tools: tools, Policy: agentrt.DefaultPolicy(), Goal: "g", Loop: loop}
+}
+
+// The harness runs a consumer's own loop over a Gate through every crash
+// point, the ones a Driver reaches and the two only a gate's caller can
+// reach, and the run's record keeps every invariant: nothing re-executes
+// on its own, a grant executes once, and no step or lease is left.
+func TestRun_GateLoopKeepsTheContractAtEveryCrash(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		se      agentrt.SideEffect
+		crashes []testkit.Crash
+		calls   int32
+		step0   agentrt.StepStatus
+	}{
+		{"no crash", agentrt.LocalMutation, nil, 1, agentrt.StepDone},
+		{"before deciding", agentrt.LocalMutation, []testkit.Crash{{Step: 0, At: testkit.AfterStepStarted}}, 0, agentrt.StepInterrupted},
+		{"decision recorded", agentrt.LocalMutation, []testkit.Crash{{Step: 0, At: testkit.AfterDecided}}, 0, agentrt.StepInterrupted},
+		{"allowed, not executed", agentrt.LocalMutation, []testkit.Crash{{Step: 0, At: testkit.AfterAllowed}}, 0, agentrt.StepInterrupted},
+		{"tool start recorded", agentrt.LocalMutation, []testkit.Crash{{Step: 0, At: testkit.AfterToolStarted}}, 1, agentrt.StepDone},
+		{"side effect lost", agentrt.LocalMutation, []testkit.Crash{{Step: 0, At: testkit.AfterToolEffect}}, 2, agentrt.StepDone},
+		{"takeover lost", agentrt.LocalMutation, []testkit.Crash{{Step: 0, At: testkit.AfterToolEffect}, {Step: 0, At: testkit.AfterInterrupted}}, 2, agentrt.StepDone},
+		{"between steps", agentrt.LocalMutation, []testkit.Crash{{Step: 0, At: testkit.AfterToolFinished}}, 1, agentrt.StepDone},
+		{"approved, resumed", agentrt.RemoteMutation, []testkit.Crash{{At: testkit.AfterResumed}}, 1, agentrt.StepDone},
+		{"approved, attached", agentrt.RemoteMutation, []testkit.Crash{{Step: 0, At: testkit.AfterAttachAllowed}}, 1, agentrt.StepDone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			work := newTool("work", tc.se)
+			// The interrupted step keeps its index, so the script carries a
+			// spare completion.
+			res := testkit.Run(t, gateScenario(gateLoop(scripted.ToolCall("work", `{"n":1}`, ""), scripted.Complete(`{}`)), work), tc.crashes...)
+			if res.Run.Status != agentrt.StatusCompleted || work.calls.Load() != tc.calls || res.Steps[0].Status != tc.step0 {
+				t.Fatalf("run %s, %d calls, want %d: %s", res.Run.Status, work.calls.Load(), tc.calls, res)
+			}
+			if len(res.Crashes) != len(tc.crashes) || len(res.Inputs) != 0 {
+				t.Fatalf("crashes %v, %d inputs", res.Crashes, len(res.Inputs))
+			}
+		})
+	}
+}
+
+// A crash after Attach allowed an approved step abandons the session with
+// the grant unexecuted; the next Attach finds it and runs it once.
+func TestRun_GateLoopAbandonedAfterAttachRunsTheGrantOnce(t *testing.T) {
+	push := newTool("push", agentrt.RemoteMutation)
+	res := testkit.Run(t, gateScenario(gateLoop(scripted.ToolCall("push", `{"n":1}`, ""), scripted.Complete(`{}`)), push), testkit.Crash{Step: 0, At: testkit.AfterAttachAllowed})
+	if res.Run.Status != agentrt.StatusCompleted || push.calls.Load() != 1 || res.Resumes != 2 || len(res.Approvals) != 1 || res.Approvals[0].Status != agentrt.ApprovalApproved {
+		t.Fatalf("run %s, %d calls, %d resumes, approvals %+v: %s", res.Run.Status, push.calls.Load(), res.Resumes, res.Approvals, res)
+	}
+}
+
+// A Driver reaches AfterAllowed too, between its policy and the tool
+// start, and runs nothing.
+func TestRun_DriverStopsAfterAllowed(t *testing.T) {
+	work := newTool("work", agentrt.LocalMutation)
+	sc := scenario(work)
+	sc.Agent = &scripted.Agent{Decisions: []agentrt.Decision{scripted.ToolCall("work", `{"n":1}`, ""), scripted.Complete(`{}`), scripted.Complete(`{}`)}}
+	res := testkit.Run(t, sc, testkit.Crash{Step: 0, At: testkit.AfterAllowed})
+	if res.Run.Status != agentrt.StatusCompleted || work.calls.Load() != 0 || res.Steps[0].Status != agentrt.StepInterrupted || len(res.Crashes) != 1 {
+		t.Fatalf("run %s, %d calls: %s", res.Run.Status, work.calls.Load(), res)
+	}
+}
+
+// A broken loop is reported: one that ignores the approved step Attach
+// left open leaves a granted run waiting on nothing, one that stops
+// mid-step leaves the run running and the step in flight, and an error
+// the loop returns is named.
+func TestRun_BrokenGateLoopsAreReported(t *testing.T) {
+	decisions := []agentrt.Decision{scripted.ToolCall("push", `{"n":1}`, ""), scripted.Complete(`{}`)}
+	for _, tc := range []struct {
+		name string
+		loop func(context.Context, *agentrt.Session) error
+		want []string
+	}{
+		{"ignores the grant", func(ctx context.Context, s *agentrt.Session) error {
+			if s.Current() != nil {
+				return nil
+			}
+			return gateLoop(decisions...)(ctx, s)
+		}, []string{"is waiting with no pending approval"}},
+		{"stops mid-step", func(ctx context.Context, s *agentrt.Session) error {
+			_, err := s.Step(ctx)
+			return err
+		}, []string{"is left RUNNING", "step 0 is left deciding"}},
+		{"returns an error", func(ctx context.Context, s *agentrt.Session) error {
+			st, err := s.Step(ctx)
+			if err != nil {
+				return err
+			}
+			if _, err := st.Propose(ctx, decisions[1]); err != nil {
+				return err
+			}
+			return errors.New("lost my place")
+		}, []string{"loop: lost my place"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &recorder{TB: t}
+			testkit.Run(r, gateScenario(tc.loop, newTool("push", agentrt.RemoteMutation)))
+			for _, want := range tc.want {
+				if !strings.Contains(r.joined(), want) {
+					t.Errorf("errors lack %q:\n%s", want, r.joined())
+				}
+			}
+		})
+	}
+}

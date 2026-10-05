@@ -82,6 +82,7 @@
 //	agentrt.decision.invalid_args             step        step.decided               text, when the arguments were not JSON
 //	agentrt.decision.invalid_result           step        step.decided               text, when the result was not JSON
 //	agentrt.decision.invalid_base64           step        step.decided               bool, when set
+//	agentrt.decision.origin                   step        step.decided               model, plan, operator, when set
 //	agentrt.policy.outcome                    step        step.policy                allow, deny, abort, require_approval
 //	agentrt.policy.reason                     step        step.policy                text
 //	agentrt.policy.kind                       step        step.policy                approval kind, for require_approval
@@ -372,7 +373,7 @@ func (x *Exporter) Handle(e agentrt.Event) error {
 		s.SetAttributes(valid(append(p.attrs,
 			p.str("agentrt.decision.kind", "kind"), p.text("agentrt.decision.tool", "tool", x.maxText()), p.text("agentrt.decision.args", "args", x.maxText()),
 			p.text("agentrt.decision.reason", "reason", x.maxText()), p.text("agentrt.decision.result", "result", x.maxText()), p.text("agentrt.decision.message", "message", x.maxText()),
-			p.text("agentrt.decision.invalid_args", "invalid_args", x.maxText()), p.text("agentrt.decision.invalid_result", "invalid_result", x.maxText()), p.boolean("agentrt.decision.invalid_base64", "invalid_base64")))...)
+			p.text("agentrt.decision.invalid_args", "invalid_args", x.maxText()), p.text("agentrt.decision.invalid_result", "invalid_result", x.maxText()), p.boolean("agentrt.decision.invalid_base64", "invalid_base64"), p.str("agentrt.decision.origin", "origin")))...)
 		s.AddEvent(e.Type, trace.WithTimestamp(e.At))
 	case agentrt.EventStepPolicy:
 		s := x.stepSpan(r, e)

@@ -107,10 +107,10 @@ type Limits struct {
 	// approval may stay pending: once it passes, the approval expires and
 	// the run is cancelled when it is next touched. It does not bound an
 	// approval already decided. GrantTTL bounds how long an approved grant
-	// may wait for Resume, measured from its decision: Resume finding a
-	// grant older than that expires it and cancels the run instead of
-	// executing it. Zero disables each; a run stored before GrantTTL
-	// existed decodes it as zero.
+	// may wait for Resume, measured from its decision: Resume, or a Gate's
+	// Attach or Execute, finding a grant older than that expires it and
+	// cancels the run instead of executing it. Zero disables each; a run
+	// stored before GrantTTL existed decodes it as zero.
 	MaxActiveTime  time.Duration `json:"max_active_time,omitempty"`
 	MaxElapsedTime time.Duration `json:"max_elapsed_time,omitempty"`
 	ApprovalTTL    time.Duration `json:"approval_ttl,omitempty"`
@@ -188,6 +188,27 @@ const (
 	KindNoToolCall DecisionKind = "no_tool_call"
 )
 
+// DecisionOrigin records who proposed a step. The runtime records it and
+// attaches no behaviour to it: policy does not see it.
+type DecisionOrigin string
+
+const (
+	// OriginModel is a model's decision.
+	OriginModel DecisionOrigin = "model"
+	// OriginPlan is a step of a promoted deterministic plan.
+	OriginPlan DecisionOrigin = "plan"
+	// OriginOperator is a step an operator proposed.
+	OriginOperator DecisionOrigin = "operator"
+)
+
+func (o DecisionOrigin) valid() bool {
+	switch o {
+	case "", OriginModel, OriginPlan, OriginOperator:
+		return true
+	}
+	return false
+}
+
 // Decision is the agent's output for one step. It is recorded verbatim before
 // it is validated, so the audit log shows what the agent asked for even when
 // the request was invalid.
@@ -202,6 +223,11 @@ type Decision struct {
 	Result json.RawMessage `json:"result,omitempty"`
 	// Message applies to fail.
 	Message string `json:"message,omitempty"`
+	// Origin is who proposed the step, empty when unspecified. An empty
+	// origin is not stored, so a decision without one is recorded exactly
+	// as before Origin existed; a value outside the known set makes the
+	// decision invalid.
+	Origin DecisionOrigin `json:"origin,omitempty"`
 	// InvalidArgs and InvalidResult are set only on a recorded decision:
 	// arguments or a result the agent returned that were not usable JSON,
 	// kept verbatim in place of Args or Result, which are then empty. When

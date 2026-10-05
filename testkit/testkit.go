@@ -2,8 +2,9 @@
 // agent against the runtime without a model: an interruption harness that
 // crashes the loop at a chosen point and resumes it in a fresh Driver, a
 // policy conformance table, schema fuzzing of tool arguments, and a render
-// equivalence check. It is built on the public API alone and on the
-// scripted package, which it re-exports nothing of.
+// equivalence check. A consumer whose own loop drives a Gate runs the same
+// harness over that loop, with Scenario.Loop. It is built on the public
+// API alone and on the scripted package, which it re-exports nothing of.
 //
 // A crash is a real one as far as the runtime can tell: the hook at the
 // crash point parks the goroutine executing the run and the harness closes
@@ -18,6 +19,8 @@ package testkit
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -61,6 +64,21 @@ const (
 	// interrupted resume it is the move back to RUNNING before the loop.
 	// Step is ignored.
 	AfterResumed Point = agentrt.EventRunResumed
+	// AfterAllowed stops once the policy has allowed a step's request and
+	// before its tool start is written: a loop abandoned with an Allowed
+	// verdict in hand, before Execute. The harness stops it as the policy
+	// returns allow, which leaves the record exactly as that loop does,
+	// because nothing about an allowed request but its decision is written
+	// until Execute. Resume or Attach marks the step interrupted while
+	// deciding; the request is never executed. A Driver reaches it too,
+	// between its policy and the tool start.
+	AfterAllowed Point = "policy.allowed"
+	// AfterAttachAllowed stops after Attach returned Allowed for an
+	// approved step, before Execute, and abandons the session: the run is
+	// still WAITING with its grant approved and nothing written, so the
+	// next Attach finds the grant and executes it once. Step is the
+	// approved step's index. Only a Scenario with a Loop reaches it.
+	AfterAttachAllowed Point = "attach.allowed"
 	// AfterInterrupted stops after step.interrupted: a resume took the run
 	// over and died before reconciling or pausing it. The next resume must
 	// still know the step was executing.
@@ -122,6 +140,16 @@ type Scenario struct {
 	// as a restarted process would; a value too short for the machine
 	// makes a live loop lose its own lease between heartbeats.
 	LeaseTTL time.Duration
+	// Loop, when set, is the consumer's own loop over a Gate, which the
+	// harness runs in place of a Driver and its Agent. Each process opens a
+	// fresh Gate on the scenario's tools, policy, reconciliation, clock,
+	// ids, and lease, takes a session with Begin, or with Attach after a
+	// pause or a crash, hands it to Loop, and closes it when Loop returns.
+	// Loop drives the session until it is Done; when Current is not nil,
+	// Attach left an approved step open for Execute. An error Loop returns
+	// is reported. Result.Inputs is then empty, and SameRenders, which
+	// renders what an Agent was handed, needs an Agent.
+	Loop func(ctx context.Context, s *agentrt.Session) error
 }
 
 // Call is one invocation a consumer tool received from the runtime.
@@ -161,8 +189,9 @@ type Result struct {
 }
 
 // Run executes sc in a fresh file-backed store, crashing at each Crash in
-// turn and resuming in a fresh Driver each time, until the run is terminal
-// or an Operator leaves it waiting. It then asserts what the runtime
+// turn and resuming in a fresh Driver each time, or in a fresh Gate under
+// the Scenario's Loop, until the run is terminal or an Operator leaves it
+// waiting. It then asserts what the runtime
 // promises across an interruption: a step never executes twice on its own
 // (every execution past the first is under an approval of that step), an
 // approved request executes at most once, every recorded tool start is
@@ -175,8 +204,8 @@ func Run(t testing.TB, sc Scenario, crashes ...Crash) Result {
 	h := newHarness(t, sc, crashes)
 	t.Cleanup(h.cleanup)
 	ctx := context.Background()
-	out := h.call(func(d *agentrt.Driver) (agentrt.Run, error) {
-		return d.Start(ctx, sc.Goal, h.limits())
+	out := h.call(func(p process) (agentrt.Run, error) {
+		return h.start(ctx, p)
 	})
 	for {
 		switch {
@@ -256,10 +285,73 @@ func (h *harness) armed() *Crash {
 	return nil
 }
 
-// call runs one Driver call against a fresh open of the file. It returns
-// when the call does, or when the armed crash fires, having closed the
-// Store underneath the parked goroutine.
-func (h *harness) call(fn func(*agentrt.Driver) (agentrt.Run, error)) outcome {
+// process is one life of the process running the run: its Driver, or the
+// Gate the scenario's Loop drives, the crash it is armed with, and how it
+// stops there.
+type process struct {
+	d     *agentrt.Driver
+	g     *agentrt.Gate
+	crash *Crash
+	park  func()
+}
+
+// start begins the run, with Start or with Begin and the Loop.
+func (h *harness) start(ctx context.Context, p process) (agentrt.Run, error) {
+	if p.g == nil {
+		return p.d.Start(ctx, h.sc.Goal, h.limits())
+	}
+	id := newRunID()
+	if h.sc.NewID != nil {
+		id = h.sc.NewID()
+	}
+	s, err := p.g.Begin(ctx, id, h.sc.Goal, h.limits())
+	if err != nil {
+		return agentrt.Run{}, err
+	}
+	return h.loop(ctx, s)
+}
+
+// resumeIn continues the run, with Resume or with Attach and the Loop. A
+// crash armed after Attach allowed the approved step abandons the session
+// there, unclosed, as a process that died holding it.
+func (h *harness) resumeIn(ctx context.Context, p process) (agentrt.Run, error) {
+	if p.g == nil {
+		return p.d.Resume(ctx, h.runID)
+	}
+	s, v, err := p.g.Attach(ctx, h.runID)
+	if err != nil {
+		return agentrt.Run{}, err
+	}
+	if c := p.crash; c != nil && c.At == AfterAttachAllowed && v.Outcome == agentrt.VerdictAllowed && s.Current().Index() == c.Step {
+		p.park()
+		return agentrt.Run{}, nil
+	}
+	return h.loop(ctx, s)
+}
+
+// loop hands the session to the scenario's Loop and closes it after.
+func (h *harness) loop(ctx context.Context, s *agentrt.Session) (agentrt.Run, error) {
+	defer s.Close()
+	if err := h.sc.Loop(ctx, s); err != nil {
+		return s.Run(), fmt.Errorf("loop: %w", err)
+	}
+	return s.Run(), nil
+}
+
+// newRunID is a run id for Begin when the Scenario has no NewID, as a
+// Driver draws its own.
+func newRunID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// call runs one Driver or Gate call against a fresh open of the file. It
+// returns when the call does, or when the armed crash fires, having closed
+// the Store underneath the parked goroutine.
+func (h *harness) call(fn func(process) (agentrt.Run, error)) outcome {
 	h.t.Helper()
 	st, err := agentrt.OpenStore(h.path)
 	if err != nil {
@@ -280,13 +372,26 @@ func (h *harness) call(fn func(*agentrt.Driver) (agentrt.Run, error)) outcome {
 	for i, tool := range h.sc.Tools {
 		tools[i] = &crashTool{Tool: tool, h: h, crash: crash, park: park}
 	}
-	cfg := agentrt.Config{
-		Store: st, Agent: &recordingAgent{Agent: h.sc.Agent, h: h}, Policy: h.sc.Policy, Tools: tools,
+	policy := h.sc.Policy
+	if policy != nil {
+		policy = &crashPolicy{Policy: policy, h: h, crash: crash, park: park}
+	}
+	proc := process{crash: crash, park: park}
+	cfg := agentrt.GateConfig{
+		Store: st, Policy: policy, Tools: tools,
 		Observer:  h.observer(crash, park),
 		Reconcile: h.sc.Reconcile, Now: h.sc.Now, NewID: h.sc.NewID,
 		LeaseTTL: h.sc.LeaseTTL, LeaseOwner: fmt.Sprintf("testkit-%d", h.drivers),
 	}
-	d, err := agentrt.NewDriver(cfg)
+	if h.sc.Loop != nil {
+		proc.g, err = agentrt.NewGate(cfg)
+	} else {
+		proc.d, err = agentrt.NewDriver(agentrt.Config{
+			Store: cfg.Store, Agent: &recordingAgent{Agent: h.sc.Agent, h: h}, Policy: cfg.Policy, Tools: cfg.Tools,
+			Observer: cfg.Observer, Reconcile: cfg.Reconcile, Now: cfg.Now, NewID: cfg.NewID,
+			LeaseTTL: cfg.LeaseTTL, LeaseOwner: cfg.LeaseOwner,
+		})
+	}
 	if err != nil {
 		st.Close()
 		h.t.Fatalf("testkit: %v", err)
@@ -294,7 +399,7 @@ func (h *harness) call(fn func(*agentrt.Driver) (agentrt.Run, error)) outcome {
 	done := make(chan outcome, 1)
 	go func() {
 		defer close(p.done)
-		r, err := fn(d)
+		r, err := fn(proc)
 		done <- outcome{run: r, err: err}
 	}()
 	select {
@@ -321,8 +426,8 @@ func (h *harness) call(fn func(*agentrt.Driver) (agentrt.Run, error)) outcome {
 func (h *harness) resume(ctx context.Context) outcome {
 	h.t.Helper()
 	for attempt := 0; ; attempt++ {
-		out := h.call(func(d *agentrt.Driver) (agentrt.Run, error) {
-			return d.Resume(ctx, h.runID)
+		out := h.call(func(p process) (agentrt.Run, error) {
+			return h.resumeIn(ctx, p)
 		})
 		var leased agentrt.ErrRunLeased
 		if !errors.As(out.err, &leased) || attempt >= 20 {
@@ -363,12 +468,9 @@ func (h *harness) decide(ctx context.Context, run agentrt.Run) bool {
 	if verdict == Leave {
 		return false
 	}
-	// The decision is stamped by the driver's clock, as a consumer's
+	// The decision is stamped by the scenario's clock, as a consumer's
 	// Driver.Approve would, so a deterministic Now governs expiry too.
-	d, err := agentrt.NewDriver(agentrt.Config{Store: st, Agent: h.sc.Agent, Policy: h.sc.Policy, Tools: h.sc.Tools, Now: h.sc.Now, NewID: h.sc.NewID})
-	if err != nil {
-		h.t.Fatalf("testkit: %v", err)
-	}
+	d := agentrt.Operator{Store: st, Now: h.sc.Now}
 	if verdict == Reject {
 		if err := d.Reject(ctx, run.ID, pending.ID, "testkit", "rejected by the scenario's operator"); err != nil {
 			h.t.Errorf("testkit: reject: %v", err)
@@ -442,6 +544,24 @@ func (c *crashTool) Call(ctx context.Context, call agentrt.ToolCall) (agentrt.To
 		c.park()
 	}
 	return res, err
+}
+
+// crashPolicy is the scenario's policy, which, armed with AfterAllowed for
+// its step, parks as it allows that step's request in a RUNNING run.
+type crashPolicy struct {
+	agentrt.Policy
+	h     *harness
+	crash *Crash
+	park  func()
+}
+
+func (c *crashPolicy) Evaluate(ctx context.Context, req agentrt.ToolRequest, view agentrt.RunView) (agentrt.PolicyDecision, error) {
+	pd, err := c.Policy.Evaluate(ctx, req, view)
+	if err == nil && pd.Outcome == agentrt.Allow && c.crash != nil && c.crash.At == AfterAllowed &&
+		view.Run.Status == agentrt.StatusRunning && c.h.stepIndex(req.StepID) == c.crash.Step {
+		c.park()
+	}
+	return pd, err
 }
 
 // recordingAgent keeps what the agent was handed.
