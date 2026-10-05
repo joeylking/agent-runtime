@@ -75,9 +75,11 @@ crash, timed out, or left without an answer from the server may have taken
 effect. It is never run again on the policy alone, inside the window or
 after it, and not after an operator rejected running it again: only an
 operator's approval of an `interrupted_side_effect` approval naming the
-earlier attempt runs it, and while one waits, other mutating calls to the
-tool are blocked. An error the server returned is an answer, and is not
-unknown.
+earlier attempt runs it, and until an operator resolves it, other mutating
+calls to the tool are blocked; an expiry resolves nothing, and the question
+is asked again rather than left with nothing to act on. An error the server
+returned is an answer, and is not unknown, and so is content the runtime
+refused: the call executed, and its result could not be recorded.
 
 **No policy language.** The policy maps side-effect classes, with a per-tool
 override, to allow, require approval, or deny. Conditions on arguments and

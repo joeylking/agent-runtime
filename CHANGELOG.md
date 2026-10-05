@@ -73,13 +73,20 @@ needed.
   mutating call within `repeat_window` (10m) is refused as `DUPLICATE` with
   the earlier outcome, a rejected or expired request is not asked for again
   within it, and a mutating call whose outcome is unknown, cut off by a
-  crash, timed out, or left without an answer from the server, waits on an
-  `interrupted_side_effect` approval, answers `INTERRUPTED` or
-  `UNKNOWN_OUTCOME`, blocks other mutating calls to its tool, and is never
-  run again on the policy alone, even after a rejection. `max_pending` (5)
-  caps the approvals waiting. A stdio server whose arguments reach the
-  proxy's own files is refused at startup. `gate_status`
-  reports approvals and executes nothing. Approvals are decided with
+  crash while executing, timed out, or left without an answer from the
+  server, waits on an `interrupted_side_effect` approval and answers
+  `INTERRUPTED` or `UNKNOWN_OUTCOME`; the identical request is never run
+  again on the policy alone, even after a rejection, and other mutating
+  calls to its tool are `BLOCKED` until an operator approves a re-run whose
+  outcome is then known or rejects it. An expiry, a re-run that meets the
+  run's step limit, or a crash before the proxy asked leaves nothing
+  waiting, so the question is asked again in a fresh run. A mutating call
+  whose server answered with content the runtime refused answers
+  `UNRECORDED` and counts as executed. `max_pending` (5) caps, within each
+  process, the approvals the model's calls leave waiting. A stdio server whose arguments name the proxy's own
+  files, in the spellings the check reads, is refused at startup, as a
+  guard against a mistake rather than a boundary. `gate_status` reports
+  approvals, and what came of an approved request, and executes nothing. Approvals are decided with
   `agentrt` or the webhook approver, outside the host. Subcommands `pin` and
   `check`. The configuration is one JSON file with unknown fields refused.
   It keeps an index of its calls in a table of its own, `proxy_calls`, in the

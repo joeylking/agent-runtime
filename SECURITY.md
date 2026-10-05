@@ -332,9 +332,13 @@ host, a program the operator runs and the proxy does not control.
   configuration, manifests, or database: a server that can write them can
   rewrite the policy or forge an approval. The proxy refuses to start a
   stdio server whose arguments name one of them or a directory holding one,
-  compared as resolved absolute paths, unless the configuration sets
-  `skip_path_check` for it. That is a best-effort check of the
-  configuration, not of what a server can reach.
+  in the spellings it reads (a path, the part after `=` or `:`, a
+  `file://` URL, a path glued to a short flag, a leading `~`), compared by
+  file identity, unless the configuration sets `skip_path_check` for it.
+  That is a best-effort guard against a mistake in the configuration, not
+  a boundary: it does not see what a server can reach by other means, and
+  it protects neither the proxy's binary nor the host's own configuration,
+  which a server that can write them can replace.
 - What it does not trust: the host and the model behind it, whose calls are
   requests the gate decides, and the upstream servers, as for `mcp`. Every
   call is checked against the pinned, restricted schema and evaluated by the
@@ -348,11 +352,20 @@ host, a program the operator runs and the proxy does not control.
   approval or counts as a repeat; arguments the runtime refuses as JSON
   match nothing and are recorded invalid.
 - A call that executed is not executed again for an identical call within
-  the repeat window, so a host's blind retry does not repeat a side effect.
-  A mutating call whose outcome is unknown, cut off by a crash, timed out,
-  or failed with no answer from the server, is not run again without an
-  operator's approval, at any age and after a rejection, and every other
-  mutating call to its tool is refused while the approval waits.
+  the repeat window, so a host's blind retry does not repeat a side effect;
+  a mutating call whose server answered with content the runtime refused
+  counts as executed. A mutating call whose outcome is unknown, cut off by
+  a crash while executing, timed out, or failed with no answer from the
+  server, is not run again as the identical request without an operator's
+  approval, at any age and after a rejection. Every other mutating call to
+  its tool is refused until an operator resolves it, by approving a re-run
+  whose outcome is then known, or by rejecting it; an expiry resolves
+  nothing, and the question is asked again, so the tool is never blocked
+  with nothing for an operator to act on. A request spelled differently,
+  `7` for `7.0` or with an optional field added, is a different request:
+  after a rejection it runs under the ordinary policy. An approval for a
+  blocked tool is still collected, including one granted after the block
+  began.
 - Text the model, a server, or the operator chose is escaped with
   `trace.Sanitize` in the prose the proxy writes, to the model and to
   stderr; a tool's result returned to the model is passed back as the

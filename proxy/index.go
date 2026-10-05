@@ -197,6 +197,20 @@ func (x *index) attempts(ctx context.Context, session, key string) ([]row, error
 	return rows, nil
 }
 
+// unknownForTool returns, for each request to tool in the session other
+// than exceptKey, its newest row that can hold an attempt when that row's
+// outcome is unknown or not yet seen, oldest first: the requests whose
+// last attempt may have an unknown outcome.
+func (x *index) unknownForTool(ctx context.Context, session, tool, exceptKey string) ([]row, error) {
+	rows, err := scanRows(x.db.QueryContext(ctx, `SELECT `+rowColumns+` FROM proxy_calls p WHERE session = ? AND tool = ? AND request_key != ? AND outcome IN (?, ?)
+		AND id = (SELECT MAX(id) FROM proxy_calls q WHERE q.session = p.session AND q.request_key = p.request_key AND q.outcome != ?) ORDER BY id`,
+		session, tool, exceptKey, outcomeUnseen, outcomeUnknown, outcomeNone))
+	if err != nil {
+		return nil, fmt.Errorf("proxy: index: %w", err)
+	}
+	return rows, nil
+}
+
 // recent returns the session's rows unsettled or settled at or after
 // since, newest first, at most limit of them.
 func (x *index) recent(ctx context.Context, session string, since time.Time, limit int) ([]row, error) {

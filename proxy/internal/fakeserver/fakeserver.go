@@ -7,8 +7,9 @@
 // before it answers, so a test counts executions by counting lines. A
 // payment's mode argument chooses how it answers: "slow" waits two seconds
 // first, "block" waits until a file named like the ledger with ".release"
-// added exists, "error" answers isError, and "structured" answers with
-// structured content. FAKE_PAYMENTS_DESCRIPTION, when set, replaces the
+// added exists, "error" answers isError, "structured" answers with
+// structured content, and "deep" answers with structured content nested
+// deeper than the runtime records. FAKE_PAYMENTS_DESCRIPTION, when set, replaces the
 // read's description, as a server that changed since it was pinned would.
 package fakeserver
 
@@ -32,7 +33,7 @@ const (
 const (
 	balanceSchema = `{"type":"object","properties":{"account":{"type":"string"}},"required":["account"],"additionalProperties":false}`
 	paySchema     = `{"type":"object","properties":{"to":{"type":"string"},"amount":{"type":"number"},"currency":{"type":"string"},` +
-		`"mode":{"type":"string","enum":["slow","block","error","structured"]}},"required":["to","amount"],"additionalProperties":false}`
+		`"mode":{"type":"string","enum":["slow","block","error","structured","deep"]}},"required":["to","amount"],"additionalProperties":false}`
 	refundSchema = `{"type":"object","properties":{"payment":{"type":"string"}},"required":["payment"],"additionalProperties":false}`
 )
 
@@ -105,6 +106,15 @@ func pay(ctx context.Context, req *sdk.CallToolRequest) (*sdk.CallToolResult, er
 		res := text(fmt.Sprintf("card declined for %s", in.To))
 		res.IsError = true
 		return res, nil
+	case "deep":
+		var v any = map[string]any{"paid": in.Amount}
+		for range 300 {
+			v = []any{v}
+		}
+		return &sdk.CallToolResult{
+			Content:           []sdk.Content{&sdk.TextContent{Text: "deep"}},
+			StructuredContent: map[string]any{"nested": v},
+		}, nil
 	case "structured":
 		return &sdk.CallToolResult{
 			Content:           []sdk.Content{&sdk.TextContent{Text: fmt.Sprintf("paid %.2f to %s", in.Amount, in.To)}},

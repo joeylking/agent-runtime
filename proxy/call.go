@@ -37,10 +37,11 @@ func answer(r *sdk.CallToolResult) action { return action{result: r} }
 // origin operator: the proxy decided it, on the operator's configuration,
 // and the model did not.
 const (
-	closeToolError = "one call per run: the tool call returned an error"
-	closeDenied    = "one call per run: the request was denied"
-	closeInvalid   = "one call per run: the request was invalid"
-	closeRecovered = "one call per run: taken over after an interruption, with nothing left in it to execute"
+	closeToolError  = "one call per run: the tool call returned an error"
+	closeDenied     = "one call per run: the request was denied"
+	closeInvalid    = "one call per run: the request was invalid"
+	closeRecovered  = "one call per run: taken over after an interruption, with nothing left in it to execute"
+	closeUnrecorded = "one call per run: the tool call executed and its result could not be recorded"
 )
 
 // handle answers one call to an upstream tool. Gate and store work runs on
@@ -153,7 +154,7 @@ func (p *Proxy) decide(ctx context.Context, t *tool, key string, valid bool, arg
 	// Arguments the runtime refuses as JSON have no key and match no
 	// other call; no rule can apply, and the gate records them invalid.
 	if !valid {
-		return p.begin(ctx, t, "", args, nil, false, nil, now)
+		return p.begin(ctx, t, "", args, nil, false, nil, agentrt.OriginModel, now)
 	}
 	open, recent, err := p.idx.forKey(ctx, p.session, key, now.Add(-t.window))
 	if err != nil {
@@ -207,7 +208,7 @@ func (p *Proxy) decide(ctx context.Context, t *tool, key string, valid bool, arg
 		return a
 	}
 	// Otherwise a new run begins.
-	return p.begin(ctx, t, key, args, open, reuse, prior, now)
+	return p.begin(ctx, t, key, args, open, reuse, prior, agentrt.OriginModel, now)
 }
 
 // unfinished applies rules 1 to 3 to the request's own run that has not
@@ -311,9 +312,11 @@ func (p *Proxy) recover(ctx context.Context, t *tool, r *row) (action, bool) {
 // refusal applies rules 4 and 5 to the request's finished runs within the
 // window, newest first, and settles each one it reads. The newest that
 // decides anything decides: one rejected, cancelled, or expired refuses
-// the call; for a tool that is not read-only, one whose tool executed
-// with a known outcome refuses it as a duplicate, and one whose outcome is
-// unknown refuses nothing, because rule 6 asks an operator instead. A run
+// the call, except one expired on a question about an unknown outcome,
+// which rule 6 asks again; for a tool that is not read-only, one whose
+// tool executed with a known outcome, or whose result went unrecorded,
+// refuses it as a duplicate, and one whose outcome is unknown refuses
+// nothing, because rule 6 asks an operator instead. A run
 // whose tool never started, denied or invalid, decides nothing.
 func (p *Proxy) refusal(ctx context.Context, t *tool, recent []row, now time.Time) (action, bool, error) {
 	if t.window <= 0 {
@@ -342,6 +345,10 @@ func (p *Proxy) refusal(ctx context.Context, t *tool, recent []row, now time.Tim
 				return answer(rejectedText(a.ID, a.Note, until)), true, nil
 			}
 		case agentrt.ReasonApprovalExpired:
+			// An expiry resolves no unknown outcome: rule 6 asks again.
+			if o == outcomeUnknown {
+				return action{}, false, nil
+			}
 			if a != nil {
 				return answer(expiredText(a.ID, until)), true, nil
 			}
@@ -426,14 +433,16 @@ func (p *Proxy) unresolved(ctx context.Context, key string, now time.Time) (*att
 	return nil, nil
 }
 
-// sessionRules blocks a new call to a tool that is not read-only while an
-// interruption of another call to the same tool, or a re-run of one whose
-// outcome is unknown, is unresolved: pending, or approved and not yet
-// collected, and not expired. It blocks a new call that needs approval
-// while the session's approvals are at the cap. A run of the same tool
-// left running past its lease is recovered first, so a crash cannot hide
-// an interruption from this check. Rows read on the way are settled: a
-// finished run's, and one whose run never began.
+// sessionRules blocks a new call to a tool that is not read-only while
+// another request to the same tool has an unknown outcome no operator has
+// resolved: an interruption approval of it pending, or approved and not
+// yet collected, blocks the call; an interruption approval past its expiry
+// is expired here, and with any other unknown outcome left with nothing
+// waiting it is asked about again (unknownBlock). It blocks a new call
+// that needs approval while the session's approvals are at the cap. A run
+// of the same tool left running past its lease is recovered first. Rows
+// read on the way are settled: a finished run's, and one whose run never
+// began.
 func (p *Proxy) sessionRules(ctx context.Context, t *tool, key string, rerun bool, now time.Time) (action, bool) {
 	outcome, _ := p.decider.decide(t)
 	needsApproval := outcome == agentrt.RequireApproval || rerun && outcome != agentrt.Deny
@@ -475,8 +484,16 @@ func (p *Proxy) sessionRules(ctx context.Context, t *tool, key string, rerun boo
 			}
 			live := a.Status == agentrt.ApprovalPending && (a.ExpiresAt.IsZero() || !now.After(a.ExpiresAt)) ||
 				a.Status == agentrt.ApprovalApproved && (st.run.Limits.GrantTTL <= 0 || !now.After(a.DecidedAt.Add(st.run.Limits.GrantTTL)))
-			if sameTool && a.Kind == agentrt.InterruptedSideEffect && live {
-				return answer(blockedInterruptedText(t.name, a.ID)), true
+			if sameTool && a.Kind == agentrt.InterruptedSideEffect {
+				if live {
+					return answer(blockedInterruptedText(t.name, a.ID)), true
+				}
+				// Expired: Attach expires it and ends the run, and an expiry
+				// resolves nothing, so unknownBlock asks again below.
+				if s, _, err := p.gate.Attach(ctx, r.runID); err == nil {
+					s.Close()
+				}
+				continue
 			}
 			if live && a.Status == agentrt.ApprovalPending {
 				pending++
@@ -494,10 +511,107 @@ func (p *Proxy) sessionRules(ctx context.Context, t *tool, key string, rerun boo
 			}
 		}
 	}
+	if t.class != agentrt.ReadOnly {
+		if a, done := p.unknownBlock(ctx, t, key, now); done {
+			return a, true
+		}
+	}
 	if needsApproval && pending >= p.maxPending {
 		return answer(blockedPendingText(p.maxPending)), true
 	}
 	return action{}, false
+}
+
+// unknownBlock blocks a call to a tool that is not read-only while another
+// request to the tool has a last attempt whose outcome is unknown, in a
+// finished run, and no operator has resolved it: no attempt since has a
+// known outcome, and its run did not end on an operator's rejection or
+// cancellation. Such a request has nothing waiting for an operator, its
+// re-run having met the run's limit, its run recovered after a crash, or
+// its approval expired, so it is asked about again, in a fresh run, and
+// the call is blocked on that approval: nothing is blocked with nothing
+// for an operator to act on. A tool the policy denies is not blocked: the
+// call is denied anyway.
+func (p *Proxy) unknownBlock(ctx context.Context, t *tool, key string, now time.Time) (action, bool) {
+	if o, _ := p.decider.decide(t); o == agentrt.Deny {
+		return action{}, false
+	}
+	rows, err := p.idx.unknownForTool(ctx, p.session, t.name, key)
+	if err != nil {
+		return p.unavailable(err, notRead), true
+	}
+	for i := range rows {
+		r := &rows[i]
+		st, err := p.inspect(ctx, r.runID)
+		if err != nil {
+			return p.unavailable(err, notRead), true
+		}
+		// A run not finished is in flight or waiting, which the scan of
+		// unsettled rows has judged.
+		if !st.exists || !st.run.Status.Terminal() {
+			continue
+		}
+		o, at := p.lastAttempt(st)
+		p.settle(ctx, r, o, now)
+		if o != outcomeUnknown || st.run.Reason == agentrt.ReasonApprovalRejected || st.run.Reason == agentrt.ReasonOperatorCancelled {
+			continue
+		}
+		a := p.reopen(ctx, t, r.key, lastArgs(st), at, now)
+		if a == nil {
+			return answer(unavailableText("the gate could not ask an operator about an earlier call to this tool whose outcome is unknown, and nothing was executed")), true
+		}
+		return answer(blockedInterruptedText(t.name, a.ID)), true
+	}
+	return action{}, false
+}
+
+// reopen asks an operator, in a fresh run of the request, whether a
+// request whose last attempt's outcome is unknown runs again, when nothing
+// about it waits: the proxy proposes the recorded request with origin
+// operator, and the policy asks with an interruption approval naming the
+// attempt (rerunOf). It returns that approval, or nil when none could be
+// asked for, which is logged.
+func (p *Proxy) reopen(ctx context.Context, t *tool, key string, args json.RawMessage, at *attempt, now time.Time) *agentrt.Approval {
+	open, _, err := p.idx.forKey(ctx, p.session, key, now)
+	if err != nil {
+		p.logf("error: %v", err)
+		return nil
+	}
+	reuse := false
+	if open != nil {
+		st, err := p.inspect(ctx, open.runID)
+		if err != nil {
+			p.logf("error: %v", err)
+			return nil
+		}
+		switch {
+		case !st.exists:
+			reuse = true
+		case !st.run.Status.Terminal():
+			p.logf("error: run %s: asking again about an unknown outcome: the request's run %s has not finished", at.RunID, open.runID)
+			return nil
+		}
+	}
+	a := p.begin(ctx, t, key, args, open, reuse, at, agentrt.OriginOperator, now)
+	if a.exec != nil {
+		// The policy asks for an interruption short of a denial, so this
+		// is never reached; the step is left unexecuted.
+		a.exec.s.Close()
+	}
+	if a.pending == nil {
+		p.logf("error: run %s: asking again about an unknown outcome: no approval was opened", at.RunID)
+	}
+	return a.pending
+}
+
+// lastArgs are the arguments of a run's last tool call, as recorded.
+func lastArgs(st runState) json.RawMessage {
+	for i := len(st.steps) - 1; i >= 0; i-- {
+		if d := st.steps[i].Decision; d != nil && d.Kind == agentrt.DecideToolCall {
+			return orEmpty(d.Args)
+		}
+	}
+	return json.RawMessage("{}")
 }
 
 // begin opens the request's run and proposes the call. A new run claims a
@@ -506,8 +620,9 @@ func (p *Proxy) sessionRules(ctx context.Context, t *tool, key string, rerun boo
 // calls that try, the store lets one begin it and the other decides
 // again. Arguments the runtime refuses as JSON (key "") get a row of
 // their own that no call matches. prior, when set, is the attempt whose
-// outcome is unknown that this run re-runs (rule 6).
-func (p *Proxy) begin(ctx context.Context, t *tool, key string, args json.RawMessage, open *row, reuse bool, prior *attempt, now time.Time) action {
+// outcome is unknown that this run re-runs (rule 6). origin is the
+// decision's: the model's call, or the proxy's own question (reopen).
+func (p *Proxy) begin(ctx context.Context, t *tool, key string, args json.RawMessage, open *row, reuse bool, prior *attempt, origin agentrt.DecisionOrigin, now time.Time) action {
 	const notStarted = "the gate could not start this request, and nothing was executed"
 	runID := p.session + "." + newSuffix()
 	if reuse {
@@ -547,7 +662,7 @@ func (p *Proxy) begin(ctx context.Context, t *tool, key string, args json.RawMes
 		p.setRerun(runID, prior)
 		defer p.setRerun(runID, nil)
 	}
-	v, err := st.Propose(ctx, agentrt.Decision{Kind: agentrt.DecideToolCall, Tool: t.name, Args: args, Origin: agentrt.OriginModel})
+	v, err := st.Propose(ctx, agentrt.Decision{Kind: agentrt.DecideToolCall, Tool: t.name, Args: args, Origin: origin})
 	if err != nil {
 		s.Close()
 		return p.unavailable(err, "the gate could not record this request, and nothing was executed")
@@ -653,6 +768,11 @@ func (p *Proxy) execute(ctx context.Context, e *execution) *sdk.CallToolResult {
 		if ended, unknown := p.unknownEnding(e.t, obs); unknown {
 			return p.rerun(ctx, e, ended, obs)
 		}
+		if unrecorded(e.t, obs) {
+			p.finish(ctx, e.s, closeUnrecorded)
+			p.settleRun(ctx, runID)
+			return unrecordedText(errorText(obs.Content), e.t.window)
+		}
 		p.finish(ctx, e.s, closeToolError)
 	} else {
 		e.s.Close()
@@ -661,14 +781,37 @@ func (p *Proxy) execute(ctx context.Context, e *execution) *sdk.CallToolResult {
 	return resultOf(obs)
 }
 
+// unrecorded reports a call to a tool that is not read-only whose server
+// answered with content the runtime refused (invalid_content): not usable
+// JSON, nested too deep, or a number past its bound. The server answered,
+// so the call executed, and it is not a failure the model may retry: it
+// counts as executed, for the duplicate rule as for every other, and the
+// model is told its result could not be recorded. It is not an unknown
+// outcome either: the server is known to have answered, so asking an
+// operator whether to run it again would invite the repeat the duplicate
+// rule exists to stop.
+func unrecorded(t *tool, obs agentrt.Observation) bool {
+	return t.class != agentrt.ReadOnly && obs.Kind == agentrt.ObserveToolError && failureOf(obs) == "invalid_content"
+}
+
+func failureOf(obs agentrt.Observation) string {
+	var c struct {
+		Failure string `json:"failure"`
+	}
+	json.Unmarshal(obs.Content, &c)
+	return c.Failure
+}
+
 // rerun follows a call to a tool that is not read-only whose outcome is
 // unknown: the server may have acted. The run is not ended: the proxy
 // proposes the recorded request again in it, with origin operator, and
 // the policy asks an operator whether it runs again (rerunOf), so the
 // operator sees it at once, the tool is blocked until it is decided, and
 // the model's identical call collects it. The model is told the outcome
-// is unknown. If the proposal cannot wait, the run ends, and rule 6 asks
-// at the next identical call.
+// is unknown. If the run's limit ends it first, which a re-run whose
+// outcome is unknown again meets, the question is asked in a fresh run of
+// the request (reopen); if that fails too, the next call to the tool asks
+// it (unknownBlock, rule 6).
 func (p *Proxy) rerun(ctx context.Context, e *execution, ended string, obs agentrt.Observation) *sdk.CallToolResult {
 	runID, stepID := e.s.Run().ID, e.st.ID()
 	how := attempt{Ended: ended}.how()
@@ -691,9 +834,13 @@ func (p *Proxy) rerun(ctx context.Context, e *execution, ended string, obs agent
 	at := &attempt{RunID: runID, StepID: stepID, StartedAt: stamp3339(executed.StartedAt), Ended: ended}
 	st, err := e.s.Step(ctx)
 	if err != nil || st == nil {
-		p.logf("error: run %s: no step for the re-run: %v", runID, err)
+		// The run's limit ended it: the question is asked in a fresh run.
 		e.s.Close()
 		p.settleRun(ctx, runID)
+		if a := p.reopenRun(ctx, e.t, executed.Decision.Args, at); a != nil {
+			return unknownText(how, text, a.ID)
+		}
+		p.logf("error: run %s: no step for the re-run: %v", runID, err)
 		return unknownText(how, text, "")
 	}
 	p.setRerun(runID, at)
@@ -708,14 +855,29 @@ func (p *Proxy) rerun(ctx context.Context, e *execution, ended string, obs agent
 		p.operatorHint(v.Approval, e.t)
 		return unknownText(how, text, v.Approval.ID)
 	}
-	// Denied by the policy now, or ended by a limit: nothing waits.
+	// Denied by the policy now: nothing waits. Ended by a limit: the
+	// question is asked in a fresh run.
 	if v.Outcome == agentrt.VerdictDenied {
 		p.denied(ctx, e.s, v)
-	} else {
-		e.s.Close()
-		p.settleRun(ctx, runID)
+		return unknownText(how, text, "")
+	}
+	e.s.Close()
+	p.settleRun(ctx, runID)
+	if a := p.reopenRun(ctx, e.t, executed.Decision.Args, at); a != nil {
+		return unknownText(how, text, a.ID)
 	}
 	return unknownText(how, text, "")
+}
+
+// reopenRun is reopen for the request a run's attempt made, keyed from its
+// recorded arguments.
+func (p *Proxy) reopenRun(ctx context.Context, t *tool, args json.RawMessage, at *attempt) *agentrt.Approval {
+	args = orEmpty(args)
+	key, valid := requestKey(t.name, args)
+	if !valid {
+		return nil
+	}
+	return p.reopen(ctx, t, key, args, at, p.now())
 }
 
 func orEmpty(raw json.RawMessage) json.RawMessage {
@@ -771,7 +933,7 @@ func (p *Proxy) unknownEnding(t *tool, obs agentrt.Observation) (string, bool) {
 // leaves the outcome unknown, is unknown; and so is a re-run waiting on, or
 // rejected or expired on, an interruption approval, which names the attempt
 // that approval was about. A step that never executed, denied or invalid
-// or never approved, is passed over.
+// or never approved, or cut off before its tool started, is passed over.
 func (p *Proxy) lastAttempt(st runState) (outcome, *attempt) {
 	for i := len(st.steps) - 1; i >= 0; i-- {
 		s := st.steps[i]
@@ -782,6 +944,10 @@ func (p *Proxy) lastAttempt(st runState) (outcome, *attempt) {
 		at := &attempt{RunID: st.run.ID, StepID: s.ID, StartedAt: stamp3339(s.StartedAt), Ended: endedCutOff}
 		if interruptedExecuting(s) {
 			return outcomeUnknown, at
+		}
+		if interruptedBeforeExecuting(s) {
+			// Cut off before its tool started: nothing ran.
+			continue
 		}
 		if o := s.Observation; o != nil {
 			switch o.Kind {
@@ -827,8 +993,11 @@ func executedStep(st runState) *agentrt.Step {
 // knownOutcome is what came of a step that executed, as the model is told
 // it in prose: escaped and bounded, since the server chose it.
 func knownOutcome(st agentrt.Step) string {
-	if st.Observation.Kind == agentrt.ObserveToolResult {
+	switch {
+	case st.Observation.Kind == agentrt.ObserveToolResult:
 		return "it succeeded, with this result: " + clean(resultText(st.Observation.Content), maxResult)
+	case failureOf(*st.Observation) == "invalid_content":
+		return "the server answered, but its result could not be recorded: " + clean(errorText(st.Observation.Content), 500)
 	}
 	return "it failed, with this error: " + clean(errorText(st.Observation.Content), maxResult)
 }

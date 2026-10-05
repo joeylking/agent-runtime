@@ -34,8 +34,11 @@ the proxy's configuration, its manifests, or its database: a server that
 can write them can rewrite the policy or forge an approval. Give a
 filesystem server a root that does not contain them. The proxy refuses to
 start a stdio server whose arguments name one of those files or a directory
-holding one, as a best-effort check (see Configuration); it cannot see what
-a server reaches by other means.
+holding one, as a best-effort check (see Configuration). It is a guard
+against a mistake in the configuration, not a boundary: it cannot see what
+a server reaches by other means, and it protects neither the proxy's binary
+nor the host's own configuration, either of which a server that can write
+them can replace.
 
 It never sees model calls, so it sets no token or cost limits, and it never
 sees the user's prompt.
@@ -55,8 +58,10 @@ What it keeps:
 - an approval bound by hash to the exact request, durable across restarts,
   with policy evaluated again when the request is collected;
 - a mutating call whose outcome is unknown, cut off by a crash, timed out,
-  or left without an answer from the server, is not run again without an
-  operator;
+  or left without an answer from the server, is not run again, as the
+  identical request, without an operator's approval, and other mutating
+  calls to its tool are refused until an operator resolves it (see
+  Limitations for what "identical" leaves out);
 - the audit record is committed with each state change;
 - tools are pinned and classified by the operator;
 - an identical mutating call is not executed twice within the window.
@@ -80,9 +85,13 @@ origin `model`. A mutating call whose outcome is unknown is not ended: the
 proxy proposes it again in the same run, with origin `operator`, and that
 step waits for an operator (see Timeouts and lost connections). Every run's
 limits are fixed: three steps, three consecutive failures, a loop threshold
-of three, and the configured approval and grant expiries, so no limit ends a
-call's run early, unless a re-run's outcome is unknown again; that run then
-ends, and the next identical call asks an operator.
+of three, and the configured approval and grant expiries. A call's run needs
+at most its tool step, one re-run, and the closing decision. An approved
+re-run whose outcome is unknown again is asked about again in the same run,
+once; when the next re-run's outcome is unknown too, the step limit ends the
+run, and the proxy asks the same question in a fresh run of the request at
+once, so an approval is left waiting
+(`TestUnknown_StepLimitKeepsTheToolBlocked`).
 
 For `agentrt runs` this means one row per call that started something new: a
 call that collects an approved request, or is refused by one of the rules
@@ -146,20 +155,28 @@ the same key and applies, in order:
    pauses on an approval of kind `interrupted_side_effect` and the call
    answers `INTERRUPTED`. A read cut off, a call cut off before its tool ran,
    or one cut off after its outcome was recorded leaves nothing to execute:
-   the proxy ends that run and the rules continue with it finished
-   (`TestProxy_AbandonedCallIsEndedAndRunFresh`).
+   the proxy ends that run and the rules continue with it finished. A
+   mutating call cut off before its tool ran, abandoned after the policy
+   allowed it or its lease lost before it executed, made no attempt: the
+   identical call runs under the ordinary rules and the tool is not blocked
+   (`TestProxy_AbandonedCallIsEndedAndRunFresh`,
+   `TestUnknown_CutOffBeforeExecutingIsNoAttempt`).
 4. **A request rejected, cancelled, or expired within the repeat window**:
    the call answers `REJECTED`, with the operator's note, or `EXPIRED`, and no
    new approval is asked for within the window. This holds for the identical
    request only: a model that changes one character of the arguments makes
    a new request, which asks again, and `max_pending` bounds how many such
-   requests wait at once, not how often a model asks.
+   requests wait at once, not how often a model asks. An expired approval
+   that asked whether an attempt with an unknown outcome runs again refuses
+   nothing: an expiry resolves nothing, and rule 6 asks again.
 5. **The duplicate rule**: for a tool that is not read-only, a run with this
    key whose tool call executed with a known outcome, a result or an error
    the server returned, within `repeat_window` of now, refuses the call as
-   `DUPLICATE`, with the earlier call's time and outcome. A denied or invalid
-   earlier attempt does not count, because nothing ran, and an attempt whose
-   outcome is unknown is not a duplicate: rule 6 decides it. Rules 4 and 5
+   `DUPLICATE`, with the earlier call's time and outcome. A call whose server
+   answered with content the runtime refused executed, and counts. A denied
+   or invalid earlier attempt does not count, because nothing ran, and an
+   attempt whose outcome is unknown is not a duplicate: rule 6 decides it.
+   Rules 4 and 5
    read the request's runs newest first, and the newest that decides
    anything decides.
 6. **An unknown outcome**: for a tool that is not read-only, when the last
@@ -173,18 +190,35 @@ the same key and applies, in order:
    (`TestUnknown_RejectionUnblocksAndAnIdenticalCallAsksAgain`).
 7. Otherwise a new run begins and the call is proposed.
 
-Two more rules apply before a new run begins. While an
-`interrupted_side_effect` approval of this session is unresolved, pending or
-approved and not yet collected, and not past its expiry, every new call that
-is not read-only to the same tool is refused as `BLOCKED`, so a model cannot
-get around an unknown outcome by changing an argument; a run of that tool
-left running past its lease is taken over first, so a crash cannot hide one.
-The approval is resolved, and the tool unblocked, when an operator approves
-it and the identical call collects it, when an operator rejects it, or when
-it expires. An operator sees it in `agentrt runs` as a run
+Two more rules apply before a new run begins. While another request to the
+same tool has an unknown outcome that no operator has resolved, every new
+call to that tool that is not read-only is refused as `BLOCKED`, naming the
+approval that asks about it, so a model cannot get around an unknown outcome
+by changing an argument. A run of that tool left running past its lease is
+taken over first. An unknown outcome is resolved, and the tool unblocked:
+
+- when an operator approves the re-run and the identical call collects it
+  with an outcome that is known, a result or an error the server returned,
+  or an answer whose result could not be recorded; a collected re-run whose
+  outcome is unknown again is a new unknown outcome, asked about at once;
+- when an operator rejects the re-run, or cancels its run; the identical
+  call is still not run on the policy alone (rule 6);
+- never by an expiry. An approval about it that expires unanswered, a
+  re-run that meets the run's step limit, or a run that stopped before the
+  proxy asked (a crash after the attempt's outcome was recorded) leaves
+  nothing waiting, so the next mutating call to that tool, or the identical
+  call, asks the same question again in a fresh run and is answered with
+  that approval's id. The tool is never blocked with nothing for an operator
+  to act on (`TestUnknown_StepLimitKeepsTheToolBlocked`,
+  `TestUnknown_CrashBeforeTheReRunKeepsTheToolBlocked`,
+  `TestUnknown_ExpiryAsksAgainRatherThanUnblocks`).
+
+An operator sees the approval in `agentrt runs` as a run
 `WAITING_FOR_APPROVAL`, in `agentrt show <run>`, and on the proxy's stderr.
-And a call that needs an approval while `max_pending` approvals of the
-session are already waiting is refused as `BLOCKED` without asking.
+A question the proxy asks again while deciding a call to another request
+of the tool is not held to `max_pending`. And a call
+that needs an approval while `max_pending` approvals of the session are
+already waiting is refused as `BLOCKED` without asking.
 
 The duplicate rule is what makes a host's blind retry after a lost response
 safe: the retry does not execute a second payment, and it hands the model the
@@ -299,12 +333,16 @@ lists the session's pending approvals, each with its id, tool, a summary of
 its arguments, and how long it has waited. With an id, from the last hour,
 it answers for that one: pending; approved and awaiting collection, with the
 instruction to call the original tool again with exactly the same
-arguments; approved and executed, only when its step executed; approved but
-not executed, with why, such as a policy that denied it at collection or an
-operator who cancelled it; rejected, with the note; or expired. It never
-executes, decides, or writes anything, and it is not recorded as a run
-(`TestProxy_StatusToolReportsAndNeverExecutes`,
-`TestProxy_StatusSaysWhetherAnApprovedRequestExecuted`). The measurement found that a
+arguments; approved and executed, only when its step executed, with what
+its step recorded: it succeeded, the server reported a failure (with the
+error), the server answered and its result could not be recorded, or its
+outcome is unknown (with the approval that now asks whether it runs again,
+if one waits); approved but not executed, with why, such as a policy that
+denied it at collection or an operator who cancelled it; rejected, with the
+note; or expired. It never executes, decides, or writes anything, and it is
+not recorded as a run (`TestProxy_StatusToolReportsAndNeverExecutes`,
+`TestProxy_StatusSaysWhetherAnApprovedRequestExecuted`,
+`TestUnknown_StatusSaysWhatCameOfAnApprovedRequest`). The measurement found that a
 model merely asked for an update looks for a tool like this and passes the
 approval id.
 
@@ -333,12 +371,13 @@ test can recognise it:
 | `IN_PROGRESS` | no | the same request is executing, or its outcome is not yet known; retry shortly |
 | `INTERRUPTED` | no | an earlier attempt was cut off and its outcome is unknown; an operator decides whether it runs again |
 | `UNKNOWN_OUTCOME` | no | this call, or an earlier attempt of it, timed out or failed with no answer from the server, so it may have taken effect; an operator decides whether it runs again |
+| `UNRECORDED` | no | the server answered this mutating call, so it executed, but its answer could not be recorded; it may have taken effect, and it is not to be retried |
 | `DENIED` | yes | the policy does not allow it, with the policy's reason |
 | `INVALID` | yes | the arguments do not match the schema, with the runtime's reason |
 | `REJECTED` | yes | an operator rejected or cancelled this request, with the note |
 | `EXPIRED` | yes | the approval expired before it was used |
 | `DUPLICATE` | yes | the identical call already executed within the window, with its time and outcome |
-| `BLOCKED` | yes | an unknown outcome of this tool waits for an operator, or too many approvals are waiting |
+| `BLOCKED` | yes | another request to this tool has an unknown outcome that an operator has not resolved, or too many approvals are waiting |
 | `UNAVAILABLE` | yes | the proxy could not read or write its records; says whether anything was executed |
 | `GATE_STATUS` | no | the status tool's answer |
 
@@ -374,6 +413,17 @@ content's size, and the server's text; content the runtime refused; and the
 (`TestUnknown_ClassifiesRecordedErrors`). A read's error is always an
 ordinary failure.
 
+Content the runtime refused, not usable JSON, nested past 256 levels, or a
+number past its bound, is an answer: the server answered, so for a tool that
+is not read-only the call executed and only its result could not be
+recorded. The proxy does not report that as a failure, which would invite a
+retry, nor as an unknown outcome, which would ask an operator to run again
+a call the server is known to have answered: the call answers `UNRECORDED`,
+saying it executed and its answer could not be recorded, and it counts as
+executed, so the identical call within the window is `DUPLICATE`
+(`TestUnknown_UnrecordedResultCountsAsExecuted`). A read whose content was
+refused is an ordinary failure.
+
 For an unknown outcome the run is not ended. In the same run the proxy
 proposes the recorded request again, with origin `operator`, and the policy
 asks an operator with an `interrupted_side_effect` approval whose capability
@@ -383,9 +433,12 @@ answers `UNKNOWN_OUTCOME`: the outcome is unknown, it may have taken effect,
 and an operator decides. The operator sees it at once on stderr and in
 `agentrt runs`. While it waits, the identical call answers the same and runs
 nothing, inside the window or long after it, and other mutating calls to the
-tool are `BLOCKED`. Approved, the identical call runs it once more; rejected,
-nothing runs, the tool is unblocked, the identical call is `REJECTED` within
-the window, and after it asks an operator again (rule 6)
+tool are `BLOCKED`. Approved, the identical call runs it once more; if that
+outcome is unknown too, the question is asked again (see One run per call).
+Rejected, nothing runs, the tool is unblocked, the identical call is
+`REJECTED` within the window, and after it asks an operator again (rule 6).
+Expired, nothing runs and the tool stays blocked: the next mutating call to
+it asks again
 (`TestUnknown_TimeoutAfterTheEffectWaitsForAnOperator`,
 `TestUnknown_RejectionUnblocksAndAnIdenticalCallAsksAgain`). An error the
 server returned is a known failure: no operator is asked, the identical call
@@ -409,7 +462,11 @@ after its last renewal and 30 seconds by default, an identical call answers
 the step is marked interrupted, and for a tool that is not read-only the run
 waits on an `interrupted_side_effect` approval and the call answers
 `INTERRUPTED`. While it waits, every other mutating call to that tool is
-`BLOCKED`, and other tools work. If the operator approves, the next identical
+`BLOCKED`, and other tools work. A proxy stopped after an attempt's unknown
+outcome was recorded and before it asked about it leaves a run with nothing
+waiting; the next mutating call to that tool takes it over, asks the
+question in a fresh run, and is `BLOCKED` on it
+(`TestUnknown_CrashBeforeTheReRunKeepsTheToolBlocked`). If the operator approves, the next identical
 call runs the request again, once: this is the documented approved re-run,
 under an approval whose presentation says the first attempt may have taken
 effect, and whose capability names the earlier attempt's step and start time.
@@ -464,11 +521,21 @@ Each server takes the `mcp.Server` fields and its pin and rules:
 
 A stdio server whose command arguments name the configuration file, a
 manifest, or the database, or a directory holding one, is refused at
-startup: each argument, and the part after an `=` in one, is compared as a
-path, absolute, cleaned, and with symbolic links resolved
-(`TestConfig_RefusesAServerThatReachesTheProxysFiles`). It is a best-effort
-check of what the configuration says, not of what the server can reach: set
-`skip_path_check` only for a server that cannot write there.
+startup. Each argument is read for the paths it may name: the argument
+itself, the part after its first `=` or `:`, a `file://` URL's path, and the
+rest of a short flag such as `-r/path`, with a leading `~` read as the home
+directory; a relative path is relative to the proxy's working directory.
+Each one that exists is compared by identity with the protected files and
+every directory above them, so a symbolic link or a different case on a
+case-insensitive filesystem names the same directory
+(`TestConfig_RefusesAServerThatReachesTheProxysFiles`,
+`TestConfig_ReachCheckReadsCommonSpellings`). It is a best-effort guard
+against a mistake in the configuration, not a boundary: it reads what the
+configuration says, not what the server can reach, which can be a path it
+reads from its own configuration or is told later, or one spelled in a way
+this check does not read; and it protects neither the proxy's binary nor
+the host's own configuration. Set `skip_path_check` only for a server that
+cannot write there.
 
 A rule is the shape [`examples/mcp/rules.json`](../examples/mcp/rules.json)
 uses (`mcp.FileRule`): `side_effect`, `timeout`, `description`, `deny`,
@@ -576,8 +643,22 @@ Besides the scope at the top of this page:
 - The `max_pending` cap can be passed by one per process when several
   processes ask at the same moment.
 - `BLOCKED` stops new calls to a tool with an unresolved unknown outcome.
-  An approval of that tool that the operator had already granted is still
-  collected.
+  Any approval for that tool is still collected by its identical call,
+  including one an operator granted after the block began.
+- An operator who stays away does not unblock a tool: when the approval
+  about its unknown outcome expires, the next mutating call to the tool,
+  or the identical call, asks the same question again in a fresh run. Until
+  an operator approves or rejects, every other mutating call to that tool
+  is `BLOCKED`.
+- "Not run again without an operator's approval" holds for the identical
+  request, keyed as above. After a rejection or an expiry, a request
+  spelled differently, `7` for `7.0` or with an optional field added, is a
+  different request: it is blocked while the unknown outcome is unresolved,
+  and after an operator rejected the re-run it runs under the ordinary
+  policy, which may allow it.
+- The reach check of a server's arguments is a guard against a mistake,
+  not a boundary, and protects neither the proxy's binary nor the host's
+  configuration (see Configuration).
 - The rules across calls key a request by its registered tool name. Two
   server entries pointing at the same upstream, or a tool renamed between
   restarts, are different tools to them, so `BLOCKED` and the duplicate rule

@@ -58,12 +58,14 @@ What it does not do:
   - The pin covers what a server presents, not what it does.
   - The servers run as you. None may reach the configuration, the manifests,
     or the database: one that can write them can rewrite the policy or forge
-    an approval.
+    an approval. The check of a server's arguments for them is a guard
+    against a mistake, not a boundary.
 
 What it keeps: an approval bound by hash to the exact request, durable across
 restarts, with policy evaluated again when the request is collected; a call
 that changes something whose outcome is unknown, cut off, timed out, or left
-without an answer, is not run again without an operator;
+without an answer, is not run again as the identical request without an
+operator;
 the audit record is committed with each state change; tools are pinned and
 classified by the operator; an identical call that changes something is not
 executed twice within the repeat window.

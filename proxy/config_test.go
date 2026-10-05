@@ -243,7 +243,7 @@ func TestProxy_ModelVisibleTextNamesNoOperatorPath(t *testing.T) {
 	for _, r := range []*sdk.CallToolResult{
 		pendingText("a1"), interruptedText("a1"), unknownText("timed out before the server answered", "e", "a1"), unknownText("x", "", ""), inProgressText(), deniedText("r"), invalidText("e"),
 		rejectedText("a1", "n", until), cancelledText("n", until), expiredText("a1", until),
-		duplicateText(until, time.Minute, "o"), blockedInterruptedText("bank_pay", "a1"), blockedPendingText(5),
+		duplicateText(until, time.Minute, "o"), blockedInterruptedText("bank_pay", "a1"), blockedPendingText(5), unrecordedText("e", time.Minute),
 		unavailableText("the gate could not read its records, and nothing was executed"),
 	} {
 		texts = append(texts, resultString(r))
@@ -278,8 +278,8 @@ func TestProxy_ModelVisibleTextNamesNoOperatorPath(t *testing.T) {
 // TestConfig_RefusesAServerThatReachesTheProxysFiles: a stdio server runs
 // as the same user, so one whose arguments name the directory holding the
 // configuration, a manifest, or the database could rewrite the policy or
-// forge an approval. Such a server is refused at startup, however the
-// path is spelled, unless skip_path_check says otherwise.
+// forge an approval. Such a server is refused at startup, for the
+// spellings the check reads, unless skip_path_check says otherwise.
 func TestConfig_RefusesAServerThatReachesTheProxysFiles(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(t, dir)
@@ -309,6 +309,55 @@ func TestConfig_RefusesAServerThatReachesTheProxysFiles(t *testing.T) {
 		t.Fatalf("with skip_path_check: %v", err)
 	}
 	p.Close()
+}
+
+// TestConfig_ReachCheckReadsCommonSpellings: the reach check reads the
+// spellings a server commonly takes a root in: a home directory the server
+// expands, '~' or '~/...'; a different case on a case-insensitive
+// filesystem; a path glued to a short flag; one after a ':'; and a
+// file:// URL. Arguments that are not paths, and paths elsewhere, are
+// still accepted.
+func TestConfig_ReachCheckReadsCommonSpellings(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, "proxy")
+	elsewhere := filepath.Join(home, "sandbox")
+	for _, d := range []string{dir, elsewhere} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := testConfig(t, dir)
+	cfg.path = filepath.Join(dir, "proxy.json")
+	if err := os.WriteFile(cfg.path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	self := cfg.Servers[0].Command[0]
+	refused := []string{"~", "~/", "~/proxy", "-r" + dir, "--root:" + dir, "file://" + dir, "file://" + dir + "/", "--root=file://" + dir}
+	if upper := strings.ToUpper(dir); upper != dir {
+		if _, err := os.Stat(upper); err == nil {
+			refused = append(refused, upper)
+		} else {
+			t.Logf("the filesystem is case-sensitive here; the case spelling is not checked")
+		}
+	}
+	for _, arg := range refused {
+		cfg.Servers[0].Command = []string{self, arg}
+		if err := cfg.checkReach(); err == nil || !strings.Contains(err.Error(), "skip_path_check") {
+			t.Errorf("argument %q: %v", arg, err)
+		}
+	}
+	for _, args := range [][]string{
+		{elsewhere},
+		{"~/sandbox"},
+		{"-r" + elsewhere, "--root:" + elsewhere, "file://" + elsewhere},
+		{"--flag", "not-a-path", "-v", "-p8080", "--port=8080", "http://localhost:8080/x", "a:b", "--", "-", "~nobody"},
+	} {
+		cfg.Servers[0].Command = append([]string{self}, args...)
+		if err := cfg.checkReach(); err != nil {
+			t.Errorf("arguments %q: %v", args, err)
+		}
+	}
 }
 
 // TestConfig_RefusesWhatCouldReadTwoWays: a repeated key, which

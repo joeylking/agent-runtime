@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -309,19 +311,41 @@ func readManifest(path string) (*mcp.Manifest, error) {
 // checkReach refuses, best effort, a stdio server whose arguments name the
 // configuration, a manifest, or the database, or a directory holding one:
 // the server runs as the same user, and one that can write them can
-// rewrite the policy or forge an approval. An argument is taken as a path,
-// relative to the proxy's working directory when it is not absolute, and
-// so is the part after an '=' in it. Paths are compared absolute, cleaned,
-// and with symbolic links resolved as far as they exist. It cannot see what a server reaches by other means, a
-// path it is told later or one in its own configuration.
+// rewrite the policy or forge an approval. It is a guard against a
+// mistake in the configuration, not a boundary: it cannot see what a
+// server reaches by other means, a path it is told later, one in its own
+// configuration, or one spelled in a way not read here, and it protects
+// neither the proxy's binary nor the host's own configuration.
+//
+// Each argument yields its candidate paths (reachCandidates), and a
+// candidate that names an existing file or directory is compared by
+// identity, os.SameFile, with each protected file and every directory
+// above it, so a symbolic link, a relative path, or a different case on a
+// case-insensitive filesystem names the same thing. A candidate that names
+// nothing is passed over, unless its resolved path is that of a protected
+// file not created yet.
 func (c *Config) checkReach() error {
-	var protected []string
+	type protectedDir struct {
+		file string
+		info os.FileInfo
+	}
+	var protected []protectedDir
+	// A file not created yet, such as a new database, is compared by its
+	// resolved path, as a candidate that names it is.
+	unborn := map[string]string{}
 	for _, p := range append([]string{c.path, c.Database}, manifests(c)...) {
 		if p == "" {
 			continue
 		}
-		if r, err := realPath(p); err == nil {
-			protected = append(protected, r)
+		if _, err := os.Stat(p); err != nil {
+			if r, err := realPath(p); err == nil {
+				unborn[r] = p
+			}
+		}
+		for _, dir := range ancestors(p) {
+			if info, err := os.Stat(dir); err == nil {
+				protected = append(protected, protectedDir{file: p, info: info})
+			}
 		}
 	}
 	for _, s := range c.Servers {
@@ -329,23 +353,21 @@ func (c *Config) checkReach() error {
 			continue
 		}
 		for _, arg := range s.Command[1:] {
-			candidates := []string{arg}
-			if _, after, ok := strings.Cut(arg, "="); ok {
-				candidates = append(candidates, after)
-			}
-			for _, cand := range candidates {
-				if cand == "" {
-					continue
-				}
-				reach, err := realPath(cand)
-				if err != nil {
-					continue
-				}
-				for _, p := range protected {
-					if p == reach || strings.HasPrefix(p, reach+string(filepath.Separator)) || reach == string(filepath.Separator) {
-						return fmt.Errorf("server %q: its argument %q reaches %s, which the proxy's policy and approvals depend on: "+
-							"point the server elsewhere, or set skip_path_check on it if it cannot write there", s.Name, arg, p)
+			for _, cand := range reachCandidates(arg) {
+				reached := ""
+				if info, err := os.Stat(cand); err == nil {
+					for _, p := range protected {
+						if os.SameFile(info, p.info) {
+							reached = p.file
+							break
+						}
 					}
+				} else if r, err := realPath(cand); err == nil {
+					reached = unborn[r]
+				}
+				if reached != "" {
+					return fmt.Errorf("server %q: its argument %q reaches %s, which the proxy's policy and approvals depend on: "+
+						"point the server elsewhere, or set skip_path_check on it if it cannot write there", s.Name, arg, reached)
 				}
 			}
 		}
@@ -357,6 +379,65 @@ func manifests(c *Config) []string {
 	var out []string
 	for _, s := range c.Servers {
 		out = append(out, s.Manifest)
+	}
+	return out
+}
+
+// ancestors are p and every directory above it up to the root, both as
+// written, made absolute, and with symbolic links resolved as far as they
+// exist, since either chain names what holds p.
+func ancestors(p string) []string {
+	var out []string
+	walk := func(q string) {
+		for {
+			out = append(out, q)
+			up := filepath.Dir(q)
+			if up == q {
+				return
+			}
+			q = up
+		}
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		walk(abs)
+	}
+	if r, err := realPath(p); err == nil {
+		walk(r)
+	}
+	return out
+}
+
+// reachCandidates are the paths an argument may name, read liberally: the
+// argument itself; the part after its first '=' or ':', as in --root=/p or
+// --root:/p; the path of a file:// URL; and, for a short flag, the rest of
+// it, as in -r/p. A leading '~' is the home directory, as a server that
+// expands it reads it. Relative candidates are relative to the proxy's
+// working directory.
+func reachCandidates(arg string) []string {
+	cands := []string{arg}
+	if _, after, ok := strings.Cut(arg, "="); ok {
+		cands = append(cands, after)
+	}
+	if _, after, ok := strings.Cut(arg, ":"); ok {
+		cands = append(cands, after)
+	}
+	if strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") && len(arg) > 2 {
+		cands = append(cands, arg[2:])
+	}
+	for _, c := range cands {
+		if u, err := url.Parse(c); err == nil && strings.EqualFold(u.Scheme, "file") {
+			cands = append(cands, u.Path)
+		}
+	}
+	home, _ := os.UserHomeDir()
+	out := cands[:0]
+	for _, c := range cands {
+		if home != "" && (c == "~" || strings.HasPrefix(c, "~/")) {
+			c = filepath.Join(home, c[1:])
+		}
+		if c != "" {
+			out = append(out, c)
+		}
 	}
 	return out
 }

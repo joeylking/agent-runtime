@@ -241,14 +241,32 @@ func interruptedStep(steps []agentrt.Step) *agentrt.Step {
 }
 
 func interruptedExecuting(st agentrt.Step) bool {
+	prev, ok := interruptedFrom(st)
+	return ok && prev == agentrt.StepExecuting
+}
+
+// interruptedBeforeExecuting reports a tool step agentrt marked
+// interrupted before its tool started, while deciding or allowed: nothing
+// ran.
+func interruptedBeforeExecuting(st agentrt.Step) bool {
+	prev, ok := interruptedFrom(st)
+	return ok && prev != "" && prev != agentrt.StepExecuting
+}
+
+// interruptedFrom is the status a tool step had when agentrt marked it
+// interrupted, from its observation.
+func interruptedFrom(st agentrt.Step) (agentrt.StepStatus, bool) {
 	if st.Status != agentrt.StepInterrupted || st.Observation == nil || st.Observation.Kind != agentrt.ObserveInterrupted ||
 		st.Decision == nil || st.Decision.Kind != agentrt.DecideToolCall {
-		return false
+		return "", false
 	}
 	var prev struct {
 		PreviousStatus agentrt.StepStatus `json:"previous_status"`
 	}
-	return json.Unmarshal(st.Observation.Content, &prev) == nil && prev.PreviousStatus == agentrt.StepExecuting
+	if json.Unmarshal(st.Observation.Content, &prev) != nil {
+		return "", false
+	}
+	return prev.PreviousStatus, true
 }
 
 // latestFor is a step's latest approval in insertion order, the only one

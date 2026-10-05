@@ -25,6 +25,7 @@ const (
 	PrefixInvalid     = "INVALID"
 	PrefixInterrupted = "INTERRUPTED"
 	PrefixUnknown     = "UNKNOWN_OUTCOME"
+	PrefixUnrecorded  = "UNRECORDED"
 	PrefixInProgress  = "IN_PROGRESS"
 	PrefixRejected    = "REJECTED"
 	PrefixExpired     = "EXPIRED"
@@ -83,6 +84,19 @@ func unknownText(how, errText, approvalID string) *sdk.CallToolResult {
 		"Do not call this tool again until you have been told the operator decided, and do not try another tool to achieve the same thing. "+
 		"Tell the user. If you are told it was approved, call this tool again with exactly the same arguments.",
 		PrefixUnknown, how, e, next)
+}
+
+// unrecordedText tells the model a call to a tool that changes something
+// executed, since the server answered, but its answer could not be
+// recorded, so neither it nor the gate knows what came of it.
+func unrecordedText(reason string, window time.Duration) *sdk.CallToolResult {
+	dup := ""
+	if window > 0 {
+		dup = fmt.Sprintf(" An identical call within %s is refused as a duplicate.", window)
+	}
+	return textResult(false, "%s: the server answered this request, so it executed, but its answer could not be recorded (%s). "+
+		"What it did is not known here: it may have taken effect. Do not call this tool again to retry it.%s Tell the user.",
+		PrefixUnrecorded, clean(reason, 500), dup)
 }
 
 func inProgressText() *sdk.CallToolResult {

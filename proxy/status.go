@@ -81,7 +81,7 @@ func (p *Proxy) status(ctx context.Context, approvalID string) *sdk.CallToolResu
 	if approvalID != "" {
 		for _, x := range all {
 			if x.a.ID == approvalID {
-				fmt.Fprintf(&b, "%s: %s", PrefixStatus, p.describe(x, now))
+				fmt.Fprintf(&b, "%s: %s", PrefixStatus, p.describe(x, all, now))
 				return textResult(false, "%s", b.String())
 			}
 		}
@@ -90,7 +90,7 @@ func (p *Proxy) status(ctx context.Context, approvalID string) *sdk.CallToolResu
 	var waiting []string
 	for _, x := range all {
 		if p.isWaiting(x, now) {
-			waiting = append(waiting, "- "+p.describe(x, now))
+			waiting = append(waiting, "- "+p.describe(x, all, now))
 		}
 	}
 	switch len(waiting) {
@@ -110,8 +110,9 @@ func (p *Proxy) isWaiting(x tracked, now time.Time) bool {
 
 // describe is one approval in a sentence: the call, how long it has
 // waited or what became of it, and what the model should do. An approved
-// request is reported executed only when its step executed.
-func (p *Proxy) describe(x tracked, now time.Time) string {
+// request is reported executed only when its step executed, and with what
+// its step recorded (ran).
+func (p *Proxy) describe(x tracked, all []tracked, now time.Time) string {
 	call := fmt.Sprintf("approval %s for %s %s", x.a.ID, clean(x.r.tool, 64), clean(compact(x.a.Request.Args), 200))
 	latest := x.st.latest()
 	switch {
@@ -133,9 +134,10 @@ func (p *Proxy) describe(x tracked, now time.Time) string {
 		return fmt.Sprintf("%s: EXPIRED. It was not executed.", call)
 	}
 	// Approved.
-	if st := stepOf(x.st, x.a.StepID); st != nil && st.Observation != nil &&
-		(st.Observation.Kind == agentrt.ObserveToolResult || st.Observation.Kind == agentrt.ObserveToolError) {
-		return fmt.Sprintf("%s: APPROVED and executed.", call)
+	if st := stepOf(x.st, x.a.StepID); st != nil {
+		if ran, ok := p.ran(x, *st, all, now); ok {
+			return fmt.Sprintf("%s: APPROVED and executed, %s", call, ran)
+		}
 	}
 	switch {
 	case latest != nil && latest.ID != x.a.ID:
@@ -146,6 +148,47 @@ func (p *Proxy) describe(x tracked, now time.Time) string {
 		return fmt.Sprintf("%s: APPROVED and executing now.", call)
 	}
 	return fmt.Sprintf("%s: APPROVED but not executed: %s.", call, notExecuted(x.st, x.a.StepID))
+}
+
+// ran says what came of an approved step that executed, from its recorded
+// observation: it succeeded; the server reported a failure, with the
+// error; the server answered and its result could not be recorded; or its
+// outcome is unknown, timed out, without an answer, or cut off while
+// executing, with the approval that now asks whether it runs again, if
+// one waits. ok is false for a step that did not execute.
+func (p *Proxy) ran(x tracked, st agentrt.Step, all []tracked, now time.Time) (string, bool) {
+	how := ""
+	switch {
+	case interruptedExecuting(st):
+		how = attempt{Ended: endedCutOff}.how()
+	case st.Observation == nil:
+		return "", false
+	case st.Observation.Kind == agentrt.ObserveToolResult:
+		return "and it succeeded.", true
+	case st.Observation.Kind != agentrt.ObserveToolError:
+		return "", false
+	default:
+		t := p.tools[x.r.tool]
+		ended, unknown := endedNoAnswer, t == nil
+		if t != nil {
+			ended, unknown = p.unknownEnding(t, *st.Observation)
+		}
+		switch {
+		case t != nil && unrecorded(t, *st.Observation):
+			return fmt.Sprintf("and the server answered, but its result could not be recorded (%s); it may have taken effect.",
+				clean(errorText(st.Observation.Content), 500)), true
+		case !unknown:
+			return fmt.Sprintf("and the server reported a failure: %s.", clean(errorText(st.Observation.Content), 500)), true
+		}
+		how = attempt{Ended: ended}.how()
+	}
+	next := "No approval to run it again is waiting now."
+	for _, y := range all {
+		if y.r.key == x.r.key && y.a.ID != x.a.ID && y.a.Kind == agentrt.InterruptedSideEffect && p.isWaiting(y, now) {
+			next = fmt.Sprintf("Approval %s now waits for an operator to decide whether it runs again.", y.a.ID)
+		}
+	}
+	return fmt.Sprintf("but it %s, so whether it took effect is unknown: it may have. %s", how, next), true
 }
 
 // notExecuted says why an approved request's run ended before its step

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"slices"
@@ -173,4 +174,277 @@ func TestUnknown_ClassifiesRecordedErrors(t *testing.T) {
 			t.Errorf("%s %s: unknown = %v", c.t.name, c.o.Content, unknown)
 		}
 	}
+}
+
+// statusOf is the status tool's answer about one approval.
+func statusOf(t *testing.T, h *harness, id string) string {
+	t.Helper()
+	return wantPrefix(t, h.call("gate_status", `{"approval_id":"`+id+`"}`), PrefixStatus, false)
+}
+
+// TestUnknown_StatusSaysWhatCameOfAnApprovedRequest: the status tool
+// reports an approved request that executed by what its step recorded: a
+// success; a failure the server reported, with its error; and an outcome
+// left unknown, naming the approval that now asks whether it runs again.
+func TestUnknown_StatusSaysWhatCameOfAnApprovedRequest(t *testing.T) {
+	h := newHarness(t, nil)
+	wantPrefix(t, h.call("bank_pay", `{"to":"oli","amount":2,"mode":"error"}`), PrefixPending, false)
+	declined := h.onlyPending()
+	decide(t, h.p.store, declined, true, "")
+	if res := h.call("bank_pay", `{"to":"oli","amount":2,"mode":"error"}`); !res.IsError {
+		t.Fatalf("the declined payment: %q", resultString(res))
+	}
+	if s := statusOf(t, h, declined.ID); !strings.Contains(s, "APPROVED and executed, and the server reported a failure: ") ||
+		!strings.Contains(s, "card declined for oli") {
+		t.Errorf("status of a payment the server declined: %q", s)
+	}
+	wantPrefix(t, h.call("bank_pay", `{"to":"pia","amount":3}`), PrefixPending, false)
+	paid := h.onlyPending()
+	decide(t, h.p.store, paid, true, "")
+	h.call("bank_pay", `{"to":"pia","amount":3}`)
+	if s := statusOf(t, h, paid.ID); !strings.Contains(s, "APPROVED and executed, and it succeeded.") {
+		t.Errorf("status of a payment that succeeded: %q", s)
+	}
+
+	h = newHarness(t, timeoutPay)
+	args := `{"to":"kim","amount":7,"mode":"block"}`
+	wantPrefix(t, h.call("bank_pay", args), PrefixUnknown, false)
+	first := unknownApproval(t, h)
+	decide(t, h.p.store, first, true, "")
+	wantPrefix(t, h.call("bank_pay", args), PrefixUnknown, false)
+	next := unknownApproval(t, h)
+	s := statusOf(t, h, first.ID)
+	if !strings.Contains(s, "APPROVED and executed, but it timed out before the server answered, so whether it took effect is unknown") ||
+		!strings.Contains(s, "Approval "+next.ID+" now waits") {
+		t.Errorf("status of an approved re-run that timed out: %q", s)
+	}
+}
+
+// TestUnknown_StepLimitKeepsTheToolBlocked: an approved re-run times out,
+// and so does a second; the run's step limit ends it, and the question is
+// asked again in a fresh run, so the tool stays blocked on an approval an
+// operator can act on, and the identical call waits on the same one.
+func TestUnknown_StepLimitKeepsTheToolBlocked(t *testing.T) {
+	h := newHarness(t, timeoutPay)
+	args := `{"to":"kim","amount":7,"mode":"block"}`
+	wantPrefix(t, h.call("bank_pay", args), PrefixUnknown, false)
+	for range 2 {
+		decide(t, h.p.store, unknownApproval(t, h), true, "")
+		wantPrefix(t, h.call("bank_pay", args), PrefixUnknown, false)
+	}
+	a := unknownApproval(t, h)
+	if n := h.payments(); n != 3 {
+		t.Fatalf("%d payments, want the attempt and two approved re-runs", n)
+	}
+	if s := wantPrefix(t, h.call("bank_pay", `{"to":"lou","amount":1}`), PrefixBlocked, true); !strings.Contains(s, a.ID) {
+		t.Errorf("another payment: %q, want it blocked on %s", s, a.ID)
+	}
+	if s := wantPrefix(t, h.call("bank_pay", args), PrefixUnknown, false); !strings.Contains(s, a.ID) {
+		t.Errorf("the identical call: %q", s)
+	}
+	if n := h.payments(); n != 3 {
+		t.Fatalf("%d payments, want 3", n)
+	}
+	decide(t, h.p.store, a, false, "")
+	if res := h.call("bank_pay", `{"to":"lou","amount":1}`); res.IsError {
+		t.Fatalf("another payment once the operator rejected: %q", resultString(res))
+	}
+	settledOrWaiting(t, h.p.store)
+}
+
+// TestUnknown_CrashBeforeTheReRunKeepsTheToolBlocked: the proxy stops
+// after an attempt's timeout is recorded and before it proposes the
+// re-run. Another call to the tool recovers the run and finds the unknown
+// outcome with nothing waiting: it asks an operator in a fresh run and is
+// blocked on that approval, which the identical call then waits on too.
+func TestUnknown_CrashBeforeTheReRunKeepsTheToolBlocked(t *testing.T) {
+	h := newHarness(t, timeoutPay)
+	ctx := context.Background()
+	args := `{"to":"kim","amount":7,"mode":"block"}`
+	key := mustKey(t, "bank_pay", args)
+	runID := "test.crashedbeforererun"
+	if err := h.p.idx.claim(ctx, "test", key, "bank_pay", agentrt.RemoteMutation, runID, nil, h.clock.now()); err != nil {
+		t.Fatal(err)
+	}
+	s, err := h.p.gate.Begin(ctx, runID, "call bank_pay", h.p.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, _ := s.Step(ctx)
+	if v, err := st.Propose(ctx, agentrt.Decision{Kind: agentrt.DecideToolCall, Tool: "bank_pay", Args: []byte(args), Origin: agentrt.OriginModel}); err != nil || v.Outcome != agentrt.VerdictAllowed {
+		t.Fatalf("propose: %+v %v", v, err)
+	}
+	if obs, err := st.Execute(ctx); err != nil || obs.Kind != agentrt.ObserveToolError {
+		t.Fatalf("execute: %+v %v", obs, err)
+	}
+	s.Close() // as the crash leaves it, the lease released
+	res := h.call("bank_pay", `{"to":"lou","amount":1}`)
+	wantPrefix(t, res, PrefixBlocked, true)
+	a := unknownApproval(t, h)
+	if !strings.Contains(resultString(res), a.ID) || a.RunID == runID {
+		t.Fatalf("another payment: %q, approval %s in run %s", resultString(res), a.ID, a.RunID)
+	}
+	if s := wantPrefix(t, h.call("bank_pay", args), PrefixUnknown, false); !strings.Contains(s, a.ID) {
+		t.Errorf("the identical call: %q", s)
+	}
+	if n := h.payments(); n != 1 {
+		t.Fatalf("%d payments before the operator decided", n)
+	}
+	os.WriteFile(h.ledger+".release", nil, 0o600)
+	decide(t, h.p.store, a, true, "")
+	if res := h.call("bank_pay", args); res.IsError || resultString(res) != "paid 7.00 to kim" {
+		t.Fatalf("the approved re-run: %q", resultString(res))
+	}
+	if res := h.call("bank_pay", `{"to":"lou","amount":1}`); res.IsError {
+		t.Fatalf("another payment once the outcome is known: %q", resultString(res))
+	}
+	if n := h.payments(); n != 3 {
+		t.Fatalf("%d payments, want the attempt, the approved re-run, and lou's", n)
+	}
+	settledOrWaiting(t, h.p.store)
+}
+
+// TestUnknown_ExpiryAsksAgainRatherThanUnblocks: an approval about an
+// unknown outcome that expires resolves nothing. The next call to the tool
+// is blocked on a new approval asking the same question, and the identical
+// call waits on that one rather than being refused as expired.
+func TestUnknown_ExpiryAsksAgainRatherThanUnblocks(t *testing.T) {
+	h := newHarness(t, func(c *Config) {
+		timeoutPay(c)
+		c.ApprovalTTL = &Duration{time.Minute}
+	})
+	args := `{"to":"kim","amount":7,"mode":"block"}`
+	wantPrefix(t, h.call("bank_pay", args), PrefixUnknown, false)
+	first := unknownApproval(t, h)
+	h.clock.add(2 * time.Minute)
+	s := wantPrefix(t, h.call("bank_pay", `{"to":"lou","amount":1}`), PrefixBlocked, true)
+	again := unknownApproval(t, h)
+	if again.ID == first.ID || !strings.Contains(s, again.ID) {
+		t.Fatalf("another payment after the expiry: %q, approval %s (first %s)", s, again.ID, first.ID)
+	}
+	if s := wantPrefix(t, h.call("bank_pay", args), PrefixUnknown, false); !strings.Contains(s, again.ID) {
+		t.Errorf("the identical call: %q", s)
+	}
+	// Expired with nothing else calling, the identical call asks again.
+	h.clock.add(2 * time.Minute)
+	if s := wantPrefix(t, h.call("bank_pay", args), PrefixUnknown, false); strings.Contains(s, again.ID) || len(h.pending()) != 1 {
+		t.Errorf("the identical call after a second expiry: %q", s)
+	}
+	if n := h.payments(); n != 1 {
+		t.Fatalf("%d payments", n)
+	}
+	settledOrWaiting(t, h.p.store)
+}
+
+// TestUnknown_CutOffBeforeExecutingIsNoAttempt: a mutating call cut off
+// after the policy allowed it and before its tool started ran nothing:
+// abandoned there, or its lease lost there. Its run is ended, the tool is
+// not blocked, and the identical call runs under the ordinary rules,
+// without asking an operator.
+func TestUnknown_CutOffBeforeExecutingIsNoAttempt(t *testing.T) {
+	allowPay := func(c *Config) {
+		p := c.Servers[0].Rules["pay"]
+		p.Outcome = agentrt.Allow
+		c.Servers[0].Rules["pay"] = p
+		c.LeaseTTL = &Duration{time.Hour}
+	}
+	ctx := context.Background()
+	args := `{"to":"zed","amount":3}`
+	allowed := func(t *testing.T, h *harness, g *agentrt.Gate, runID string) (*agentrt.Session, *agentrt.OpenStep) {
+		t.Helper()
+		if err := h.p.idx.claim(ctx, "test", mustKey(t, "bank_pay", args), "bank_pay", agentrt.RemoteMutation, runID, nil, h.clock.now()); err != nil {
+			t.Fatal(err)
+		}
+		s, err := g.Begin(ctx, runID, "call bank_pay", h.p.limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, _ := s.Step(ctx)
+		if v, err := st.Propose(ctx, agentrt.Decision{Kind: agentrt.DecideToolCall, Tool: "bank_pay", Args: []byte(args), Origin: agentrt.OriginModel}); err != nil || v.Outcome != agentrt.VerdictAllowed {
+			t.Fatalf("propose: %+v %v", v, err)
+		}
+		return s, st
+	}
+	check := func(t *testing.T, h *harness, runID string) {
+		t.Helper()
+		if res := h.call("bank_pay", args); res.IsError || resultString(res) != "paid 3.00 to zed" {
+			t.Fatalf("the identical call: %q", resultString(res))
+		}
+		old, err := h.p.store.GetRun(ctx, runID)
+		if err != nil || old.Status != agentrt.StatusFailed || !strings.Contains(old.ReasonDetail, "taken over after an interruption") {
+			t.Fatalf("the run cut off: %+v %v", old, err)
+		}
+		if n := h.approvals(); n != 0 {
+			t.Fatalf("%d approvals, want none", n)
+		}
+		settledOrWaiting(t, h.p.store)
+	}
+	t.Run("abandoned after it was allowed", func(t *testing.T) {
+		h := newHarness(t, allowPay)
+		s, _ := allowed(t, h, h.p.gate, "test.abandonedallowed")
+		s.Close()
+		if res := h.call("bank_pay", `{"to":"lou","amount":1}`); res.IsError {
+			t.Fatalf("another payment: %q", resultString(res))
+		}
+		check(t, h, "test.abandonedallowed")
+		if n := h.payments(); n != 2 {
+			t.Fatalf("%d payments, want lou's and zed's", n)
+		}
+	})
+	t.Run("lease lost before Execute", func(t *testing.T) {
+		h := newHarness(t, allowPay)
+		g, err := agentrt.NewGate(agentrt.GateConfig{Store: h.p.store, Policy: gatePolicy{h.p}, Tools: []agentrt.Tool{gateTool{h.p.tools["bank_pay"]}},
+			Reconcile: h.p.reconcile, Now: h.clock.now, LeaseOwner: "another-proxy", LeaseTTL: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runID := "test.leaselost"
+		s, st := allowed(t, h, g, runID)
+		defer s.Close()
+		// The other process's lease runs out unrenewed.
+		if _, err := h.p.store.DB().ExecContext(ctx, `UPDATE runs SET lease_expires_at = ? WHERE id = ?`,
+			time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), runID); err != nil {
+			t.Fatal(err)
+		}
+		if res := h.call("bank_pay", `{"to":"lou","amount":1}`); res.IsError {
+			t.Fatalf("another payment: %q", resultString(res))
+		}
+		if _, err := st.Execute(ctx); err == nil {
+			t.Fatal("the step whose lease was lost executed")
+		}
+		check(t, h, runID)
+		if n := h.payments(); n != 2 {
+			t.Fatalf("%d payments, want lou's and zed's", n)
+		}
+	})
+}
+
+// TestUnknown_UnrecordedResultCountsAsExecuted: a payment whose server
+// answered with content the runtime refuses executed, and its result could
+// not be recorded. The model is told exactly that, not that it failed; no
+// operator is asked; the identical call within the window is a duplicate,
+// and other payments run.
+func TestUnknown_UnrecordedResultCountsAsExecuted(t *testing.T) {
+	h := newHarness(t, timeoutPay)
+	args := `{"to":"ria","amount":4,"mode":"deep"}`
+	res := h.call("bank_pay", args)
+	s := wantPrefix(t, res, PrefixUnrecorded, false)
+	if !strings.Contains(s, "so it executed") || !strings.Contains(s, "could not be recorded") || strings.Contains(s, "failed") || h.payments() != 1 {
+		t.Fatalf("first call: %q, %d payments", s, h.payments())
+	}
+	if s := wantPrefix(t, h.call("bank_pay", args), PrefixDuplicate, true); !strings.Contains(s, "could not be recorded") || strings.Contains(s, "it failed") {
+		t.Errorf("the identical call: %q", s)
+	}
+	if res := h.call("bank_pay", `{"to":"lou","amount":1}`); res.IsError {
+		t.Fatalf("another payment: %q", resultString(res))
+	}
+	if n, a := h.payments(), h.approvals(); n != 2 || a != 0 {
+		t.Fatalf("%d payments, %d approvals", n, a)
+	}
+	runs := h.runs()
+	steps, _ := h.p.store.ListSteps(context.Background(), runs[0].ID)
+	if len(steps) == 0 || steps[0].Observation == nil || failureOf(*steps[0].Observation) != "invalid_content" {
+		t.Fatalf("the first payment's step: %+v", steps)
+	}
+	settledOrWaiting(t, h.p.store)
 }

@@ -54,11 +54,13 @@ const Version = "0.1.0"
 // sees names the operator command.
 const serverName = "gated-tools"
 
-// limits are every run's, fixed: a call's run holds its one tool step and
+// limits are every run's, fixed: a call's run needs its one tool step and
 // at most two more, its re-run after an unknown outcome and the proxy's
-// closing decision, so the step and failure limits never end a call's run
-// early. A re-run whose own outcome is unknown again may meet them; its
-// run then ends, and the next identical call asks an operator (rule 6).
+// closing decision. An approved re-run whose outcome is unknown again is
+// asked about again in the same run, once; the next such re-run meets the
+// step limit, which ends the run, and the proxy asks the same question in
+// a fresh run of the request at once (rerun, reopen); if that cannot be
+// asked, the next mutating call to the tool asks it (unknownBlock).
 // ApprovalTTL and GrantTTL come from the configuration.
 func limits(cfg *Config) agentrt.Limits {
 	return agentrt.Limits{
