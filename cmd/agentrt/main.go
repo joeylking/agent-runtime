@@ -73,13 +73,21 @@ cancel flags (may come before or after the run id):
 
 verify flags:
   -from n               first event to check, by seq (default: the first)
-  -to n                 last event to check, by seq (default: the newest)
+  -to n                 last event to check, by seq (default: the newest);
+                        a -to past the last event fails
+  -head seq:hash        a head kept elsewhere (export.Follower.Head, or an
+                        earlier verify's last checked): fails unless the
+                        walk reaches seq and its event still has that hash
 
-verify prints the chain's head and either "intact" or the first event that
-does not chain, and exits 1 for a break. It reads a page at a time and
-writes nothing. An intact chain shows the events were not altered only up
-to a head kept where whoever can write the database cannot reach: such a
-writer can recompute every hash after a row they changed.
+verify prints the chain's head, then either "intact" with the seq and hash
+of the last event checked, or the first event that does not chain. It exits
+1 for a break, for a -to not reached, and for a -head not reached or not
+matched. It reads a page at a time and writes nothing. An intact chain
+shows the events were not altered only up to a head kept where whoever can
+write the database cannot reach: such a writer can recompute every hash
+after a row they changed, or cut events from the end, and the chain still
+verifies. Keep the last checked seq and hash, and pass them as -head next
+time.
 
 agentrt never creates a missing database and never migrates one on a
 different schema version than this build: that is the consumer's job.
@@ -474,10 +482,18 @@ func parseCancel(args []string) (*command, error) {
 	}}, nil
 }
 
+// keptHead is a head an operator kept elsewhere, as verify -head takes
+// it: a seq and the hash its event had.
+type keptHead struct {
+	seq  int64
+	hash string
+}
+
 func parseVerify(args []string) (*command, error) {
 	fs := newFlagSet("verify")
 	from := fs.Int64("from", 0, "first event to check, by seq")
 	to := fs.Int64("to", 0, "last event to check, by seq")
+	headArg := fs.String("head", "", "a head kept elsewhere, SEQ:HASH, that the chain must reach and match")
 	if err := fs.Parse(args); err != nil {
 		return nil, parseErr(err)
 	}
@@ -490,7 +506,22 @@ func parseVerify(args []string) (*command, error) {
 	if *from > 0 && *to > 0 && *to < *from {
 		return nil, fmt.Errorf("%w: verify: -to %d is before -from %d", errUsage, *to, *from)
 	}
-	return &command{readOnly: true, exec: func(ctx context.Context, e *env) error { return cmdVerify(ctx, e, *from, *to) }}, nil
+	var kept *keptHead
+	if *headArg != "" {
+		seqText, hash, ok := strings.Cut(*headArg, ":")
+		seq, err := strconv.ParseInt(seqText, 10, 64)
+		if !ok || err != nil || seq < 1 || hash == "" {
+			return nil, fmt.Errorf("%w: verify: -head is SEQ:HASH, a positive seq and the hash kept for it", errUsage)
+		}
+		if *to > 0 && seq > *to {
+			return nil, fmt.Errorf("%w: verify: -head seq %d is past -to %d", errUsage, seq, *to)
+		}
+		if *from > seq {
+			return nil, fmt.Errorf("%w: verify: -head seq %d is before -from %d, so the walk would not check it", errUsage, seq, *from)
+		}
+		kept = &keptHead{seq, hash}
+	}
+	return &command{readOnly: true, exec: func(ctx context.Context, e *env) error { return cmdVerify(ctx, e, *from, *to, kept) }}, nil
 }
 
 // cmdRuns lists runs, newest first, reading only the page it prints.
@@ -862,17 +893,27 @@ func cmdEvents(ctx context.Context, e *env, runID string, limit, offset int) err
 }
 
 // errChainBroken is verify's error for an event that does not chain,
-// after the break has been printed.
-var errChainBroken = errors.New("the event chain is broken")
+// after the break has been printed; errNotReached for a -to or -head the
+// chain does not reach, and errHeadMismatch for a kept head whose event
+// now has another hash.
+var (
+	errChainBroken  = errors.New("the event chain is broken")
+	errNotReached   = errors.New("the event chain is shorter than asked")
+	errHeadMismatch = errors.New("the event chain does not match the head kept")
+)
 
 // cmdVerify checks the events' hash chain from -from to -to and prints the
-// head and what it found. The head is read first, so events committed
-// while it runs are not checked.
-func cmdVerify(ctx context.Context, e *env, from, to int64) error {
+// head, what it found, and the hash of the last event checked. The head is
+// read first, so events committed while it runs are not checked. A -to
+// past the last event, and a kept head (-head) at a seq the walk did not
+// reach or whose event's hash is not the one kept, fail it: a chain cut at
+// its end verifies on its own, and only those show it is short.
+func cmdVerify(ctx context.Context, e *env, from, to int64, kept *keptHead) error {
 	seq, hash, err := e.store.ChainHead(ctx)
 	if err != nil {
 		return err
 	}
+	asked := to
 	if to == 0 {
 		to = seq
 	}
@@ -880,6 +921,31 @@ func cmdVerify(ctx context.Context, e *env, from, to int64) error {
 	if to > 0 {
 		if rep, err = e.store.VerifyEvents(ctx, from, to); err != nil {
 			return err
+		}
+	}
+	var problem error
+	reached := rep.Break == nil && rep.Checked > 0 && rep.To >= asked
+	if rep.Break == nil && asked > 0 && !reached {
+		problem = fmt.Errorf("%w: -to %d was not reached; the last event checked is seq %d", errNotReached, asked, rep.To)
+	}
+	// The kept head's event, read when the walk checked it.
+	var found string
+	matches := false
+	if kept != nil && rep.Break == nil && problem == nil {
+		switch {
+		case rep.Checked == 0 || kept.seq > rep.To:
+			problem = fmt.Errorf("%w: the kept head, seq %d, was not reached; the last event checked is seq %d", errNotReached, kept.seq, rep.To)
+		case kept.seq == rep.To:
+			found = rep.Hash
+		default:
+			if found, err = e.store.EventHash(ctx, kept.seq); err != nil {
+				return err
+			}
+		}
+		if problem == nil {
+			if matches = found == kept.hash; !matches {
+				problem = fmt.Errorf("%w: seq %d has hash %s, not the %s kept", errHeadMismatch, kept.seq, trace.Sanitize(found), trace.Sanitize(kept.hash))
+			}
 		}
 	}
 	if e.json {
@@ -893,16 +959,35 @@ func cmdVerify(ctx context.Context, e *env, from, to int64) error {
 			Found    string `json:"found"`
 			Detail   string `json:"detail"`
 		}
+		type requested struct {
+			To      int64 `json:"to"`
+			Reached bool  `json:"reached"`
+		}
+		type keptOut struct {
+			Seq     int64  `json:"seq"`
+			Hash    string `json:"hash"`
+			Found   string `json:"found"`
+			Matches bool   `json:"matches"`
+		}
 		out := struct {
-			Head    head        `json:"head"`
-			From    int64       `json:"from"`
-			To      int64       `json:"to"`
-			Checked int64       `json:"checked"`
-			Intact  bool        `json:"intact"`
-			Break   *chainBreak `json:"break,omitempty"`
-		}{Head: head{seq, hash}, From: rep.From, To: rep.To, Checked: rep.Checked, Intact: rep.Break == nil}
+			Head      head        `json:"head"`
+			From      int64       `json:"from"`
+			To        int64       `json:"to"`
+			Hash      string      `json:"hash"`
+			Checked   int64       `json:"checked"`
+			Intact    bool        `json:"intact"`
+			Break     *chainBreak `json:"break,omitempty"`
+			Requested *requested  `json:"requested,omitempty"`
+			KeptHead  *keptOut    `json:"kept_head,omitempty"`
+		}{Head: head{seq, hash}, From: rep.From, To: rep.To, Hash: rep.Hash, Checked: rep.Checked, Intact: rep.Break == nil}
 		if b := rep.Break; b != nil {
 			out.Break = &chainBreak{b.Seq, b.Expected, b.Found, b.Detail}
+		}
+		if asked > 0 {
+			out.Requested = &requested{asked, reached}
+		}
+		if kept != nil {
+			out.KeptHead = &keptOut{kept.seq, kept.hash, found, matches}
 		}
 		if err := printJSON(e.out, out); err != nil {
 			return err
@@ -918,13 +1003,16 @@ func cmdVerify(ctx context.Context, e *env, from, to int64) error {
 		} else if rep.Checked == 0 {
 			fmt.Fprintln(e.out, "intact: no events in the range")
 		} else {
-			fmt.Fprintf(e.out, "intact: %d event(s), seq %d to %d\n", rep.Checked, rep.From, rep.To)
+			fmt.Fprintf(e.out, "intact: %d event(s), seq %d to %d\nlast checked: seq %d %s\n", rep.Checked, rep.From, rep.To, rep.To, trace.Sanitize(rep.Hash))
+		}
+		if matches {
+			fmt.Fprintf(e.out, "kept head: seq %d matches\n", kept.seq)
 		}
 	}
 	if rep.Break != nil {
 		return fmt.Errorf("%w at seq %d", errChainBroken, rep.Break.Seq)
 	}
-	return nil
+	return problem
 }
 
 // capPayload returns ev with its payload bounded to n bytes for text-mode

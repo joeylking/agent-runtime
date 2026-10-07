@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -57,7 +58,7 @@ func TestCLI_Recheck(t *testing.T) {
 	p.stop()
 
 	code, out, errb := recheckRun(t, "-config", config)
-	if code != 0 || !strings.Contains(out, "3 run(s) re-checked under agentrt-proxy/sha256:") || !strings.HasSuffix(out, ": 0 differ\n") || strings.Contains(out, "DIFFERENT") {
+	if code != 0 || !strings.Contains(out, "3 run(s) re-checked under agentrt-proxy/sha256:") || !strings.Contains(out, ": 4 decision(s) re-checked, 0 not re-checkable and skipped; 0 run(s) differ\n"+recheckScope+"\n") || strings.Contains(out, "DIFFERENT") {
 		t.Fatalf("same configuration: exit %d\n%s%s", code, out, errb)
 	}
 	if !strings.Contains(out, "policy unchanged") || !strings.Contains(out, "same      step 0 seq ") {
@@ -69,7 +70,7 @@ func TestCLI_Recheck(t *testing.T) {
 	})
 	code, out, errb = recheckRun(t, "-config", config)
 	if code != 1 || strings.Count(out, "DIFFERENT") != 2 || !strings.Contains(out, "bank_pay: require_approval -> deny: side effect remote_mutation is deny by policy") ||
-		!strings.Contains(out, "bank_pay (on resume): require_approval -> deny") || !strings.Contains(out, "policy changed") || !strings.HasSuffix(out, ": 1 differ\n") {
+		!strings.Contains(out, "bank_pay (on resume): require_approval -> deny") || !strings.Contains(out, "policy changed") || !strings.Contains(out, "; 1 run(s) differ\n") {
 		t.Fatalf("payments denied: exit %d\n%s%s", code, out, errb)
 	}
 
@@ -111,5 +112,44 @@ func TestCLI_Recheck(t *testing.T) {
 	}
 	if code, _, errb := recheckRun(t, "-config", config, "-run", "nope"); code != 1 || !strings.Contains(errb, "not found") {
 		t.Errorf("a missing run: exit %d\n%s", code, errb)
+	}
+}
+
+// A re-check that re-checked nothing fails: a -session no run was recorded
+// under, a mistyped one, and a run whose only decision met a policy error,
+// which left no evaluation to re-check.
+func TestCLI_RecheckOfNothingFails(t *testing.T) {
+	dir, config := setup(t, nil)
+	p := start(t, config)
+	if res := p.call("bank_balance", `{"account":"main"}`); res.IsError {
+		t.Fatalf("balance: %s", text(res))
+	}
+	p.stop()
+	code, out, errb := recheckRun(t, "-config", config, "-session", "no-such-session")
+	if code != 1 || !strings.Contains(errb, `no run of session "no-such-session" was found, so nothing was re-checked`) || !strings.Contains(out, "0 run(s) re-checked") {
+		t.Fatalf("a wrong session: exit %d\n%s%s", code, out, errb)
+	}
+	code, out, errb = recheckRun(t, "-config", config, "-session", "no-such-session", "-json")
+	if code != 1 || strings.TrimSpace(out) != "[]" {
+		t.Fatalf("a wrong session, -json: exit %d\n%s%s", code, out, errb)
+	}
+
+	// The balance's decision, as a policy error leaves it: no step.policy,
+	// and the step failed with the policy's error.
+	store, err := agentrt.OpenStore(filepath.Join(dir, "runs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`DELETE FROM events WHERE type = 'step.policy'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`INSERT INTO events (run_id, step_id, at, type, payload_json) SELECT run_id, id, started_at, 'step.failed', '{"detail":"policy error: rules unavailable"}' FROM steps`); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	code, out, errb = recheckRun(t, "-config", config)
+	if code != 1 || !strings.Contains(out, "0 decision(s) re-checked, 1 not re-checkable and skipped") || !strings.Contains(out, "policy failed; no evaluation recorded: rules unavailable") ||
+		!strings.Contains(errb, "no decision of the policy was re-checked (1 not re-checkable)") {
+		t.Fatalf("a policy error: exit %d\n%s%s", code, out, errb)
 	}
 }

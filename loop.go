@@ -200,7 +200,11 @@ func (st *OpenStep) propose(ctx context.Context, decision Decision) Verdict {
 	view := RunView{Run: st.run}
 	view.Steps, view.Approvals = s.c.policy.view(s.c, st.n)
 	st.view = seenBy(view)
-	pd, perr := d.policy.Evaluate(ctx, req, view)
+	handed, err := policyRequest(req)
+	if err != nil {
+		return s.lose(ctx, err)
+	}
+	pd, perr := d.policy.Evaluate(ctx, handed, view)
 	return st.apply(ctx, req, pd, perr, nil, time.Time{})
 }
 
@@ -415,7 +419,7 @@ func (st *OpenStep) apply(ctx context.Context, req ToolRequest, pd PolicyDecisio
 	}
 	if perr != nil {
 		return settle(ending{status: StatusFailed, reason: ReasonInternalError, detail: "policy: " + perr.Error(),
-			step: step, stepStatus: StepFailed, stepDetail: "policy error: " + perr.Error()})
+			step: step, stepStatus: StepFailed, stepDetail: policyErrorPrefix + perr.Error()})
 	}
 	st.policyAt = resumedAt
 	if granted == nil {
@@ -425,7 +429,7 @@ func (st *OpenStep) apply(ctx context.Context, req ToolRequest, pd PolicyDecisio
 	if cerr := checkPolicy(pd); cerr != nil {
 		step.Policy = &PolicyDecision{Outcome: pd.Outcome, Reason: pd.Reason, Kind: pd.Kind}
 		return settle(ending{status: StatusFailed, reason: ReasonInternalError, detail: "policy: " + cerr.Error(), pre: policyEvent,
-			step: step, stepStatus: StepFailed, stepDetail: "policy error: " + cerr.Error()})
+			step: step, stepStatus: StepFailed, stepDetail: policyErrorPrefix + cerr.Error()})
 	}
 	step.Policy = &pd
 

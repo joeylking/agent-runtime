@@ -22,7 +22,19 @@ import (
 // byte-identical to what json.Marshal of the decoded value produced when
 // the hashes were first stored, and TestCanonicalJSON_MatchesEncodingJSON
 // and TestContentHash_Golden pin that.
-func canonicalJSON(raw json.RawMessage) ([]byte, error) {
+func canonicalJSON(raw json.RawMessage) ([]byte, error) { return encodeSorted(raw, true) }
+
+// policyForm is the form of raw a policy is handed: canonicalJSON's
+// traversal with HTML escaping off. It does not check raw, so a tool's
+// schema, which NewDriver compiles but does not hold to checkJSON, encodes
+// alike from what the tool registered and from its stored canonical form:
+// a repeated key keeps its last value in both.
+func policyForm(raw json.RawMessage) ([]byte, error) { return encodeSorted(raw, false) }
+
+// encodeSorted decodes raw and writes it with object keys in byte order
+// and no insignificant whitespace; html is whether '<', '>', '&', U+2028,
+// and U+2029 are escaped.
+func encodeSorted(raw json.RawMessage, html bool) ([]byte, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return []byte("null"), nil
 	}
@@ -32,13 +44,13 @@ func canonicalJSON(raw json.RawMessage) ([]byte, error) {
 	if err := dec.Decode(&v); err != nil {
 		return nil, err
 	}
-	return appendCanonical(nil, v)
+	return appendCanonical(nil, v, html)
 }
 
 // appendCanonical writes a decoded value: objects with keys in byte order,
 // numbers as their literal text, strings escaped as encoding/json escapes
-// them with HTML escaping on.
-func appendCanonical(dst []byte, v any) ([]byte, error) {
+// them, with HTML escaping on when html is set.
+func appendCanonical(dst []byte, v any, html bool) ([]byte, error) {
 	switch x := v.(type) {
 	case nil:
 		return append(dst, "null"...), nil
@@ -53,7 +65,7 @@ func appendCanonical(dst []byte, v any) ([]byte, error) {
 		}
 		return append(dst, x...), nil
 	case string:
-		return appendCanonicalString(dst, x), nil
+		return appendCanonicalString(dst, x, html), nil
 	case []any:
 		dst = append(dst, '[')
 		for i, e := range x {
@@ -61,7 +73,7 @@ func appendCanonical(dst []byte, v any) ([]byte, error) {
 				dst = append(dst, ',')
 			}
 			var err error
-			if dst, err = appendCanonical(dst, e); err != nil {
+			if dst, err = appendCanonical(dst, e, html); err != nil {
 				return nil, err
 			}
 		}
@@ -77,10 +89,10 @@ func appendCanonical(dst []byte, v any) ([]byte, error) {
 			if i > 0 {
 				dst = append(dst, ',')
 			}
-			dst = appendCanonicalString(dst, k)
+			dst = appendCanonicalString(dst, k, html)
 			dst = append(dst, ':')
 			var err error
-			if dst, err = appendCanonical(dst, x[k]); err != nil {
+			if dst, err = appendCanonical(dst, x[k], html); err != nil {
 				return nil, err
 			}
 		}
@@ -92,15 +104,16 @@ func appendCanonical(dst []byte, v any) ([]byte, error) {
 const lowerHex = "0123456789abcdef"
 
 // appendCanonicalString quotes s: '"' and '\' escaped with a backslash;
-// \b, \f, \n, \r, \t by their short escapes; other control bytes, '<',
-// '>', and '&' as \u00XX; U+2028 and U+2029 as   and  ; an
-// invalid UTF-8 byte as �; everything else as is.
-func appendCanonicalString(dst []byte, s string) []byte {
+// \b, \f, \n, \r, \t by their short escapes; other control bytes as
+// \u00XX; with html set, '<', '>', and '&' as \u00XX and U+2028 and
+// U+2029 as   and  ; an invalid UTF-8 byte as �;
+// everything else as is.
+func appendCanonicalString(dst []byte, s string, html bool) []byte {
 	dst = append(dst, '"')
 	start := 0
 	for i := 0; i < len(s); {
 		if b := s[i]; b < utf8.RuneSelf {
-			if b >= 0x20 && b != '"' && b != '\\' && b != '<' && b != '>' && b != '&' {
+			if b >= 0x20 && b != '"' && b != '\\' && (!html || b != '<' && b != '>' && b != '&') {
 				i++
 				continue
 			}
@@ -133,7 +146,7 @@ func appendCanonicalString(dst []byte, s string) []byte {
 			start = i
 			continue
 		}
-		if c == ' ' || c == ' ' {
+		if html && (c == ' ' || c == ' ') {
 			dst = append(dst, s[start:i]...)
 			dst = append(dst, '\\', 'u', '2', '0', '2', lowerHex[c&0xF])
 			i += size

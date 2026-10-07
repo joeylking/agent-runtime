@@ -887,6 +887,25 @@ func (s *Store) GetApproval(ctx context.Context, runID, id string) (Approval, er
 	return a, err
 }
 
+// firstApprovals reads a run's first n approvals in creation order, each
+// whole, as GetApproval reads one.
+func (s *Store) firstApprovals(ctx context.Context, runID string, n int) ([]Approval, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+approvalColumns+` FROM approvals WHERE run_id = ? ORDER BY rowid LIMIT ?`, runID, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Approval
+	for rows.Next() {
+		a, err := scanApproval(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 // PendingApprovalIDs maps each run waiting for approval to the ids of its
 // pending approvals, in creation order, in one query. It is what a listing
 // of many runs needs without reading every approval's request.

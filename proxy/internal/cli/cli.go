@@ -52,8 +52,14 @@ connects to no server unless -current-tools, which loads the pinned tools as
 serving does and hands each request its tool's spec as loaded now. -json
 prints the reports as a JSON array. Each decision records the policy's
 identity, a hash of the parts of the configuration the policy decides from
-(docs/proxy.md). Exit status: 0 when every run re-checks the same, 1 when any
-differs or on an error, 2 on a usage error.
+(docs/proxy.md). A re-check covers the gate's policy: the policy map, each
+rule's outcome, its fixed values, and its rename. It does not cover the
+duplicate rule, the repeat window, max_pending, the refusal of a rejected or
+expired approval, or any call refused before the gate, and without
+-current-tools no change to a tool's schema or denied parameters. Exit
+status: 0 when every run re-checks the same and at least one decision was
+re-checked, 1 when any differs, when no run was found or no decision could
+be re-checked, or on an error, 2 on a usage error.
 
 What it does not do:
   - It governs only the calls that go through it. If the host gives the model
@@ -136,7 +142,8 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 // recheck re-checks recorded runs under the configuration's policy and
 // prints the reports, in text or JSON. It returns 0 when every run is the
-// same, 1 when any differs or on an error, and 2 on a usage error.
+// same and something was re-checked, 1 when any differs, when no run was
+// found or no decision re-checked, or on an error, and 2 on a usage error.
 func recheck(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agentrt-proxy recheck", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -173,11 +180,13 @@ func recheck(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, err)
 	}
-	differ := 0
+	differ, rechecked, skipped := 0, 0, 0
 	for _, r := range reps {
 		if !r.Same() {
 			differ++
 		}
+		rechecked += r.Rechecked()
+		skipped += r.NotRecheckable()
 	}
 	if *asJSON {
 		if reps == nil {
@@ -195,13 +204,32 @@ func recheck(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			}
 			fmt.Fprintln(stdout)
 		}
-		fmt.Fprintf(stdout, "%d run(s) re-checked under %s: %d differ\n", len(reps), trace.Sanitize(cfg.PolicyID()), differ)
+		fmt.Fprintf(stdout, "%d run(s) re-checked under %s: %d decision(s) re-checked, %d not re-checkable and skipped; %d run(s) differ\n",
+			len(reps), trace.Sanitize(cfg.PolicyID()), rechecked, skipped, differ)
+		fmt.Fprintln(stdout, recheckScope)
 	}
-	if differ > 0 {
+	switch {
+	case differ > 0:
+		return 1
+	case len(reps) == 0:
+		name := *session
+		if name == "" {
+			name = cfg.Session
+		}
+		fmt.Fprintf(stderr, "agentrt-proxy: recheck: no run of session %q was found, so nothing was re-checked\n", trace.Sanitize(name))
+		return 1
+	case rechecked == 0:
+		fmt.Fprintf(stderr, "agentrt-proxy: recheck: no decision of the policy was re-checked (%d not re-checkable)\n", skipped)
 		return 1
 	}
 	return 0
 }
+
+// recheckScope is what the summary says a re-check covers, as Usage and
+// docs/proxy.md say it.
+const recheckScope = "covered: the gate's policy (policy map, each rule's outcome, fixed values, rename); " +
+	"not covered: the duplicate rule, repeat window, max_pending, rejected or expired approvals, calls refused before the gate, " +
+	"and without -current-tools any schema or denied-parameter change"
 
 func fail(stderr io.Writer, err error) int {
 	fmt.Fprintln(stderr, "agentrt-proxy: error:", trace.Sanitize(err.Error()))

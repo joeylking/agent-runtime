@@ -257,11 +257,16 @@ func saveIf(ctx context.Context, c Cursor, seq int64, delivered bool) error {
 // as far as the follower delivered it, cut at 128 characters as
 // agentrt.Store.EventHash reads it. An operator keeps the pair where
 // whoever can write the database cannot reach, beside what the sink wrote,
-// and later checks it with agentrt.Store.VerifyEvents up to that Seq, or
-// agentrt verify -to: an intact chain whose event at Seq still has that
-// hash was not rewritten up to it. The hash covers every run's events up
-// to Seq, a follower of one run included, because the chain is the whole
-// database's. Head is zero and empty when nothing was delivered, or the
+// and later checks it with agentrt verify -head SEQ:HASH, which fails
+// unless the walk from the first event reaches Seq with no break and the
+// event at Seq still has that hash. In code the check is the same three
+// parts: agentrt.Store.VerifyEvents from the first event to at least Seq
+// with no Break, a To of at least Seq (a database cut before Seq verifies
+// intact up to where it ends), and the event at Seq's hash, the report's
+// Hash when To is Seq or EventHash otherwise, equal to the one kept. A
+// chain that passes was not rewritten up to Seq. The hash covers every
+// run's events up to Seq, a follower of one run included, because the
+// chain is the whole database's. Head is zero and empty when nothing was delivered, or the
 // Cursor is nil and so remembers nothing; agentrt.ErrNotFound means the
 // event the cursor names is no longer stored. It reads the cursor and one
 // row and changes nothing, and may be called while Follow runs, with a

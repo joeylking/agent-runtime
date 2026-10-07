@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -56,7 +57,8 @@ const (
 	RecheckNotEvaluation RecheckResult = "not_a_policy_evaluation"
 	// RecheckNotRecheckable is an evaluation the record cannot rebuild: one
 	// recorded before v0.5.0, which kept neither the spec nor the view,
-	// or one whose record is damaged or larger than a page carries.
+	// one whose record is damaged or larger than a page carries, or one
+	// whose policy failed, which recorded no evaluation to rebuild.
 	RecheckNotRecheckable RecheckResult = "not_recheckable"
 )
 
@@ -130,10 +132,20 @@ type RecheckReport struct {
 	Evaluations []RecheckedEvaluation `json:"evaluations"`
 }
 
-// Same reports whether no evaluation differs. An evaluation that was not
-// re-checked, because no policy made it or the record cannot rebuild it,
-// is not a difference; Rechecked says how many were.
+// Same reports whether no evaluation re-checked differs. An evaluation
+// that was not re-checked, because no policy made it or the record cannot
+// rebuild it, is not a difference, so a report that re-checked nothing is
+// the same: Rechecked says how many were, and Complete whether any was
+// left out. A gate wants all three.
 func (r RecheckReport) Same() bool { return r.Differences() == 0 }
+
+// Complete reports whether every evaluation listed was re-checked or is
+// not a policy evaluation: none is RecheckNotRecheckable. It does not say
+// that anything was re-checked; a run with no evaluation is complete.
+func (r RecheckReport) Complete() bool { return r.count(RecheckNotRecheckable) == 0 }
+
+// NotRecheckable is how many evaluations the record could not rebuild.
+func (r RecheckReport) NotRecheckable() int { return r.count(RecheckNotRecheckable) }
 
 // Differences is how many evaluations differ.
 func (r RecheckReport) Differences() int { return r.count(RecheckDifferent) }
@@ -152,8 +164,9 @@ func (r RecheckReport) count(res RecheckResult) int {
 	return n
 }
 
-// MarshalJSON writes the report's fields with same, differences, and
-// rechecked beside them, so a reader of the JSON need not count.
+// MarshalJSON writes the report's fields with same, differences,
+// rechecked, not_recheckable, and complete beside them, so a reader of
+// the JSON need not count.
 func (r RecheckReport) MarshalJSON() ([]byte, error) {
 	type fields RecheckReport
 	evals := r.Evaluations
@@ -164,14 +177,22 @@ func (r RecheckReport) MarshalJSON() ([]byte, error) {
 	f.Evaluations = evals
 	return json.Marshal(struct {
 		fields
-		Same        bool `json:"same"`
-		Differences int  `json:"differences"`
-		Rechecked   int  `json:"rechecked"`
-	}{f, r.Same(), r.Differences(), r.Rechecked()})
+		Same           bool `json:"same"`
+		Differences    int  `json:"differences"`
+		Rechecked      int  `json:"rechecked"`
+		NotRecheckable int  `json:"not_recheckable"`
+		Complete       bool `json:"complete"`
+	}{f, r.Same(), r.Differences(), r.Rechecked(), r.NotRecheckable(), r.Complete()})
 }
 
-// recheckPage is how many rows each read of a run's record takes.
-const recheckPage = 128
+// recheckPage is how many rows each read of a run's record takes, and
+// recheckApprovals how many of a run's approvals Recheck reads whole: an
+// evaluation whose view counted more is not re-checkable.
+const (
+	recheckPage       = 128
+	recheckApprovals  = 1024
+	policyErrorPrefix = "policy error: "
+)
 
 // Recheck replays each policy evaluation a run recorded through policy,
 // in the order they were written, and reports, evaluation by evaluation,
@@ -182,7 +203,9 @@ const recheckPage = 128
 //
 //   - the request: the run and step ids, the arguments as the step's
 //     decision recorded them, and the spec the event names (Store.ToolSpec),
-//     or the current spec when RecheckOptions.Tools is set;
+//     or the current spec when RecheckOptions.Tools is set, the arguments
+//     and the schema in PolicyJSON form, made from the stored bytes, which
+//     is the form the loop handed the policy from the agent's;
 //   - the run: its id, goal, limits, and creation time, which is its start
 //     time, from run.created, and its status, step count, model calls,
 //     tokens, estimated cost, and active time from the event's view; the
@@ -193,8 +216,8 @@ const recheckPage = 128
 //     the policy is asked and never written again, so it is what the
 //     policy saw;
 //   - the approvals: the run's first ones, as many as the view counted,
-//     each as stored but with the status it had when the event was
-//     written: the last approval.decided before the event, by seq, or
+//     each read whole and as stored but with the status it had when the
+//     event was written: the last approval.decided before the event, by seq, or
 //     pending, with no decision time, decider, or note, when there was
 //     none. An approval that has no approval.decided at all is judged by
 //     its stored decided_at against the event's time instead.
@@ -204,18 +227,29 @@ const recheckPage = 128
 // approval it asks for, computed as the runtime computes it, so a changed
 // capability or presentation differs although the outcome does not. The
 // reason is never compared. A policy error, or a decision whose capability
-// or presentation is not usable JSON, is a difference.
+// or presentation is not usable JSON, is a difference, unless the recorded
+// decision was refused as invalid for the same reason, with the same
+// outcome and kind: that is the same, with the reason in Detail.
 //
 // A step.policy written by a reconciliation's or an interrupted side
 // effect's pause is reported as not a policy evaluation, and one written
 // before v0.5.0, which recorded neither spec nor view, as not
-// re-checkable, as is one whose record the page reads cut. A run that is
-// not terminal is re-checked up to its current state, and a note says so.
-// Recheck writes nothing and reads no clock: it reads the run, its events,
-// steps, and approvals a page at a time, each text column capped at
-// MaxPageText, and each spec whole, as GetApproval reads an approval. It
-// returns ErrNotFound for a run the store does not have, and an error for a
-// policy whose identity NewDriver would refuse.
+// re-checkable, as is one whose record the page reads cut: a step.policy
+// event or a step longer than MaxPageText, which an approval's large
+// capability or presentation in the step.policy can make. A policy that
+// failed recorded no evaluation: its step is listed as not re-checkable,
+// "policy failed; no evaluation recorded", at the seq of its step.failed.
+// A gate's Allowed verdict that was never executed, an approved request
+// Attach let through whose grant then expired among them, recorded no
+// evaluation either, and leaves nothing to list beyond the step. A run
+// that is not terminal is re-checked up to its current state, and a note
+// says so. Recheck writes nothing and reads no clock: it reads the run, its
+// events and steps a page at a time, each text column capped at
+// MaxPageText; the approvals the views counted whole, as GetApproval reads
+// one, at most 1024 of them, an evaluation whose view counted more being
+// not re-checkable; and each spec whole. It returns ErrNotFound for a run
+// the store does not have, and an error for a policy whose identity
+// NewDriver would refuse.
 //
 // What it shows is limited by what the policy reads: a re-check under the
 // policy the run ran with differs only where that policy decides from
@@ -318,10 +352,18 @@ type rechecker struct {
 	steps     []Step
 	byID      map[string]int
 	approvals []Approval
+	// approvalCount is how many approvals the run has; approvals holds
+	// the first of them, as many as the views counted, at most
+	// recheckApprovals.
+	approvalCount int
 	// decided is each approval's approval.decided events, in seq order.
 	decided     map[string][]decidedEvent
 	evaluations []policyEvent
 	specs       map[string]specRead
+	// prev is the run's event before the one being read, and evaluated
+	// the steps a step.policy has been read for.
+	prev      Event
+	evaluated map[string]bool
 }
 
 type decidedEvent struct {
@@ -329,11 +371,21 @@ type decidedEvent struct {
 	status ApprovalStatus
 }
 
-// policyEvent is a step.policy event as Recheck reads it.
+// policyEvent is a step.policy event as Recheck reads it, or the
+// step.failed of a policy error, which wrote none.
 type policyEvent struct {
 	ev  Event
 	rec recordedPolicy
 	bad string
+	// invalid is why the runtime refused the recorded decision, from the
+	// step.failed written with it, empty when it did not.
+	invalid string
+	// failed is the error of a policy that failed and recorded no
+	// evaluation, and failedAgain whether an earlier evaluation of the
+	// step was read, so this one was on resume.
+	failed      string
+	isFailure   bool
+	failedAgain bool
 }
 
 // recordedPolicy is a step.policy payload: policyRecord as decoded, and the
@@ -382,14 +434,22 @@ func (rc *rechecker) read(ctx context.Context) error {
 			break
 		}
 	}
-	for offset := 0; ; offset += recheckPage {
-		page, total, err := rc.store.ListApprovalsPage(ctx, rc.runID, "", recheckPage, offset)
-		if err != nil {
-			return err
+	// The approvals the views counted are read whole, as GetApproval reads
+	// one: a policy saw each whole, and a decision is bound to all of it.
+	n, err := rc.store.count(ctx, `SELECT COUNT(*) FROM approvals WHERE run_id = ?`, rc.runID)
+	if err != nil {
+		return err
+	}
+	rc.approvalCount = n
+	need := 0
+	for _, pe := range rc.evaluations {
+		if v := pe.rec.View; v != nil && v.Approvals > need {
+			need = v.Approvals
 		}
-		rc.approvals = append(rc.approvals, page...)
-		if len(page) == 0 || offset+len(page) >= total {
-			break
+	}
+	if need = min(need, n, recheckApprovals); need > 0 {
+		if rc.approvals, err = rc.store.firstApprovals(ctx, rc.runID, need); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -397,6 +457,8 @@ func (rc *rechecker) read(ctx context.Context) error {
 
 // event keeps what Recheck needs of one event.
 func (rc *rechecker) event(e Event) {
+	prev := rc.prev
+	rc.prev = Event{Seq: e.Seq, StepID: e.StepID, Type: e.Type}
 	switch e.Type {
 	case EventRunCreated:
 		var c struct {
@@ -430,6 +492,27 @@ func (rc *rechecker) event(e Event) {
 		e.Payload = nil
 		pe.ev = e
 		rc.evaluations = append(rc.evaluations, pe)
+		if rc.evaluated == nil {
+			rc.evaluated = map[string]bool{}
+		}
+		rc.evaluated[e.StepID] = true
+	case EventStepFailed:
+		// A policy error fails the step with this detail. A decision the
+		// runtime refused wrote its step.policy just before, in the same
+		// transaction; a policy that failed wrote none.
+		var f struct {
+			Detail string `json:"detail"`
+		}
+		if json.Unmarshal(e.Payload, &f) != nil || !strings.HasPrefix(f.Detail, policyErrorPrefix) {
+			return
+		}
+		why := strings.TrimPrefix(f.Detail, policyErrorPrefix)
+		if prev.Type == EventStepPolicy && prev.StepID == e.StepID && len(rc.evaluations) > 0 {
+			rc.evaluations[len(rc.evaluations)-1].invalid = why
+			return
+		}
+		e.Payload = nil
+		rc.evaluations = append(rc.evaluations, policyEvent{ev: e, failed: why, isFailure: true, failedAgain: rc.evaluated[e.StepID]})
 	}
 }
 
@@ -458,6 +541,9 @@ func (rc *rechecker) recheck(ctx context.Context, pe policyEvent) (RecheckedEval
 		out.OnResume = rec.View.Status == StatusWaitingForApproval
 	}
 	switch {
+	case pe.isFailure:
+		out.OnResume, out.PolicyID = pe.failedAgain, step.PolicyID
+		return not(RecheckNotRecheckable, "policy failed; no evaluation recorded: "+pe.failed)
 	case pe.bad != "":
 		return cannot(pe.bad)
 	case rec.View == nil && rec.SpecHash == "":
@@ -478,8 +564,11 @@ func (rc *rechecker) recheck(ctx context.Context, pe policyEvent) (RecheckedEval
 		return cannot("its run.created is missing or longer than MaxPageText")
 	}
 	v := rec.View
-	if v.Steps < 0 || v.Steps > len(rc.steps) || v.Approvals < 0 || v.Approvals > len(rc.approvals) {
-		return cannot(fmt.Sprintf("the view counted %d steps and %d approvals; the run has %d and %d", v.Steps, v.Approvals, len(rc.steps), len(rc.approvals)))
+	if v.Steps < 0 || v.Steps > len(rc.steps) || v.Approvals < 0 || v.Approvals > rc.approvalCount {
+		return cannot(fmt.Sprintf("the view counted %d steps and %d approvals; the run has %d and %d", v.Steps, v.Approvals, len(rc.steps), rc.approvalCount))
+	}
+	if v.Approvals > len(rc.approvals) {
+		return cannot(fmt.Sprintf("the view counted %d approvals, more than the %d Recheck reads whole", v.Approvals, recheckApprovals))
 	}
 	view := RunView{Run: Run{ID: rc.runID, Goal: rc.created.goal, Status: v.Status, Limits: rc.created.limits, StepCount: v.StepCount,
 		CreatedAt: rc.created.at, StartedAt: rc.created.at, ModelCalls: v.ModelCalls,
@@ -529,9 +618,14 @@ func (rc *rechecker) recheck(ctx context.Context, pe policyEvent) (RecheckedEval
 			return out, nil
 		}
 	}
-	req.Args, req.Spec.InputSchema = cloneBytes(req.Args), cloneBytes(req.Spec.InputSchema)
+	// The policy is handed what the loop handed it: the arguments and the
+	// schema in PolicyJSON form, made here from the stored, escaped bytes.
+	handed, herr := policyRequest(req)
+	if herr != nil {
+		return cannot("the request does not encode for the policy: " + herr.Error())
+	}
 
-	pd, perr := rc.policy.Evaluate(ctx, req, view)
+	pd, perr := rc.policy.Evaluate(ctx, handed, view)
 	if cerr := ctx.Err(); cerr != nil {
 		return out, cerr
 	}
@@ -541,8 +635,18 @@ func (rc *rechecker) recheck(ctx context.Context, pe policyEvent) (RecheckedEval
 	}
 	pd.Capability, pd.Presentation = nonEmpty(pd.Capability), nonEmpty(pd.Presentation)
 	out.Rechecked = &pd
-	if cerr := checkPolicy(pd); cerr != nil {
+	cerr := checkPolicy(pd)
+	switch {
+	case cerr != nil && pe.invalid != "" && cerr.Error() == pe.invalid && pd.Outcome == rec.Outcome && pd.Kind == rec.Kind:
+		// The runtime refused the recorded decision for this reason, and
+		// would refuse this one for the same.
+		out.Result, out.Detail = RecheckSame, "an invalid decision, refused as recorded: "+cerr.Error()
+		return out, nil
+	case cerr != nil:
 		out.Result, out.Detail = RecheckDifferent, "policy returned an invalid decision: "+cerr.Error()
+		return out, nil
+	case pe.invalid != "":
+		out.Result, out.Detail = RecheckDifferent, "the recorded decision was refused as invalid ("+pe.invalid+"); the policy now returns a valid one"
 		return out, nil
 	}
 	out.Result = RecheckSame

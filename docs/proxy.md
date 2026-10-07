@@ -637,8 +637,19 @@ check and the pin included, and hands each request its tool's spec as
 loaded now, so a description reworded since makes each approval asked for
 that tool another approval; without it each request carries the spec it
 recorded, and the policy's tools are named and classified from the rules.
-`-json` prints the reports as one JSON array. It exits 0 when every run is
-the same, 1 when any differs or on an error, and 2 on a usage error.
+`-json` prints the reports as one JSON array. The text output ends with a
+summary of how many runs and decisions were re-checked, how many decisions
+were not re-checkable and skipped, and how many runs differ, and a line
+saying what the re-check covers: the gate's policy, which is the `policy`
+map, each rule's `outcome`, its `fixed` values, and its `rename`. It does
+not cover the duplicate rule, the repeat window, `max_pending`, the refusal
+of a rejected or expired approval, or any call refused before the gate, and
+without `-current-tools` no change to a tool's schema or denied parameters.
+It exits 0 when every run is the same and at least one decision was
+re-checked; 1 when any differs, when no run was found (a mistyped
+`-session` finds none), when no decision could be re-checked (every one
+recorded before v0.5.0, or met a policy error), or on an error; and 2 on a
+usage error.
 
 Every decision the proxy's policy makes records the policy's identity,
 `agentrt-proxy/sha256:` and the hex SHA-256 of the canonical JSON of the

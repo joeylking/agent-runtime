@@ -23,6 +23,25 @@ Start(goal, limits)
        terminal tool succeeded → run COMPLETED with its result
 ```
 
+The policy is handed the request's arguments and its tool's input schema
+in one form, `PolicyJSON`: object keys sorted, no insignificant
+whitespace, every number as its literal was written, and strings escaped
+only as JSON requires, so `&`, `<`, `>`, U+2028, and U+2029 stay as they
+are. The loop and a gate's `Propose` make it from what the agent wrote and
+the schema the tool registered; `Resume` and a gate's `Attach` from the
+approval's stored request, which is compacted and HTML-escaped, and the
+schema registered now; a re-check from the stored decision and spec. Each
+gives the same bytes for one request, so a policy that matches bytes, as
+one denying `&&` in an argument, decides alike in the loop, on resume, and
+on a re-check, and one that unmarshals sees what the agent and the tool
+gave. The tool is called with the arguments as the agent wrote them, and
+approval and content hashes are over the canonical form, which escapes
+HTML and is the same for every one of these forms; a policy that copies
+the arguments into its capability or presentation, as `DefaultPolicy`
+does, copies them in the policy form. A reconciliation's or an interrupted side effect's
+pause asks no policy; its request reaches the policy on the resume that
+follows, in the same form.
+
 Every state change is written in the same SQLite transaction as its audit
 event, and the observer sees events only after commit. The tables are the
 state; the events are the explanation. Nothing is reconstructed by replay.
@@ -120,7 +139,15 @@ approved and resumed has two, the second marked on resume. What is rebuilt:
   in the canonical form it is stored in. `RecheckOptions.Tools` hands the
   current spec of each tool instead, by name, and checks the arguments
   against its schema first, so the question becomes whether today's policy
-  with today's tools would have decided the same;
+  with today's tools would have decided the same. Storing a spec
+  canonicalises its schema: keys sorted, insignificant whitespace dropped
+  (a pretty-printed schema is stored compact), `<`, `>`, and `&` escaped
+  as `\u003c`, `\u003e`, and `\u0026`, and a key given twice kept once,
+  with its last value, as `encoding/json` decodes it. The arguments are
+  stored compacted and escaped the same way. The policy is handed neither
+  stored form: a re-check makes the `PolicyJSON` form of each, as the loop
+  made it from the agent's arguments and the registered schema, and the
+  two are the same bytes, so a policy that reads the bytes answers alike;
 - the run: id, goal, limits, and creation time, which is also its start,
   from `run.created`, and the rest from the event's `view`; reason, detail,
   finish time, and result are empty, as they are whenever a policy is
@@ -128,8 +155,11 @@ approved and resumed has two, the second marked on resume. What is rebuilt:
 - the steps: the run's first ones, as many as the view counted, as stored
   now. A step before the one evaluated was finished before the policy was
   asked and is never written again, so it is what the policy saw;
-- the approvals: the run's first ones, as many as the view counted, as
-  stored but with the status each had when the event was written, which is
+- the approvals: the run's first ones, as many as the view counted, each
+  read whole as `GetApproval` reads one, because the policy saw each whole
+  and a decision is bound to all of it, at most 1024 of them (an
+  evaluation whose view counted more is not re-checkable), as stored but
+  with the status each had when the event was written, which is
   the status of its last `approval.decided` before the event by seq, or
   pending, with no decision time, decider, or note, when there was none.
   Seq, not time, decides, because a decision stamped by an operator's wall
@@ -143,28 +173,50 @@ asks for, computed by the runtime's own function over the recorded request
 on one side and the re-checked request on the other, so a changed
 capability, presentation, or current spec differs although the outcome
 does not. The reason is reported and never a difference. A policy error,
-or a decision that is not usable JSON, is a difference. The report
+or a decision that is not usable JSON, is a difference, unless the
+recorded decision was refused as invalid for the same reason with the same
+outcome and kind: that is the same, with the reason beside it, and a
+recorded decision refused as invalid that the policy now returns valid is
+a difference. The report
 (`RecheckReport`) gives each evaluation's step, seq, tool, recorded and
 re-checked decisions, the spec source, and the recorded `policy_id`, and
 compares those identities with the policy's own: unknown when either side
-has none, changed when both do and differ. `trace.WriteRecheck` renders it
-one sanitized line per evaluation, differences first; its `MarshalJSON`
-adds `same`, `differences`, and `rechecked`. The `testkit` checks a
+has none, changed when both do and differ. `Same` says no evaluation
+re-checked differs, which a report that re-checked nothing also is;
+`Rechecked` counts the evaluations re-checked and `Complete` says none was
+left out as not re-checkable, so a gate wants all three.
+`trace.WriteRecheck` renders it one sanitized line per evaluation,
+differences first; its `MarshalJSON` adds `same`, `differences`,
+`rechecked`, `not_recheckable`, and `complete`. The `testkit` checks a
 scenario's policy with it (`Scenario.Recheck`, `testkit.Recheck`,
-`testkit.RecheckDiffers`), and `agentrt-proxy recheck` re-checks a
-session's calls under the configuration's policy now.
+`testkit.RecheckDiffers`), failing a re-check that differs, that
+re-checked nothing, or that left an evaluation out; `testkit.RecheckPartial`
+accepts the last two for a run the record cannot rebuild whole.
+`agentrt-proxy recheck` re-checks a session's calls under the
+configuration's policy now, and exits 1 when no run was found or nothing
+was re-checked.
 
 What cannot be rebuilt is reported, not guessed. A `step.policy` written by
 a reconciliation's or an interrupted side effect's pause is not a policy
 evaluation. One written before v0.5.0 recorded neither spec nor view and is
 not re-checkable, and a run created then says so; an evaluation made after
 the migration, as the resume of a run left waiting, is re-checked. A
-record the page reads cut, a `step.policy`, a step, or an approval longer
-than `MaxPageText`, is not re-checkable either: a policy never saw a cut
-value. A policy error the original run met wrote no `step.policy` and is
-not listed. A run not yet terminal is re-checked up to its current state.
-Recheck reads a page at a time, each spec whole, writes nothing, and reads
-no clock.
+record the page reads cut, a `step.policy` or a step longer than
+`MaxPageText`, is not re-checkable either: a policy never saw a cut value.
+A `step.policy` carries the decision's capability and presentation, so an
+approval that asks for one larger than `MaxPageText` leaves the evaluation
+that asked for it not re-checkable; the evaluations after it, which see
+that approval whole, are re-checked.
+A policy error the original run met wrote no `step.policy`: it is listed
+at the seq of its `step.failed` as not re-checkable, "policy failed; no
+evaluation recorded", with the error. A gate's `Allowed` verdict that was
+never executed, an approved request `Attach` let through whose `GrantTTL`
+then ran out among them, wrote no evaluation either, because the
+`step.policy` of an allowed request commits with its tool start, and
+leaves nothing beyond its step. A run not yet terminal is re-checked up to
+its current state. Recheck reads the events and steps a page at a time,
+the approvals and specs it needs whole, writes nothing, and reads no
+clock.
 
 What it shows is bounded by what the policy reads. A policy that decides
 from what it is handed alone answers the same again, so a re-check under
@@ -525,14 +577,20 @@ process or several, extend one chain; a rolled-back write leaves no gap.
 field in bounded chunks, and reports the first event whose stored hash is
 not the one its fields and its predecessor's hash give, or whose seq does
 not follow its predecessor's; `ChainHead` and `EventHash` read the head and
-any event's hash, and `agentrt verify` prints both. The `Event` a consumer
-receives has no hash field, so a trace is byte for byte what it was.
+any event's hash. `agentrt verify` prints the head and the seq and hash of
+the last event it checked, fails a `-to` the chain does not reach, and with
+`-head SEQ:HASH`, a head kept from an earlier check or from
+`export.Follower.Head`, fails unless the walk reaches that seq with no
+break and its event still has that hash. The `Event` a consumer receives
+has no hash field, so a trace is byte for byte what it was.
 
 What the chain proves is limited. Whoever can write the database can
 recompute every hash after a row they changed, so an intact chain shows the
 record unaltered only up to a head compared with one kept where that writer
 cannot reach; a chain cut at its end verifies on its own, and only such a
-kept head shows it is short. Within the file it catches corruption and an
+kept head shows it is short: `VerifyEvents` from the first event with no
+break, a `To` at or past the kept seq, and that event's hash equal to the
+kept one, which is what `agentrt verify -head` checks. Within the file it catches corruption and an
 event altered, deleted, or reordered by anything that did not rewrite the
 chain after it. The events stored before migration 6 carry no claim beyond
 the backfill: their hashes say what they held when the migration ran, not

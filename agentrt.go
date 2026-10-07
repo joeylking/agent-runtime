@@ -376,7 +376,16 @@ type PolicyDecision struct {
 	Presentation json.RawMessage `json:"presentation,omitempty"`
 }
 
-// ToolRequest is a schema-validated request handed to the policy.
+// ToolRequest is a schema-validated request handed to the policy. As the
+// policy is handed it, on every path (the loop, a Gate's Propose and
+// Attach, Resume, and Recheck), Args and Spec.InputSchema are in PolicyJSON
+// form: keys sorted, no insignificant whitespace, numbers as written, and
+// strings escaped only as JSON requires, the same bytes whether made from
+// what the agent wrote or from what the runtime stored. The request a tool
+// is called with, an Allowed Verdict carries, and an approval stores keeps
+// the arguments as the agent wrote them, the approval's compacted and
+// HTML-escaped as it is stored; its hash is over the canonical form, which
+// is the same for all of them.
 type ToolRequest struct {
 	RunID  string          `json:"run_id"`
 	StepID string          `json:"step_id"`
@@ -426,7 +435,12 @@ type Approval struct {
 }
 
 // Policy decides whether a validated tool request may execute. It is evaluated
-// by the runtime and the agent has no influence over it.
+// by the runtime and the agent has no influence over it. The request's
+// arguments and its tool's input schema are handed in PolicyJSON form, the
+// same bytes in the loop, on resume, and on a re-check, so a policy that
+// reads those bytes, matching "&&" in an argument, say, decides alike on
+// each. A policy that unmarshals them sees what the agent and the tool
+// gave.
 type Policy interface {
 	Evaluate(ctx context.Context, req ToolRequest, view RunView) (PolicyDecision, error)
 }

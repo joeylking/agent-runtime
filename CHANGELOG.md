@@ -45,9 +45,19 @@ entry names a specific module only when the change is not in the core.
   field, so traces are unchanged. The chain proves integrity only against a
   head kept where whoever can write the database cannot reach: such a
   writer can recompute it.
-- **`agentrt verify [-from N] [-to N]`** prints the chain's head and
-  "intact" or the first break, in text or JSON, exiting 1 on a break. It
-  opens the database read-only and reads a page at a time.
+- **`agentrt verify [-from N] [-to N] [-head SEQ:HASH]`** prints the
+  chain's head and "intact" with the seq and hash of the last event
+  checked, or the first break, in text or JSON, exiting 1 on a break. A
+  `-to` the chain does not reach fails, and `-head`, a head kept from an
+  earlier check or from `export.Follower.Head`, fails unless the walk
+  reaches that seq with no break and its event still has that hash: a
+  chain cut at its end verifies on its own, and only a kept head shows it.
+  It opens the database read-only and reads a page at a time.
+- **`PolicyJSON(raw)`** returns the form of a JSON value a policy is
+  handed: object keys sorted, no insignificant whitespace, numbers' literal
+  text kept, and strings escaped only as JSON requires, with no HTML
+  escaping. It refuses what `CanonicalJSON` refuses, and two values with
+  the same canonical form have the same `PolicyJSON`.
 - `export/otel` maps `step.policy`'s `policy_id` and `spec_hash` to
   `agentrt.policy.id` and `agentrt.policy.spec_hash`.
 - **`Recheck(ctx, store, runID, policy, opts)`** replays each policy
@@ -60,23 +70,31 @@ entry names a specific module only when the change is not in the core.
   had when the event was written, by the seq of its `approval.decided`.
   `RecheckReport` lists each evaluation as `same`, `different` (outcome, or
   for `require_approval` the approval kind or hash; a policy error; never
-  the reason), `not_a_policy_evaluation` (a reconciliation's or an
+  the reason; a decision refused as invalid again for the reason recorded
+  is the same), `not_a_policy_evaluation` (a reconciliation's or an
   interrupted side effect's pause), or `not_recheckable` (recorded before
-  v0.5.0, or cut by the page reads), with the spec source and the recorded
-  identity against the policy's (`IdentityUnknown`, `IdentityChanged`,
-  `IdentityUnchanged`); `Same`, `Differences`, `Rechecked`, and a
+  v0.5.0, cut by the page reads, or a policy error, which recorded no
+  evaluation and is listed at its `step.failed`), with the spec source and
+  the recorded identity against the policy's (`IdentityUnknown`,
+  `IdentityChanged`, `IdentityUnchanged`); `Same`, `Differences`,
+  `Rechecked`, `NotRecheckable`, `Complete` (no evaluation left out), and a
   `MarshalJSON` that adds them. A run not terminal is re-checked up to its
-  current state, with a note. It writes nothing, reads a page at a time,
-  and reads no clock.
+  current state, with a note. It writes nothing, reads the events and
+  steps a page at a time and the approvals the views counted whole, at most
+  1024, and reads no clock.
 - **`trace.WriteRecheck`** renders a report as text, one sanitized line per
   evaluation, differences first.
 - **`testkit.Recheck` and `testkit.RecheckDiffers`** re-check a run under a
   policy and fail the test on any difference, or unless exactly the steps
-  named differ; `Scenario.Recheck` re-checks the scenario's run under its
-  own policy after it runs, which a policy reading outside state fails.
+  named differ, and when nothing was re-checked or any evaluation is not
+  re-checkable; `testkit.RecheckPartial` accepts those two for a run the
+  record cannot rebuild whole. `Scenario.Recheck` re-checks the scenario's
+  run under its own policy after it runs, which a policy reading outside
+  state fails.
 - **`export.Follower.Head`** returns the seq the follower delivered up to,
   as its cursor saved it, and that event's stored hash, for an operator to
-  keep as an anchor of the chain. The JSON Lines record is unchanged.
+  keep as an anchor of the chain and check with `agentrt verify -head`. The
+  JSON Lines record is unchanged.
 - `examples/recheck` runs a scripted agent under a lenient policy, re-checks
   the run under a stricter one, which names the step it would have stopped,
   and alters one event in a copy of the database for the chain check to
@@ -86,8 +104,14 @@ entry names a specific module only when the change is not in the core.
 - proxy: **`agentrt-proxy recheck -config X [-run ID | -session NAME]
   [-limit N] [-current-tools] [-json]`** re-checks recorded calls under the
   policy the configuration gives the proxy now (`proxy.Recheck`), exiting 0
-  when every run is the same, 1 when any differs or on an error, 2 on a
-  usage error. It opens the database read-only; `-current-tools` loads the
+  when every run is the same and at least one decision was re-checked, 1
+  when any differs, when no run was found or nothing was re-checked, or on
+  an error, 2 on a usage error. Its summary counts the decisions re-checked
+  and those skipped as not re-checkable, and says what a re-check covers
+  (the gate's policy) and what it does not (the duplicate rule, repeat
+  window, `max_pending`, rejected or expired approvals, calls refused
+  before the gate, and without `-current-tools` schema and denied-parameter
+  changes). It opens the database read-only; `-current-tools` loads the
   pinned tools and uses their specs as loaded now. A re-run of an attempt
   whose outcome is unknown, which the proxy names only in memory, is read
   back from the interruption approval it asked for.
@@ -99,6 +123,25 @@ entry names a specific module only when the change is not in the core.
 
 ### Changed
 
+- **A policy now receives the request's arguments and its tool's input
+  schema in `PolicyJSON` form** (keys sorted, no insignificant whitespace,
+  numbers as written, no HTML escaping), on every path: the loop, a gate's
+  `Propose` and `Attach`, `Resume`, and `Recheck`. Before, the loop handed
+  the agent's raw bytes and the schema as registered, while a resume handed
+  the stored request, compacted and HTML-escaped (`&` as `\u0026`), and a
+  re-check the stored, canonical forms; so one request reached a policy as
+  different bytes, and a policy that matched bytes, denying `&&` say, could
+  decide one way live and another on resume, or be reported the same on a
+  re-check for a call it would deny. A policy that unmarshals the
+  arguments and the schema is unaffected. One that byte-matched
+  whitespace, key order, or HTML escapes would notice. A policy that puts
+  the arguments in its approval's capability or presentation, as
+  `DefaultPolicy` does, now puts them there in that form, so the stored
+  capability and presentation, and the approval prompt, list the
+  arguments' keys sorted; the approval's hash, over the canonical form, is
+  unchanged. What the agent proposed and the decision stored, the
+  arguments a tool is called with and an Allowed verdict carries, approval
+  and content hashes, loop detection, and clock readings are unchanged.
 - **Migration 6.** The first open by this version adds `tool_specs`,
   `steps.spec_hash` and `steps.policy_id`, and `events.hash`, and computes
   the hash of every event already stored, in seq order, in the migration's
@@ -114,6 +157,9 @@ entry names a specific module only when the change is not in the core.
 - `run.created` and `step.policy` payloads gain the fields above; every
   other payload, every event type and its order, and the content and
   approval hashes are unchanged.
+- The view a policy is handed on resuming the run's first step has `Steps`
+  nil, as the loop's view and a re-check's have when there are no steps
+  before, rather than an empty slice.
 
 ## [v0.4.0] - 2026-10-05
 

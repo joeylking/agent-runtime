@@ -280,9 +280,14 @@ func TestRecheck_PolicyErrorAndRunNotTerminal(t *testing.T) {
 }
 
 // sameView fails unless got, what a policy was handed in a re-check, is
-// field by field what want, handed it in the run, held.
+// field by field what want, handed it in the run, held. No steps or no
+// approvals is nil on both sides, never an empty slice on one: a policy
+// that encodes its view sees null either way.
 func sameView(t *testing.T, i int, got, want agentrt.RunView) {
 	t.Helper()
+	if (got.Steps == nil) != (want.Steps == nil) || (got.Approvals == nil) != (want.Approvals == nil) {
+		t.Fatalf("evaluation %d: steps nil %v and approvals nil %v, the policy saw %v and %v", i, got.Steps == nil, got.Approvals == nil, want.Steps == nil, want.Approvals == nil)
+	}
 	g, w := got.Run, want.Run
 	if !g.CreatedAt.Equal(w.CreatedAt) || !g.StartedAt.Equal(w.StartedAt) {
 		t.Fatalf("evaluation %d: times %v %v, the policy saw %v %v", i, g.CreatedAt, g.StartedAt, w.CreatedAt, w.StartedAt)
@@ -453,7 +458,7 @@ same      step 1 seq 10 wipe: deny
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantJSON = `{"run_id":"id-01","run_status":"COMPLETED","policy_id":"strict/v1","identity":"changed","spec_source":"recorded","evaluations":[{"step_index":0,"step_id":"id-02","seq":5,"tool":"read","result":"same","recorded":{"outcome":"allow","reason":"side effect read_only is allow by policy"},"rechecked":{"outcome":"allow","reason":"side effect read_only is allow by policy"},"spec_source":"recorded","policy_id":"default/v1"},{"step_index":1,"step_id":"id-03","seq":10,"tool":"wipe","result":"same","recorded":{"outcome":"deny","reason":"side effect destructive is deny by policy"},"rechecked":{"outcome":"deny","reason":"side effect destructive is deny by policy"},"spec_source":"recorded","policy_id":"default/v1"},{"step_index":2,"step_id":"id-04","seq":14,"tool":"publish","result":"different","recorded":{"outcome":"require_approval","reason":"side effect remote_mutation is require_approval by policy","kind":"remote_mutation","capability":{"args":{"n":3},"tool":"publish"},"presentation":{"args":{"n":3},"tool":"publish"}},"rechecked":{"outcome":"deny","reason":"side effect remote_mutation is deny by policy"},"recorded_hash":"d93da328f90c100de532004da432ba577ae799ed30a607eb87bed7e3b6bf73e0","spec_source":"recorded","policy_id":"default/v1"},{"step_index":2,"step_id":"id-04","seq":18,"tool":"publish","on_resume":true,"result":"different","recorded":{"outcome":"require_approval","reason":"side effect remote_mutation is require_approval by policy","kind":"remote_mutation","capability":{"args":{"n":3},"tool":"publish"},"presentation":{"args":{"n":3},"tool":"publish"}},"rechecked":{"outcome":"deny","reason":"side effect remote_mutation is deny by policy"},"recorded_hash":"d93da328f90c100de532004da432ba577ae799ed30a607eb87bed7e3b6bf73e0","spec_source":"recorded","policy_id":"default/v1"},{"step_index":3,"step_id":"id-06","seq":23,"tool":"write","result":"different","recorded":{"outcome":"allow","reason":"side effect local_mutation is allow by policy"},"rechecked":{"outcome":"deny","reason":"side effect local_mutation is deny by policy"},"spec_source":"recorded","policy_id":"default/v1"}],"same":false,"differences":3,"rechecked":5}`
+	const wantJSON = `{"run_id":"id-01","run_status":"COMPLETED","policy_id":"strict/v1","identity":"changed","spec_source":"recorded","evaluations":[{"step_index":0,"step_id":"id-02","seq":5,"tool":"read","result":"same","recorded":{"outcome":"allow","reason":"side effect read_only is allow by policy"},"rechecked":{"outcome":"allow","reason":"side effect read_only is allow by policy"},"spec_source":"recorded","policy_id":"default/v1"},{"step_index":1,"step_id":"id-03","seq":10,"tool":"wipe","result":"same","recorded":{"outcome":"deny","reason":"side effect destructive is deny by policy"},"rechecked":{"outcome":"deny","reason":"side effect destructive is deny by policy"},"spec_source":"recorded","policy_id":"default/v1"},{"step_index":2,"step_id":"id-04","seq":14,"tool":"publish","result":"different","recorded":{"outcome":"require_approval","reason":"side effect remote_mutation is require_approval by policy","kind":"remote_mutation","capability":{"args":{"n":3},"tool":"publish"},"presentation":{"args":{"n":3},"tool":"publish"}},"rechecked":{"outcome":"deny","reason":"side effect remote_mutation is deny by policy"},"recorded_hash":"d93da328f90c100de532004da432ba577ae799ed30a607eb87bed7e3b6bf73e0","spec_source":"recorded","policy_id":"default/v1"},{"step_index":2,"step_id":"id-04","seq":18,"tool":"publish","on_resume":true,"result":"different","recorded":{"outcome":"require_approval","reason":"side effect remote_mutation is require_approval by policy","kind":"remote_mutation","capability":{"args":{"n":3},"tool":"publish"},"presentation":{"args":{"n":3},"tool":"publish"}},"rechecked":{"outcome":"deny","reason":"side effect remote_mutation is deny by policy"},"recorded_hash":"d93da328f90c100de532004da432ba577ae799ed30a607eb87bed7e3b6bf73e0","spec_source":"recorded","policy_id":"default/v1"},{"step_index":3,"step_id":"id-06","seq":23,"tool":"write","result":"different","recorded":{"outcome":"allow","reason":"side effect local_mutation is allow by policy"},"rechecked":{"outcome":"deny","reason":"side effect local_mutation is deny by policy"},"spec_source":"recorded","policy_id":"default/v1"}],"same":false,"differences":3,"rechecked":5,"not_recheckable":0,"complete":true}`
 	if string(raw) != wantJSON {
 		t.Fatalf("JSON:\n%s\nwant:\n%s", raw, wantJSON)
 	}
@@ -464,5 +469,242 @@ same      step 1 seq 10 wipe: deny
 func TestSideEffectPolicy_IsNotIdentified(t *testing.T) {
 	if _, ok := any(agentrt.DefaultPolicy()).(agentrt.IdentifiedPolicy); ok {
 		t.Fatal("SideEffectPolicy implements IdentifiedPolicy")
+	}
+}
+
+// approveAndResume approves the run's latest approval and resumes it.
+func approveAndResume(t *testing.T, d *agentrt.Driver, st *agentrt.Store, run agentrt.Run, by string) agentrt.Run {
+	t.Helper()
+	ctx := context.Background()
+	approvals, err := st.ListApprovals(ctx, run.ID)
+	if err != nil || len(approvals) == 0 {
+		t.Fatalf("approvals: %v %v", approvals, err)
+	}
+	if err := d.Approve(ctx, run.ID, approvals[len(approvals)-1].ID, by, ""); err != nil {
+		t.Fatal(err)
+	}
+	if run, err = d.Resume(ctx, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	return run
+}
+
+// An approval whose capability is longer than MaxPageText is handed to
+// the re-checked policy whole, as the policy saw it: a policy that allows
+// a read only under a grant carrying the whole capability decides the
+// same again, rather than denying it for a capability a page read cut.
+func TestRecheck_ApprovalLongerThanAPageIsReadWhole(t *testing.T) {
+	blob := strings.Repeat("x", agentrt.MaxPageText+100)
+	grant, _ := json.Marshal(map[string]string{"blob": blob})
+	p := namedPolicy{agentrt.PolicyFunc(func(_ context.Context, req agentrt.ToolRequest, view agentrt.RunView) (agentrt.PolicyDecision, error) {
+		for _, a := range view.Approvals {
+			if a.Status != agentrt.ApprovalApproved {
+				continue
+			}
+			if req.Spec.Name == "publish" && a.StepID == req.StepID {
+				return agentrt.PolicyDecision{Outcome: agentrt.Allow}, nil
+			}
+			var c struct{ Blob string }
+			if req.Spec.Name == "read" && json.Unmarshal(a.Capability, &c) == nil && c.Blob == blob {
+				return agentrt.PolicyDecision{Outcome: agentrt.Allow}, nil
+			}
+		}
+		if req.Spec.Name == "publish" {
+			return agentrt.PolicyDecision{Outcome: agentrt.RequireApproval, Kind: "grant", Capability: grant}, nil
+		}
+		return agentrt.PolicyDecision{Outcome: agentrt.Deny, Reason: "no grant"}, nil
+	}), "grant/v1"}
+	st, err := agentrt.OpenStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	d, err := agentrt.NewDriver(agentrt.Config{Store: st, Policy: p, Now: tick(), NewID: numbered(), Tools: recheckTools(),
+		Agent: &scripted.Agent{Decisions: []agentrt.Decision{scripted.ToolCall("publish", `{"n":1}`, ""), scripted.ToolCall("read", `{"n":2}`, ""), scripted.Complete(`{}`)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := d.Start(context.Background(), "publish", limits(10, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run = approveAndResume(t, d, st, run, "op")
+	requireStatus(t, run, agentrt.StatusCompleted, agentrt.ReasonGoalCompleted)
+	steps, _ := st.ListSteps(context.Background(), run.ID)
+	if steps[1].Policy == nil || steps[1].Policy.Outcome != agentrt.Allow {
+		t.Fatalf("the read was not allowed under the grant: %+v", steps[1].Policy)
+	}
+	rep := recheck(t, st, run.ID, p, agentrt.RecheckOptions{})
+	requireLines(t, rep,
+		"0 publish not_recheckable ->-",
+		"0 publish same allow->allow resume",
+		"1 read same allow->allow",
+	)
+	if !rep.Same() || rep.Complete() {
+		t.Fatalf("same %v complete %v", rep.Same(), rep.Complete())
+	}
+	// The first evaluation's own step.policy carries the capability and is
+	// longer than a page carries: that one cannot be rebuilt.
+	if e := rep.Evaluations[0]; e.Detail != "not re-checkable: its step.policy is longer than MaxPageText" {
+		t.Fatalf("detail %q", e.Detail)
+	}
+}
+
+// A policy that failed recorded no evaluation, in the loop or on resume,
+// and the re-check lists each as not re-checkable at its step.failed
+// rather than leaving it out; the report is not complete.
+func TestRecheck_PolicyErrorIsListed(t *testing.T) {
+	ctx := context.Background()
+	calls := 0
+	p := namedPolicy{agentrt.PolicyFunc(func(_ context.Context, req agentrt.ToolRequest, view agentrt.RunView) (agentrt.PolicyDecision, error) {
+		calls++
+		switch {
+		case req.Spec.Name == "read" && calls == 1:
+			return agentrt.PolicyDecision{}, errors.New("rules unavailable")
+		case req.Spec.Name == "publish" && view.Run.Status == agentrt.StatusWaitingForApproval:
+			return agentrt.PolicyDecision{}, errors.New("rules gone")
+		}
+		return agentrt.DefaultPolicy().Evaluate(ctx, req, view)
+	}), "flaky/v1"}
+
+	st, err := agentrt.OpenStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	d, err := agentrt.NewDriver(agentrt.Config{Store: st, Policy: p, Now: tick(), NewID: numbered(), Tools: recheckTools(),
+		Agent: &scripted.Agent{Decisions: []agentrt.Decision{scripted.ToolCall("read", `{"n":2}`, "")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := d.Start(ctx, "read", limits(10, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireStatus(t, run, agentrt.StatusFailed, agentrt.ReasonInternalError)
+	rep := recheck(t, st, run.ID, agentrt.DefaultPolicy(), agentrt.RecheckOptions{})
+	requireLines(t, rep, "0 read not_recheckable ->-")
+	if e := rep.Evaluations[0]; e.Detail != "policy failed; no evaluation recorded: rules unavailable" || e.PolicyID != "flaky/v1" || e.Seq == 0 {
+		t.Fatalf("evaluation %+v", e)
+	}
+	if rep.Complete() || rep.Rechecked() != 0 || !rep.Same() {
+		t.Fatalf("complete %v rechecked %d", rep.Complete(), rep.Rechecked())
+	}
+
+	st, err = agentrt.OpenStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	calls = 0
+	d2, err := agentrt.NewDriver(agentrt.Config{Store: st, Policy: p, Now: tick(), NewID: numbered(), Tools: recheckTools(),
+		Agent: &scripted.Agent{Decisions: []agentrt.Decision{scripted.ToolCall("publish", `{"n":1}`, "")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err = d2.Start(ctx, "publish", limits(10, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run = approveAndResume(t, d2, st, run, "op")
+	requireStatus(t, run, agentrt.StatusFailed, agentrt.ReasonInternalError)
+	rep = recheck(t, st, run.ID, agentrt.DefaultPolicy(), agentrt.RecheckOptions{})
+	requireLines(t, rep,
+		"0 publish same require_approval->require_approval",
+		"0 publish not_recheckable ->- resume",
+	)
+	if rep.Evaluations[1].Detail != "policy failed; no evaluation recorded: rules gone" || rep.Complete() {
+		t.Fatalf("report %+v", rep)
+	}
+}
+
+// A decision the runtime refused as invalid, re-checked under a policy
+// that returns it again, is the same, with why it was refused; under a
+// policy that now returns a valid decision it differs.
+func TestRecheck_InvalidDecisionRefusedAlikeIsSame(t *testing.T) {
+	invalid := namedPolicy{agentrt.PolicyFunc(func(context.Context, agentrt.ToolRequest, agentrt.RunView) (agentrt.PolicyDecision, error) {
+		return agentrt.PolicyDecision{Outcome: agentrt.RequireApproval, Kind: "k", Capability: json.RawMessage(`{"a":1,"a":2}`)}, nil
+	}), "invalid/v1"}
+	st, run := recheckFixture(t, invalid, recheckTools(), false)
+	requireStatus(t, run, agentrt.StatusFailed, agentrt.ReasonInternalError)
+	rep := recheck(t, st, run.ID, invalid, agentrt.RecheckOptions{})
+	requireLines(t, rep, "0 read same require_approval->require_approval")
+	if e := rep.Evaluations[0]; e.Detail != `an invalid decision, refused as recorded: capability is not usable JSON: duplicate key "a"` || !rep.Same() || !rep.Complete() {
+		t.Fatalf("evaluation %+v", e)
+	}
+	var b strings.Builder
+	trace.WriteRecheck(&b, rep)
+	if !strings.Contains(b.String(), `same      step 0 seq 5 read: require_approval: an invalid decision, refused as recorded: capability is not usable JSON: duplicate key "a"`) {
+		t.Fatalf("rendered:\n%s", b.String())
+	}
+	valid := namedPolicy{agentrt.PolicyFunc(func(context.Context, agentrt.ToolRequest, agentrt.RunView) (agentrt.PolicyDecision, error) {
+		return agentrt.PolicyDecision{Outcome: agentrt.RequireApproval, Kind: "k", Capability: json.RawMessage(`{"a":2}`)}, nil
+	}), "invalid/v1"}
+	rep = recheck(t, st, run.ID, valid, agentrt.RecheckOptions{})
+	requireLines(t, rep, "0 read different require_approval->require_approval")
+	if e := rep.Evaluations[0]; !strings.HasPrefix(e.Detail, "the recorded decision was refused as invalid") {
+		t.Fatalf("detail %q", e.Detail)
+	}
+}
+
+// A step resumed at the first step was handed no steps: nil in the
+// resume's view as in the loop's and the re-check's, never an empty
+// slice on one side. The views are compared as sameView compares them,
+// nil and empty told apart, and as JSON, where nil is null and empty [].
+func TestRecheck_ResumeAtTheFirstStepHasNoSteps(t *testing.T) {
+	approvedBy := func(view agentrt.RunView) int {
+		n := 0
+		for _, a := range view.Approvals {
+			if a.Status == agentrt.ApprovalApproved {
+				n++
+			}
+		}
+		return n
+	}
+	// The publish asks for a second approval after the first, then is
+	// allowed: three evaluations of step 0, two of them on resume.
+	base := agentrt.PolicyFunc(func(_ context.Context, req agentrt.ToolRequest, view agentrt.RunView) (agentrt.PolicyDecision, error) {
+		if n := approvedBy(view); n < 2 {
+			return agentrt.PolicyDecision{Outcome: agentrt.RequireApproval, Kind: "k", Capability: json.RawMessage(fmt.Sprintf(`{"n":%d}`, n))}, nil
+		}
+		return agentrt.PolicyDecision{Outcome: agentrt.Allow}, nil
+	})
+	p := &seeingPolicy{Policy: base}
+	st, err := agentrt.OpenStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	d, err := agentrt.NewDriver(agentrt.Config{Store: st, Policy: p, Now: tick(), NewID: numbered(), Tools: recheckTools(),
+		Agent: &scripted.Agent{Decisions: []agentrt.Decision{scripted.ToolCall("publish", `{"n":1}`, ""), scripted.Complete(`{}`)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := d.Start(context.Background(), "publish", limits(10, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run = approveAndResume(t, d, st, run, "alice")
+	run = approveAndResume(t, d, st, run, "bob")
+	requireStatus(t, run, agentrt.StatusCompleted, agentrt.ReasonGoalCompleted)
+	if len(p.views) != 3 {
+		t.Fatalf("%d evaluations", len(p.views))
+	}
+	for i, v := range p.views {
+		if v.Steps != nil {
+			t.Fatalf("evaluation %d was handed steps %#v, not nil", i, v.Steps)
+		}
+	}
+	again := &seeingPolicy{Policy: base}
+	if rep := recheck(t, st, run.ID, again, agentrt.RecheckOptions{}); !rep.Same() || !rep.Complete() || rep.Rechecked() != 3 {
+		t.Fatalf("re-check:\n%s", lines(rep))
+	}
+	sameRequests(t, again, p)
+	for i := range p.views {
+		w, _ := json.Marshal(p.views[i])
+		g, _ := json.Marshal(again.views[i])
+		if !bytes.Equal(g, w) {
+			t.Fatalf("evaluation %d as JSON:\n%s\nthe policy saw\n%s", i, g, w)
+		}
 	}
 }

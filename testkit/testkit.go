@@ -3,10 +3,10 @@
 // crashes the loop at a chosen point and resumes it in a fresh Driver, a
 // policy conformance table, schema fuzzing of tool arguments, a render
 // equivalence check, and a re-check of a run's decisions under a policy
-// (Recheck, RecheckDiffers, Scenario.Recheck). A consumer whose own loop
-// drives a Gate runs the same harness over that loop, with Scenario.Loop.
-// It is built on the public API alone and on the scripted and trace
-// packages, which it re-exports nothing of.
+// (Recheck, RecheckDiffers, RecheckPartial, Scenario.Recheck). A consumer
+// whose own loop drives a Gate runs the same harness over that loop, with
+// Scenario.Loop. It is built on the public API alone and on the scripted
+// and trace packages, which it re-exports nothing of.
 //
 // A crash is a real one as far as the runtime can tell: the hook at the
 // crash point parks the goroutine executing the run and the harness closes
@@ -153,7 +153,8 @@ type Scenario struct {
 	// renders what an Agent was handed, needs an Agent.
 	Loop func(ctx context.Context, s *agentrt.Session) error
 	// Recheck, when set, has Run re-check the run under Policy once it is
-	// over, and report every evaluation that decides otherwise (see
+	// over, and report every evaluation that decides otherwise, and a
+	// re-check that re-checked nothing or left an evaluation out (see
 	// Recheck): a policy that reads anything but what it is handed fails
 	// it.
 	Recheck bool

@@ -79,6 +79,9 @@ func recheckLine(b *strings.Builder, e agentrt.RecheckedEvaluation) {
 	switch e.Result {
 	case agentrt.RecheckSame:
 		b.WriteString(field(string(e.Recorded.Outcome)))
+		if e.Detail != "" {
+			b.WriteString(": " + field(e.Detail))
+		}
 	case agentrt.RecheckDifferent:
 		now := "none"
 		if e.Rechecked != nil {

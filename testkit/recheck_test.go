@@ -116,3 +116,84 @@ func TestRecheck_InterruptedSideEffectPauseIsNotAPolicyEvaluation(t *testing.T) 
 		t.Fatalf("evaluations:\n%s", strings.Join(got, "\n"))
 	}
 }
+
+// A re-check that proves nothing fails Recheck, RecheckDiffers, and a
+// scenario's Recheck: a run whose evaluations were recorded before v0.5.0,
+// a run whose only evaluation met a policy error, and a run that asked the
+// policy nothing. RecheckPartial passes all three.
+func TestRecheck_FailsWhenNothingWasRechecked(t *testing.T) {
+	ctx := context.Background()
+	start := func(t *testing.T, p agentrt.Policy, decisions ...agentrt.Decision) (*agentrt.Store, string) {
+		st := openDB(t, filepath.Join(t.TempDir(), "kit.db"))
+		d, err := agentrt.NewDriver(agentrt.Config{Store: st, Policy: p, Agent: &scripted.Agent{Decisions: decisions},
+			Tools: []agentrt.Tool{newTool("read", agentrt.ReadOnly)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, err := d.Start(ctx, "g", agentrt.DefaultLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st, run.ID
+	}
+	failing := agentrt.PolicyFunc(func(context.Context, agentrt.ToolRequest, agentrt.RunView) (agentrt.PolicyDecision, error) {
+		return agentrt.PolicyDecision{}, fmt.Errorf("rules unavailable")
+	})
+
+	old, oldID := start(t, agentrt.DefaultPolicy(), scripted.ToolCall("read", `{}`, ""), scripted.Complete(`{}`))
+	// What v0.4.0 recorded: a step.policy with neither spec nor view.
+	if _, err := old.DB().Exec(`UPDATE events SET payload_json = json_remove(payload_json, '$.view', '$.spec_hash') WHERE type = 'step.policy'`); err != nil {
+		t.Fatal(err)
+	}
+	errored, erroredID := start(t, failing, scripted.ToolCall("read", `{}`, ""))
+	empty, emptyID := start(t, agentrt.DefaultPolicy(), scripted.Complete(`{}`))
+
+	for _, c := range []struct {
+		name  string
+		st    *agentrt.Store
+		runID string
+		want  string
+	}{
+		{"recorded before v0.5.0", old, oldID, "1 evaluation(s) not re-checkable"},
+		{"policy error", errored, erroredID, "1 evaluation(s) not re-checkable"},
+		{"no evaluation", empty, emptyID, "no evaluation was re-checked"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			for name, check := range map[string]func(testing.TB) agentrt.RecheckReport{
+				"Recheck": func(tb testing.TB) agentrt.RecheckReport {
+					return testkit.Recheck(tb, c.st, c.runID, agentrt.DefaultPolicy())
+				},
+				"RecheckDiffers": func(tb testing.TB) agentrt.RecheckReport {
+					return testkit.RecheckDiffers(tb, c.st, c.runID, agentrt.DefaultPolicy())
+				},
+			} {
+				r := &recorder{TB: t}
+				rep := check(r)
+				if len(r.errors) != 1 || !strings.Contains(r.errors[0], c.want) || !rep.Same() {
+					t.Fatalf("%s: failures:\n%s", name, r.joined())
+				}
+			}
+			r := &recorder{TB: t}
+			if testkit.RecheckPartial(r, c.st, c.runID, agentrt.DefaultPolicy()); len(r.errors) != 0 {
+				t.Fatalf("RecheckPartial: failures:\n%s", r.joined())
+			}
+		})
+	}
+
+	// The policy error is listed, not passed over in silence.
+	rep := testkit.RecheckPartial(t, errored, erroredID, agentrt.DefaultPolicy())
+	if len(rep.Evaluations) != 1 || rep.Complete() || rep.Evaluations[0].Detail != "policy failed; no evaluation recorded: rules unavailable" {
+		t.Fatalf("report %+v", rep)
+	}
+
+	// A scenario whose policy fails at its only evaluation fails its
+	// Recheck.
+	sc := scenario(newTool("read", agentrt.ReadOnly))
+	sc.Policy, sc.Recheck, sc.DB = failing, true, filepath.Join(t.TempDir(), "kit.db")
+	sc.Agent = &scripted.Agent{Decisions: []agentrt.Decision{scripted.ToolCall("read", `{}`, "")}}
+	r := &recorder{TB: t}
+	testkit.Run(r, sc)
+	if !strings.Contains(r.joined(), "1 evaluation(s) not re-checkable") {
+		t.Fatalf("failures:\n%s", r.joined())
+	}
+}

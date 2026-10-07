@@ -392,9 +392,12 @@ exits 0, 1, or 2. `-db` and `-json` go before the subcommand. `approve`,
   output with `-limit` and `-offset`.
 - `verify` opens it read-only, checks the hash chain over every run's
   events, `-from` and `-to` a range of seq, and prints the head and
-  "intact" or the first event that does not chain, exiting 1 for a break.
+  "intact" with the seq and hash of the last event checked, or the first
+  event that does not chain, exiting 1 for a break or a `-to` not reached.
   An intact chain means the events are unaltered only up to a head you kept
-  somewhere the database's writers cannot reach.
+  somewhere the database's writers cannot reach: keep the last checked seq
+  and hash, and pass them back as `-head SEQ:HASH`, which fails unless the
+  chain still reaches that seq with that hash.
 - In text output, `approve` and `reject` print the waiting request first.
   They need
   `-approval <id>`, `-yes`, or a yes typed at a terminal, and the decision

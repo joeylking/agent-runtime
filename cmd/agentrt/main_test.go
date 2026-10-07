@@ -1554,7 +1554,7 @@ func TestVerify_IntactChainExitsZero(t *testing.T) {
 	}
 	code, out, errw := exec(t, "-db", path, "verify")
 	requireOK(t, code, out, errw)
-	want := fmt.Sprintf("head: seq %d %s\nintact: %d event(s), seq 1 to %d\n", seq, hash, seq, seq)
+	want := fmt.Sprintf("head: seq %d %s\nintact: %d event(s), seq 1 to %d\nlast checked: seq %d %s\n", seq, hash, seq, seq, seq, hash)
 	if out != want {
 		t.Fatalf("stdout %q, want %q", out, want)
 	}
@@ -1627,6 +1627,11 @@ func TestVerify_BadArgumentsAreUsage(t *testing.T) {
 		{"verify", "-from", "-1"},
 		{"verify", "-to", "x"},
 		{"verify", "-from", "5", "-to", "4"},
+		{"verify", "-head", "x"},
+		{"verify", "-head", "0:abc"},
+		{"verify", "-head", "5:"},
+		{"verify", "-to", "3", "-head", "5:abc"},
+		{"verify", "-from", "6", "-head", "5:abc"},
 	} {
 		code, _, errw := exec(t, append([]string{"-db", missing}, args...)...)
 		if code != exitUsage {
@@ -1635,5 +1640,76 @@ func TestVerify_BadArgumentsAreUsage(t *testing.T) {
 	}
 	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("a usage error touched the database: %v", err)
+	}
+}
+
+// A database cut at its end verifies on its own; what shows it is short is
+// a head kept from before the cut: verify -head with that seq and hash, or
+// -to that seq, fails, and so does a kept head whose event now has another
+// hash. The hash of the last event checked is printed to be kept.
+func TestVerify_CutDatabaseFailsAKeptHead(t *testing.T) {
+	path, _, _ := pausedDB(t)
+	store, err := agentrt.OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	seq, hash, err := store.ChainHead(ctx)
+	if err != nil || seq < 4 {
+		t.Fatalf("head %d %v", seq, err)
+	}
+	mid, _ := store.EventHash(ctx, seq-2)
+	// The kept head is printed as the last event checked.
+	code, out, errw := exec(t, "-db", path, "verify", "-head", fmt.Sprintf("%d:%s", seq, hash))
+	requireOK(t, code, out, errw)
+	if !strings.Contains(out, fmt.Sprintf("last checked: seq %d %s\n", seq, hash)) || !strings.Contains(out, fmt.Sprintf("kept head: seq %d matches\n", seq)) {
+		t.Fatalf("stdout:\n%s", out)
+	}
+	if _, err := store.DB().Exec(`DELETE FROM events WHERE seq = ?`, seq); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	// The cut chain is intact on its own.
+	code, out, errw = exec(t, "-db", path, "verify")
+	requireOK(t, code, out, errw)
+	// A head kept before the cut, or a -to that reached it, is not reached.
+	code, out, errw = exec(t, "-db", path, "verify", "-head", fmt.Sprintf("%d:%s", seq, hash))
+	if code != exitError || !strings.Contains(errw, fmt.Sprintf("the kept head, seq %d, was not reached; the last event checked is seq %d", seq, seq-1)) {
+		t.Fatalf("-head: exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errw)
+	}
+	code, out, errw = exec(t, "-db", path, "verify", "-to", fmt.Sprint(seq))
+	if code != exitError || !strings.Contains(errw, fmt.Sprintf("-to %d was not reached; the last event checked is seq %d", seq, seq-1)) {
+		t.Fatalf("-to: exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errw)
+	}
+	// A kept head inside the chain matches, and one with another hash not.
+	code, out, errw = exec(t, "-db", path, "verify", "-head", fmt.Sprintf("%d:%s", seq-2, mid))
+	requireOK(t, code, out, errw)
+	code, out, errw = exec(t, "-db", path, "verify", "-head", fmt.Sprintf("%d:%s", seq-2, hash))
+	if code != exitError || !strings.Contains(errw, "does not match the head kept") {
+		t.Fatalf("mismatch: exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errw)
+	}
+
+	code, out, _ = exec(t, "-db", path, "-json", "verify", "-to", fmt.Sprint(seq), "-head", fmt.Sprintf("%d:%s", seq, hash))
+	var got struct {
+		To        int64
+		Hash      string
+		Intact    bool
+		Requested *struct {
+			To      int64
+			Reached bool
+		}
+		KeptHead *struct {
+			Seq     int64
+			Hash    string
+			Matches bool
+		} `json:"kept_head"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if code != exitError || got.To != seq-1 || len(got.Hash) != 64 || !got.Intact || got.Requested == nil || got.Requested.To != seq || got.Requested.Reached ||
+		got.KeptHead == nil || got.KeptHead.Seq != seq || got.KeptHead.Hash != hash || got.KeptHead.Matches {
+		t.Fatalf("exit %d, json %s", code, out)
 	}
 }

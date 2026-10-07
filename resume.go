@@ -131,13 +131,23 @@ func (s *Session) resumeApproved(ctx context.Context, run Run) Verdict {
 	if err != nil {
 		return s.finish(d.failInternal(ctx, run.ID, waiting, err))
 	}
-	prior := steps[:step.Index]
 	// Policy is evaluated while the run is still WAITING, so the move to
 	// RUNNING and what the policy decided commit together: a crash between
-	// them cannot drop the approved request.
-	view := RunView{Run: run, Steps: cloneSteps(prior), Approvals: cloneApprovals(approvals)}
+	// them cannot drop the approved request. The steps before the approved
+	// one are nil when there are none, as in the loop's view and a
+	// re-check's.
+	view := RunView{Run: run, Approvals: cloneApprovals(approvals)}
+	if step.Index > 0 {
+		view.Steps = cloneSteps(steps[:step.Index])
+	}
 	st := &OpenStep{s: s, step: *step, run: run, proposed: true, toolSpec: req.Spec, spec: spec, view: seenBy(view)}
-	pd, perr := d.policy.Evaluate(ctx, req, view)
+	// The policy is handed the recorded request in the form the loop
+	// handed it, PolicyJSON, although it was stored compact and escaped.
+	handed, err := policyRequest(req)
+	if err != nil {
+		return s.finish(d.failInternal(ctx, run.ID, waiting, err))
+	}
+	pd, perr := d.policy.Evaluate(ctx, handed, view)
 	s.open = st
 	return st.apply(ctx, req, pd, perr, granted, resumedAt)
 }

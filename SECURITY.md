@@ -204,10 +204,12 @@ cannot influence.
   careless or partial edit. It is not a defence against whoever can write
   the database: they can recompute every hash after the row they changed,
   or cut events from the end, and the chain still verifies. It shows the
-  record unaltered only up to a head (`ChainHead`, `EventHash`) kept where
-  that writer cannot reach, and compared later. Events stored before
-  migration 6 were hashed when it ran, so their hashes say nothing about
-  what happened to them before. The chain covers events only: the state
+  record unaltered only up to a head (`ChainHead`, `EventHash`,
+  `export.Follower.Head`) kept where that writer cannot reach, and compared
+  later with `agentrt verify -head SEQ:HASH`, which fails unless the chain
+  reaches that seq intact and its event still has that hash, so a cut end
+  is caught. Events stored before migration 6 were hashed when it ran, so
+  their hashes say nothing about what happened to them before. The chain covers events only: the state
   tables are not chained, and an approval's own hash still binds the
   approval.
 

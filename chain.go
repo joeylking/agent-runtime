@@ -62,7 +62,10 @@ func fieldHeader(h hash.Hash, n int64) {
 // VerifyReport is what VerifyEvents found.
 type VerifyReport struct {
 	// From and To are the seq of the first and last event checked, and
-	// Checked how many there were; zero when the range holds none.
+	// Checked how many there were; zero when the range holds none. A To
+	// below the toSeq asked for means the database holds no event past
+	// it: an intact chain cut at its end, which only a head kept
+	// elsewhere at a later seq shows (agentrt verify -head).
 	From, To int64
 	Checked  int64
 	// Hash is the stored hash of the last event checked: the head when To
