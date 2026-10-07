@@ -13,6 +13,19 @@ entry names a specific module only when the change is not in the core.
 
 ## [Unreleased]
 
+Planned as core v0.5.0. Of the nested modules, `proxy` and `export/otel`
+changed and will need new tags, pinning that core release; `mcp`,
+`providers/ollama`, `providers/anthropic`, `providers/openai`, and `bench`
+did not change and will only be re-pinned or left as they are.
+
+This release records what a decision needs to be decided again, chains the
+events, and replays a finished run through a policy (roadmap item 10,
+[ADR 9](docs/decisions/0009-recheckable-decisions.md)). It adds a schema
+migration and one behaviour change, both under Changed. The migration needs
+an operator step, given under Migration 6, before the first open. A policy
+evaluation recorded before the migration is reported by a re-check as not
+re-checkable.
+
 ### Added
 
 - **Each decision records what it can be checked against.** A tool_call

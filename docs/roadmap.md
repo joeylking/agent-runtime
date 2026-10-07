@@ -291,6 +291,20 @@ same policy would decide it again.
 identity, events are hash-chained, and a finished run can be replayed
 through a policy to show the same decisions.
 
+**Status.** Built and verified, to be released in core v0.5.0 with migration
+6, and with new tags for `proxy` and `export/otel`, whose code changed. It
+records each tool call's spec by hash and the policy's identity, chains the
+events (`agentrt verify`), and replays a finished run through a policy
+(`agentrt.Recheck`, `testkit.Recheck`, `agentrt-proxy recheck`,
+`examples/recheck`). It carries one behaviour change: a policy is now handed
+the arguments and the tool's schema in one form, `PolicyJSON`, on every path,
+where the loop and a resume handed different bytes, so a policy that matches
+bytes may notice. ADR 9 has the reasoning and the limits: the chain proves
+integrity only against a head kept where the writer cannot reach, a
+re-check proves the policy's answer and not the tool's behaviour, and a
+policy that reads outside state cannot be re-checked exactly
+([ADR 9](decisions/0009-recheckable-decisions.md)).
+
 ### 11. Argument-source rules
 
 **Problem.** A tool's arguments can carry authority, such as a path or a
@@ -326,5 +340,7 @@ each idea built from here.
 
 The gate, item 9, was added on 2026-10-05 after the research pass ADR 7
 records, and is released in v0.4.0; its first form outside Go, the stdio MCP
-proxy of ADR 8, followed the same day and is released as `proxy/v0.1.0`. The order from there is items 10, 11,
-and 12, with item 12 as research.
+proxy of ADR 8, followed the same day and is released as `proxy/v0.1.0`. Item
+10, re-checkable decisions, was built on 2026-10-07 after that and is to be
+released in core v0.5.0. The order from there is items 11 and 12, with item 12
+as research.

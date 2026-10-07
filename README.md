@@ -63,6 +63,7 @@ deployment needs:
 | Approvals that outlast the process | A paused run is a row in a database. The program can exit, the person can decide the next day, and the run continues from where it stopped. |
 | Limits checked before the fact | Steps, failures in a row, identical requests that keep giving the same result, elapsed time, model calls, tokens, and spend can each be capped. A cap is checked before the next action or request starts, and reaching one ends the run with that reason recorded. |
 | A complete record | Every step, decision, and result is written to a database in the same operation as the change it describes, so the record cannot fall out of step with what happened. |
+| A record you can check | Each step records which version of the tool it was decided against and, if the policy names itself, which policy decided it, and each event in the record is linked to the one before it. An operator can check that the record has not been altered, and can replay a finished run through a policy to see whether it would decide the same, which is also how a changed policy is tried against past runs. The check against alteration holds up to a point the operator has written down somewhere the database's writers cannot reach, since anyone who can write the database could relink the rest. The replay shows what the policy would answer, not what a tool would do. |
 | No action repeats on its own | If the program dies in the middle of an action, the runtime records the step as interrupted when the run is resumed. An action that changes something is not run again unless the consumer's own check of the outside world says so or an operator approves it, and the approval states that the first attempt may have taken effect. |
 | One process per run | A run in progress is leased to the process running it. Another process that tries to continue it is refused until the first finishes or its lease expires. |
 | A database only its owner can use | The database file is created so that only its owner can read or write it. One that other users can write is refused, because anyone who can write it could forge an approval. These checks are skipped on Windows. |
@@ -158,6 +159,12 @@ repository, tagged with a directory prefix: `providers/ollama/v0.2.0`,
 `export/otel/v0.1.1`, and `proxy/v0.1.0`. On `main` each requires core
 v0.4.0; the providers' tags still pin v0.3.0, which v0.4.0 only adds to.
 `bench/v0.1.1` has no requirements at all.
+
+The next release, v0.5.0, is to carry item 10 of the roadmap: re-checkable
+decisions. It adds a schema migration, so every older process must be stopped
+before the first open, and one behaviour change: a policy is handed the
+arguments and the schema in one form on every path. It is built and tested in
+the repository and is not released.
 
 The API is pre-1.0 and changes when a consumer needs it to.
 
@@ -346,6 +353,23 @@ model a shell or file access lets the model go around it, and even approve
 its own request. [docs/proxy.md](docs/proxy.md) says what it does and does not
 do, and `go run ./proxy/example` shows it with no model at all. It is an
 experiment, released as `proxy/v0.1.0`; the Go library is the full form.
+
+## Re-checking a run
+
+A finished run can be put in front of a policy again. `agentrt.Recheck`
+rebuilds each policy evaluation the run recorded, with the request, the
+tool's spec by hash, and the run as the policy saw it, asks the policy
+given, and reports where it decides differently. Under the policy the run
+ran with it is a determinism check; under a changed one it names the steps
+the change would have stopped. `testkit.Recheck` does this in a test, and
+`agentrt-proxy recheck` for the proxy's recorded calls. `agentrt verify`
+checks the events' hash chain, and `export.Follower.Head` gives a head to
+keep. A policy is handed the same form of the arguments and the schema
+(`PolicyJSON`) on the loop, on resume, and in a re-check. A run recorded
+before v0.5.0 is reported as not re-checkable. [docs/architecture.md](docs/architecture.md#re-checking-a-run)
+has the rules and the limits, [ADR 9](docs/decisions/0009-recheckable-decisions.md)
+the reasoning, and `go run ./examples/recheck` shows both checks with no
+model.
 
 ## What a consumer no longer has to write
 

@@ -232,6 +232,14 @@ schema versions are not read together, and `OpenExisting` refuses a mismatch
 rather than guessing, but only after something has tried to open the file.
 Restart them on the new build once the migration has run once.
 
+Migration 6, which adds the events' hash chain, is also a reason to stop
+every older process first: one still writing after it appends events with no
+hash, and the first breaks the chain for `agentrt verify`.
+`TestStore_ReleasedMigrationsAreUnchanged` pins migration 6 on its own while
+it is unreleased; when v0.5.0 is tagged, fold it into the pin for the
+released migrations, as migration 5 was, so that no released migration is
+edited.
+
 ## Style
 
 Read a neighbouring file first; these are the rules it follows.
