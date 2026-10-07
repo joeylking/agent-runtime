@@ -33,8 +33,13 @@ func (c classPolicy) decide(t *tool) (agentrt.PolicyOutcome, string) {
 }
 
 // gatePolicy is the agentrt.Policy the gate evaluates, at a call and again
-// when an approved call is collected.
+// when an approved call is collected. It is an agentrt.IdentifiedPolicy:
+// its identity is the configuration's PolicyID, recorded with each
+// decision.
 type gatePolicy struct{ p *Proxy }
+
+// PolicyID implements agentrt.IdentifiedPolicy.
+func (g gatePolicy) PolicyID() string { return g.p.policyID }
 
 // Evaluate implements agentrt.Policy. A denial is a denial. A request that
 // re-runs an attempt whose outcome is unknown is asked for as an
@@ -73,7 +78,8 @@ func (g gatePolicy) Evaluate(ctx context.Context, req agentrt.ToolRequest, view 
 // names: it is a fact the proxy recorded when it asked, and the rest of
 // the capability is computed again, so a changed server, tool, class,
 // argument, or fixed value still asks anew. Otherwise it is the attempt
-// the proxy named for the run as it proposed the request (Proxy.rerun).
+// the proxy named for the run as it proposed the request (Proxy.rerun),
+// or, in a re-check, the one the record names (recordedRerun).
 func (p *Proxy) rerunOf(ctx context.Context, req agentrt.ToolRequest, view agentrt.RunView) (*attempt, error) {
 	if a := latestFor(view.Approvals, req.StepID); a != nil && a.Kind == agentrt.InterruptedSideEffect {
 		var c capability
@@ -88,8 +94,36 @@ func (p *Proxy) rerunOf(ctx context.Context, req agentrt.ToolRequest, view agent
 		return &attempt{RunID: req.RunID, StepID: req.StepID, StartedAt: stamp3339(started), Ended: endedCutOff}, nil
 	}
 	p.reruns.Lock()
-	defer p.reruns.Unlock()
-	return p.reruns.m[req.RunID], nil
+	at := p.reruns.m[req.RunID]
+	p.reruns.Unlock()
+	if at == nil && p.recorded {
+		return p.recordedRerun(ctx, req, view)
+	}
+	return at, nil
+}
+
+// recordedRerun is, when a recorded run is re-checked, the attempt a
+// request the proxy proposed re-ran. The proxy named it only in memory as
+// it proposed the request (setRerun), and recorded it in the interruption
+// approval the policy then asked for: that approval is the run's next
+// after those the policy is shown, of the request's step, and names an
+// attempt other than the step itself, which a reconciliation's pause of
+// the step would name. Nil when there is none, as for a request the
+// policy denied, whose re-check cannot tell it was a re-run.
+func (p *Proxy) recordedRerun(ctx context.Context, req agentrt.ToolRequest, view agentrt.RunView) (*attempt, error) {
+	next, _, err := p.store.ListApprovalsPage(ctx, req.RunID, "", 1, len(view.Approvals))
+	if err != nil || len(next) == 0 {
+		return nil, err
+	}
+	a := next[0]
+	if a.StepID != req.StepID || a.Kind != agentrt.InterruptedSideEffect {
+		return nil, nil
+	}
+	var c capability
+	if json.Unmarshal(a.Capability, &c) != nil || c.Interrupted == nil || c.Interrupted.RunID == req.RunID && c.Interrupted.StepID == req.StepID {
+		return nil, nil
+	}
+	return c.Interrupted, nil
 }
 
 // capability is what an operator grants: the upstream call, with the

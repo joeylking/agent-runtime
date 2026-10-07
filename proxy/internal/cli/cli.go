@@ -1,5 +1,5 @@
-// Package cli is agentrt-proxy's command line: serve, pin, and check. It
-// is a package of its own so the command, its tests, and the
+// Package cli is agentrt-proxy's command line: serve, pin, check, and
+// recheck. It is a package of its own so the command, its tests, and the
 // demonstration run the same code in a child process.
 package cli
 
@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 
+	agentrt "github.com/joeylking/agent-runtime"
 	"github.com/joeylking/agent-runtime/mcp"
 	"github.com/joeylking/agent-runtime/proxy"
 	"github.com/joeylking/agent-runtime/render"
@@ -29,6 +30,9 @@ usage:
   agentrt-proxy -config <file>         serve one MCP host over stdin and stdout
   agentrt-proxy pin -config <file>     pin each server's tools into its manifest
   agentrt-proxy check -config <file>   load everything and report what is offered
+  agentrt-proxy recheck -config <file> [-run id | -session name] [-limit n]
+                [-current-tools] [-json]
+                                       re-check recorded calls under the policy now
 
 An MCP host starts it as its server, with {"command": "agentrt-proxy",
 "args": ["-config", "<file>"]}. It connects to the servers the file names,
@@ -38,6 +42,18 @@ the policy, paused on an approval bound to the exact request when the policy
 asks, executed by the gate, and recorded with its outcome. Approvals are
 decided outside the host, with agentrt on the same database. stdout carries
 only the protocol; everything else goes to stderr.
+
+recheck hands every decision the proxy's policy recorded for a call back to
+the policy the configuration gives it now, rebuilt as it was handed then, and
+prints which would now be decided otherwise: one run with -run, or the
+session's newest runs, the configuration's session unless -session names
+another, at most -limit (default 50). It opens the database read-only and
+connects to no server unless -current-tools, which loads the pinned tools as
+serving does and hands each request its tool's spec as loaded now. -json
+prints the reports as a JSON array. Each decision records the policy's
+identity, a hash of the parts of the configuration the policy decides from
+(docs/proxy.md). Exit status: 0 when every run re-checks the same, 1 when any
+differs or on an error, 2 on a usage error.
 
 What it does not do:
   - It governs only the calls that go through it. If the host gives the model
@@ -79,6 +95,9 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		cmd, args = args[0], args[1:]
 	}
+	if cmd == "recheck" {
+		return recheck(ctx, args, stdout, stderr)
+	}
 	fs := flag.NewFlagSet("agentrt-proxy", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	config := fs.String("config", "", "the configuration file")
@@ -111,6 +130,75 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 	if err != nil {
 		return fail(stderr, err)
+	}
+	return 0
+}
+
+// recheck re-checks recorded runs under the configuration's policy and
+// prints the reports, in text or JSON. It returns 0 when every run is the
+// same, 1 when any differs or on an error, and 2 on a usage error.
+func recheck(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("agentrt-proxy recheck", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	config := fs.String("config", "", "the configuration file")
+	runID := fs.String("run", "", "the one run to re-check")
+	session := fs.String("session", "", "the session whose runs are re-checked")
+	limit := fs.Int("limit", proxy.DefaultRecheckLimit, "how many of the session's newest runs")
+	current := fs.Bool("current-tools", false, "load the pinned tools and use their specs as loaded now")
+	asJSON := fs.Bool("json", false, "print the reports as JSON")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(stderr, Usage)
+			return 0
+		}
+		fmt.Fprintf(stderr, "agentrt-proxy: recheck: %v\n\n%s", err, Usage)
+		return 2
+	}
+	switch {
+	case *config == "" || fs.NArg() > 0:
+		fmt.Fprintf(stderr, "agentrt-proxy: recheck: -config <file> is required and nothing follows the flags\n\n%s", Usage)
+		return 2
+	case *runID != "" && *session != "":
+		fmt.Fprintf(stderr, "agentrt-proxy: recheck: -run and -session are exclusive\n\n%s", Usage)
+		return 2
+	case *limit <= 0:
+		fmt.Fprintf(stderr, "agentrt-proxy: recheck: -limit must be positive\n\n%s", Usage)
+		return 2
+	}
+	cfg, err := proxy.LoadConfig(*config)
+	if err != nil {
+		return fail(stderr, err)
+	}
+	reps, err := proxy.Recheck(ctx, cfg, proxy.RecheckOptions{RunID: *runID, Session: *session, Limit: *limit, CurrentTools: *current, Log: stderr})
+	if err != nil {
+		return fail(stderr, err)
+	}
+	differ := 0
+	for _, r := range reps {
+		if !r.Same() {
+			differ++
+		}
+	}
+	if *asJSON {
+		if reps == nil {
+			reps = []agentrt.RecheckReport{}
+		}
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(reps); err != nil {
+			return fail(stderr, err)
+		}
+	} else {
+		for _, r := range reps {
+			if err := trace.WriteRecheck(stdout, r); err != nil {
+				return fail(stderr, err)
+			}
+			fmt.Fprintln(stdout)
+		}
+		fmt.Fprintf(stdout, "%d run(s) re-checked under %s: %d differ\n", len(reps), trace.Sanitize(cfg.PolicyID()), differ)
+	}
+	if differ > 0 {
+		return 1
 	}
 	return 0
 }

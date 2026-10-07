@@ -617,6 +617,52 @@ The host lists `fs_list_directory`, `fs_read_text_file`, `fs_write_file`, and
 `gate_status`. Give it no shell or file tool of its own, or keep those behind
 the host's own prompts, for the reasons at the top of this page.
 
+## Re-checking recorded calls
+
+```sh
+agentrt-proxy recheck -config proxy.json [-run ID | -session NAME] [-limit N] [-current-tools] [-json]
+```
+
+`recheck` builds the policy the configuration gives the proxy now and hands
+it every decision the proxy's policy recorded for a call, rebuilt as it was
+handed then (`agentrt.Recheck`, [architecture](architecture.md#re-checking-a-run)),
+and prints, run by run, which decisions it would now make otherwise: a call
+whose payment is now denied, or whose approval would now be another. It
+re-checks one run with `-run`, or the session's newest runs, the
+configuration's session unless `-session` names another, at most `-limit`
+(default 50), read from the proxy's index of its calls. It opens the
+database read-only and writes nothing. It connects to no server unless
+`-current-tools`, which loads the pinned tools as serving does, the reach
+check and the pin included, and hands each request its tool's spec as
+loaded now, so a description reworded since makes each approval asked for
+that tool another approval; without it each request carries the spec it
+recorded, and the policy's tools are named and classified from the rules.
+`-json` prints the reports as one JSON array. It exits 0 when every run is
+the same, 1 when any differs or on an error, and 2 on a usage error.
+
+Every decision the proxy's policy makes records the policy's identity,
+`agentrt-proxy/sha256:` and the hex SHA-256 of the canonical JSON of the
+parts of the configuration the policy decides from: the `policy` map with
+`agentrt.DefaultPolicy`'s outcomes under it, and, for each server by name,
+each rule's side effect, `outcome`, `fixed` values, and `rename`, keyed by
+the server's tool name (`Config.PolicyID`). Nothing else enters it: the
+database, the session, commands and endpoints, timeouts, descriptions,
+denied parameters, `hold`, `repeat_window`, `max_pending`, and the TTLs
+change no decision of the policy, so changing them keeps the identity. The
+rules across calls, the repeat window and the pending cap among them, are
+applied before the policy is asked and are not re-checked. A re-check's
+report says "policy unchanged" when every decision recorded the identity
+the configuration has now, "policy changed" when one recorded another, and
+"policy identity unknown" for a decision recorded before the proxy had one.
+
+One thing the proxy's policy decides from is not in what it is handed:
+whether a request re-runs an attempt whose outcome is unknown, which the
+proxy names in memory as it proposes the re-run. A re-check reads it from
+the interruption approval the policy asked for then, so the same
+configuration re-checks such a call the same; a re-run the policy denied
+left no approval, and a re-check under a configuration that no longer
+denies it answers as it would for a fresh request.
+
 ## A demonstration with no model
 
 `proxy/example` scripts a host against a fake payment server bundled with

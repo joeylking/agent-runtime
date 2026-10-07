@@ -106,6 +106,75 @@ empty, `Cancel` closes its run, a driver asked to continue the run fails
 it as `internal_error` without rewriting the row, and such an approval
 cannot be decided.
 
+### Re-checking a run
+
+`Recheck(ctx, store, runID, policy, opts)` hands each policy evaluation a
+run recorded back to a policy, rebuilt from the record as the policy saw
+it, and reports, evaluation by evaluation, whether the answer is the same.
+An evaluation is a `step.policy` event carrying a `view`, so a step
+approved and resumed has two, the second marked on resume. What is rebuilt:
+
+- the request: the run and step ids, the arguments as the step's decision
+  recorded them, which is the agent's JSON compacted, and the spec the
+  event's `spec_hash` names, read whole with `Store.ToolSpec`, its schema
+  in the canonical form it is stored in. `RecheckOptions.Tools` hands the
+  current spec of each tool instead, by name, and checks the arguments
+  against its schema first, so the question becomes whether today's policy
+  with today's tools would have decided the same;
+- the run: id, goal, limits, and creation time, which is also its start,
+  from `run.created`, and the rest from the event's `view`; reason, detail,
+  finish time, and result are empty, as they are whenever a policy is
+  asked;
+- the steps: the run's first ones, as many as the view counted, as stored
+  now. A step before the one evaluated was finished before the policy was
+  asked and is never written again, so it is what the policy saw;
+- the approvals: the run's first ones, as many as the view counted, as
+  stored but with the status each had when the event was written, which is
+  the status of its last `approval.decided` before the event by seq, or
+  pending, with no decision time, decider, or note, when there was none.
+  Seq, not time, decides, because a decision stamped by an operator's wall
+  clock and an evaluation stamped by a consumer's clock need not agree; an
+  approval with no `approval.decided` at all, which the runtime never
+  leaves, is judged by its stored `decided_at` against the event's time.
+
+The answer is compared with the recorded decision on its outcome and, for
+`require_approval`, on the approval kind and the hash of the approval it
+asks for, computed by the runtime's own function over the recorded request
+on one side and the re-checked request on the other, so a changed
+capability, presentation, or current spec differs although the outcome
+does not. The reason is reported and never a difference. A policy error,
+or a decision that is not usable JSON, is a difference. The report
+(`RecheckReport`) gives each evaluation's step, seq, tool, recorded and
+re-checked decisions, the spec source, and the recorded `policy_id`, and
+compares those identities with the policy's own: unknown when either side
+has none, changed when both do and differ. `trace.WriteRecheck` renders it
+one sanitized line per evaluation, differences first; its `MarshalJSON`
+adds `same`, `differences`, and `rechecked`. The `testkit` checks a
+scenario's policy with it (`Scenario.Recheck`, `testkit.Recheck`,
+`testkit.RecheckDiffers`), and `agentrt-proxy recheck` re-checks a
+session's calls under the configuration's policy now.
+
+What cannot be rebuilt is reported, not guessed. A `step.policy` written by
+a reconciliation's or an interrupted side effect's pause is not a policy
+evaluation. One written before v0.5.0 recorded neither spec nor view and is
+not re-checkable, and a run created then says so; an evaluation made after
+the migration, as the resume of a run left waiting, is re-checked. A
+record the page reads cut, a `step.policy`, a step, or an approval longer
+than `MaxPageText`, is not re-checkable either: a policy never saw a cut
+value. A policy error the original run met wrote no `step.policy` and is
+not listed. A run not yet terminal is re-checked up to its current state.
+Recheck reads a page at a time, each spec whole, writes nothing, and reads
+no clock.
+
+What it shows is bounded by what the policy reads. A policy that decides
+from what it is handed alone answers the same again, so a re-check under
+the policy a run ran with is a determinism check: one that reads a clock,
+a counter, a file, or a service may differ, and a difference then says
+the policy, not the record, changed. A re-check does not show the record
+is unaltered: it trusts what it reads. The hash chain shows that, up to a
+head kept where whoever can write the database cannot reach; without such
+a head, a writer can rewrite both the record and its chain.
+
 ## What the agent sees and cannot do
 
 `StepInput` carries the run, every prior step in order, the approvals, the

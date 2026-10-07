@@ -16,6 +16,19 @@ func (f PolicyFunc) Evaluate(ctx context.Context, req ToolRequest, view RunView)
 
 // SideEffectPolicy maps each side-effect class to an outcome. It is the
 // runtime's only built-in policy; consumers wrap or replace it.
+//
+// It does not implement IdentifiedPolicy: a map has no identity of its
+// own that stays the same while its contents change, so the runtime
+// cannot name one for it. A consumer whose decisions should say which
+// policy made them wraps it in a type that does, naming the version of its
+// own configuration the map was built from:
+//
+//	type versioned struct {
+//		agentrt.SideEffectPolicy
+//		id string
+//	}
+//
+//	func (p versioned) PolicyID() string { return p.id }
 type SideEffectPolicy map[SideEffect]PolicyOutcome
 
 // DefaultPolicy allows reads and local mutations, requires approval for

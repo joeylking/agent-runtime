@@ -50,6 +50,52 @@ entry names a specific module only when the change is not in the core.
   opens the database read-only and reads a page at a time.
 - `export/otel` maps `step.policy`'s `policy_id` and `spec_hash` to
   `agentrt.policy.id` and `agentrt.policy.spec_hash`.
+- **`Recheck(ctx, store, runID, policy, opts)`** replays each policy
+  evaluation a run recorded, every `step.policy` carrying a `view`, the
+  resume's included, through a policy, rebuilt as the policy saw it: the
+  request with the recorded arguments and spec, or with the current spec of
+  each tool in `RecheckOptions.Tools`, whose schema the arguments are
+  checked against first; the run from `run.created` and the view; the
+  run's first steps as stored; and its first approvals with the status each
+  had when the event was written, by the seq of its `approval.decided`.
+  `RecheckReport` lists each evaluation as `same`, `different` (outcome, or
+  for `require_approval` the approval kind or hash; a policy error; never
+  the reason), `not_a_policy_evaluation` (a reconciliation's or an
+  interrupted side effect's pause), or `not_recheckable` (recorded before
+  v0.5.0, or cut by the page reads), with the spec source and the recorded
+  identity against the policy's (`IdentityUnknown`, `IdentityChanged`,
+  `IdentityUnchanged`); `Same`, `Differences`, `Rechecked`, and a
+  `MarshalJSON` that adds them. A run not terminal is re-checked up to its
+  current state, with a note. It writes nothing, reads a page at a time,
+  and reads no clock.
+- **`trace.WriteRecheck`** renders a report as text, one sanitized line per
+  evaluation, differences first.
+- **`testkit.Recheck` and `testkit.RecheckDiffers`** re-check a run under a
+  policy and fail the test on any difference, or unless exactly the steps
+  named differ; `Scenario.Recheck` re-checks the scenario's run under its
+  own policy after it runs, which a policy reading outside state fails.
+- **`export.Follower.Head`** returns the seq the follower delivered up to,
+  as its cursor saved it, and that event's stored hash, for an operator to
+  keep as an anchor of the chain. The JSON Lines record is unchanged.
+- `examples/recheck` runs a scripted agent under a lenient policy, re-checks
+  the run under a stricter one, which names the step it would have stopped,
+  and alters one event in a copy of the database for the chain check to
+  find. It needs no model.
+- `SideEffectPolicy` documents why it does not implement `IdentifiedPolicy`
+  and how a consumer wraps it to name it.
+- proxy: **`agentrt-proxy recheck -config X [-run ID | -session NAME]
+  [-limit N] [-current-tools] [-json]`** re-checks recorded calls under the
+  policy the configuration gives the proxy now (`proxy.Recheck`), exiting 0
+  when every run is the same, 1 when any differs or on an error, 2 on a
+  usage error. It opens the database read-only; `-current-tools` loads the
+  pinned tools and uses their specs as loaded now. A re-run of an attempt
+  whose outcome is unknown, which the proxy names only in memory, is read
+  back from the interruption approval it asked for.
+- proxy: the proxy's policy implements `IdentifiedPolicy`; its identity,
+  `Config.PolicyID`, is `agentrt-proxy/sha256:` and the hash of the canonical
+  JSON of the policy map and each rule's side effect, outcome, fixed values,
+  and rename, by server. Decisions the proxy records from this version carry
+  it as `policy_id`.
 
 ### Changed
 

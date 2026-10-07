@@ -252,6 +252,36 @@ func saveIf(ctx context.Context, c Cursor, seq int64, delivered bool) error {
 	return c.Save(context.WithoutCancel(ctx), seq)
 }
 
+// Head returns the Seq the follower has delivered up to, as its Cursor
+// saved it, and the stored hash of that event: the head of the event chain
+// as far as the follower delivered it, cut at 128 characters as
+// agentrt.Store.EventHash reads it. An operator keeps the pair where
+// whoever can write the database cannot reach, beside what the sink wrote,
+// and later checks it with agentrt.Store.VerifyEvents up to that Seq, or
+// agentrt verify -to: an intact chain whose event at Seq still has that
+// hash was not rewritten up to it. The hash covers every run's events up
+// to Seq, a follower of one run included, because the chain is the whole
+// database's. Head is zero and empty when nothing was delivered, or the
+// Cursor is nil and so remembers nothing; agentrt.ErrNotFound means the
+// event the cursor names is no longer stored. It reads the cursor and one
+// row and changes nothing, and may be called while Follow runs, with a
+// Cursor safe for that, as FileCursor is.
+func (f *Follower) Head(ctx context.Context) (seq int64, hash string, err error) {
+	if f.Store == nil {
+		return 0, "", errors.New("export: Follower.Store is nil")
+	}
+	if f.Cursor == nil {
+		return 0, "", nil
+	}
+	if seq, err = f.Cursor.Load(ctx); err != nil || seq <= 0 {
+		return 0, "", err
+	}
+	if hash, err = f.Store.EventHash(ctx, seq); err != nil {
+		return 0, "", fmt.Errorf("export: head at seq %d: %w", seq, err)
+	}
+	return seq, hash, nil
+}
+
 // page reads at most size events after seq, in Seq order, for the
 // follower's run or every run, through agentrt.Store.ListEventsAfter: one
 // bounded query, closed before anything is delivered, so the store's

@@ -1,10 +1,12 @@
 // Package testkit is what a consumer uses to test its tools, policy, and
 // agent against the runtime without a model: an interruption harness that
 // crashes the loop at a chosen point and resumes it in a fresh Driver, a
-// policy conformance table, schema fuzzing of tool arguments, and a render
-// equivalence check. A consumer whose own loop drives a Gate runs the same
-// harness over that loop, with Scenario.Loop. It is built on the public
-// API alone and on the scripted package, which it re-exports nothing of.
+// policy conformance table, schema fuzzing of tool arguments, a render
+// equivalence check, and a re-check of a run's decisions under a policy
+// (Recheck, RecheckDiffers, Scenario.Recheck). A consumer whose own loop
+// drives a Gate runs the same harness over that loop, with Scenario.Loop.
+// It is built on the public API alone and on the scripted and trace
+// packages, which it re-exports nothing of.
 //
 // A crash is a real one as far as the runtime can tell: the hook at the
 // crash point parks the goroutine executing the run and the harness closes
@@ -150,6 +152,11 @@ type Scenario struct {
 	// is reported. Result.Inputs is then empty, and SameRenders, which
 	// renders what an Agent was handed, needs an Agent.
 	Loop func(ctx context.Context, s *agentrt.Session) error
+	// Recheck, when set, has Run re-check the run under Policy once it is
+	// over, and report every evaluation that decides otherwise (see
+	// Recheck): a policy that reads anything but what it is handed fails
+	// it.
+	Recheck bool
 }
 
 // Call is one invocation a consumer tool received from the runtime.
@@ -197,8 +204,10 @@ type Result struct {
 // approved request executes at most once, every recorded tool start is
 // followed by its finish or by the step's interruption, the run ends
 // terminal or waiting with no step in flight, no run is left leased, and
-// every Crash was reached. Failures are reported with t.Errorf, so a test
-// sees all of them, and the Result is returned regardless.
+// every Crash was reached. With Scenario.Recheck it re-checks the run
+// under the scenario's policy as well. Failures are reported with
+// t.Errorf, so a test sees all of them, and the Result is returned
+// regardless.
 func Run(t testing.TB, sc Scenario, crashes ...Crash) Result {
 	t.Helper()
 	h := newHarness(t, sc, crashes)
@@ -224,6 +233,7 @@ func Run(t testing.TB, sc Scenario, crashes ...Crash) Result {
 	}
 	res := h.result(ctx)
 	h.check(res)
+	h.recheck(res)
 	return res
 }
 

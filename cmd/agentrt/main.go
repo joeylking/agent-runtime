@@ -90,6 +90,13 @@ policy, so resume belongs in the consumer's own command:
 
   run, err := driver.Resume(ctx, runID)
 
+There is no recheck command for the same reason: re-checking a run's
+decisions hands them to the consumer's policy, so it belongs in the
+consumer's own command, or in its tests (testkit.Recheck):
+
+  report, err := agentrt.Recheck(ctx, store, runID, policy, agentrt.RecheckOptions{})
+  trace.WriteRecheck(os.Stdout, report)
+
 exit status: 0 success, 1 error, 2 usage.
 `
 

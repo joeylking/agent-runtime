@@ -447,6 +447,29 @@ nested module, released as `proxy/v0.1.0`.
 | Recording specs, identities, views, and hashes reads no clock | Verified | `TestDriver_ClockReadingsAreStable` |
 | `export/otel` carries `policy_id` and `spec_hash` as `agentrt.policy.id` and `agentrt.policy.spec_hash` | Verified | `TestExporter_RunAndStepSpans` |
 
+## Re-checkable decisions: re-checking a run
+
+| Capability | Status | Reference |
+|---|---|---|
+| `Recheck` under the policy a run ran with reports every evaluation the same: an allow, a deny, and an approval granted and resumed, the resume a line of its own, the identity unchanged, and the recorded approval hash the stored approval's | Verified | `recheck.go`, `TestRecheck_SamePolicyIsSame` |
+| Under a stricter policy the report names exactly the evaluations that differ and what they would have become | Verified | `TestRecheck_StricterPolicyNamesTheStepsThatDiffer` |
+| A policy whose approval presentation changed differs on each `require_approval` by the approval's hash while the outcome matches; a changed reason is never a difference | Verified | `TestRecheck_ChangedPresentationDiffersByHash` |
+| Recorded specs against current ones: a tool whose description changed between runs re-checks the same against what each run recorded, and today's spec makes the earlier run's approvals other approvals; a tool no longer registered, or arguments today's schema refuses, differ | Verified | `TestRecheck_CurrentSpecsAgainstRecordedSpecs` |
+| A policy error is a difference; a run not terminal is re-checked up to its current state with a note; a missing run is `ErrNotFound`; an identity `NewDriver` refuses is refused | Verified | `TestRecheck_PolicyErrorAndRunNotTerminal` |
+| The view handed to the policy in a re-check is, field by field, the one it was handed, and the request the same, in a model-backed loop, on resume, and through a gate's Propose and Attach | Verified | `TestRecheck_RebuildsTheViewOfTheLoop`, `TestRecheck_RebuildsTheViewOnResume`, `TestRecheck_RebuildsTheViewThroughAGate` |
+| A v0.4.0 database is re-checked rather than refused: its `step.policy` events are not re-checkable, a run created then says so, and an evaluation made after the migration is re-checked | Verified | `TestRecheck_PreMigrationRunIsNotRecheckable` |
+| An interrupted side effect's pause is reported as no policy evaluation, between the step's first evaluation and the one on resume | Verified | `testkit`, `TestRecheck_InterruptedSideEffectPauseIsNotAPolicyEvaluation` |
+| The text and JSON renderings are pinned; the text is one sanitized line per evaluation, differences first | Verified | `TestRecheck_RenderingsArePinned`, `TestWriteRecheck_OneSanitizedLinePerEvaluationDifferencesFirst`, `ExampleRecheck` |
+| `SideEffectPolicy` does not implement `IdentifiedPolicy` | Verified | `TestSideEffectPolicy_IsNotIdentified` |
+| `testkit.Recheck` passes a policy that decides from its input and fails one that reads outside state, through `Scenario.Recheck`; `testkit.RecheckDiffers` asserts the steps a second policy changes and reports a wrong expectation with the report | Verified | `TestRecheck_ScenarioPolicyThatDecidesFromItsInputPasses`, `TestRecheck_PolicyThatReadsOutsideStateFails`, `TestRecheckDiffers_NamesTheStepsASecondPolicyChanges` |
+| `export.Follower.Head` is the seq delivered up to and its stored hash, which `VerifyEvents` up to it finds intact, unmoved by events not yet delivered | Verified | `TestFollower_HeadIsTheChainAsFarAsDelivered` |
+| The demonstration re-checks a scripted run under a stricter policy, which names the step it would have stopped, and the chain check finds an event altered in a copy | Verified | `examples/recheck`, `TestRun_StricterPolicyStopsThePublishAndVerifyFindsTheAlteredEvent` |
+| The proxy's calls re-check the same under the configuration they ran with, identified by it; under a policy now denying payments the payment's two decisions are named and nothing else; `-run`, a limit, and another session select runs | Verified | `proxy`, `TestRecheck_ChangedPolicyNamesTheCallsNowDenied` |
+| The proxy's policy identity covers the policy map and each rule's side effect, outcome, fixed values, and rename, and nothing else | Verified | `TestConfig_PolicyIDCoversWhatThePolicyDecidesFrom` |
+| With the tools loaded now, a reworded payment description makes its approvals other approvals while the recorded specs re-check the same and the identity stays | Verified | `TestRecheck_CurrentToolsAfterADescriptionChange` |
+| A re-run of a payment whose outcome is unknown re-checks the same, the attempt it re-ran read from its interruption approval | Verified | `TestRecheck_ReRunOfAnUnknownOutcomeIsTheSame` |
+| `agentrt-proxy recheck` exits 0 when every run is the same, 1 when one differs or the run is missing, 2 on a usage error; prints text or JSON; `-current-tools` reports the load on stderr | Verified | `proxy/internal/cli`, `TestCLI_Recheck` |
+
 ## Not implemented
 
 | Capability | Where it is planned |

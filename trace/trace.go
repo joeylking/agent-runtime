@@ -1,7 +1,8 @@
 // Package trace provides the two observers an operator wants while a run
 // executes: aligned lines for a terminal and JSON Lines for a collector.
 // Both are safe for concurrent use, because the runtime delivers events
-// from whichever goroutine committed them.
+// from whichever goroutine committed them. WriteRecheck renders a re-check
+// report (agentrt.Recheck) for the same terminal.
 package trace
 
 import (

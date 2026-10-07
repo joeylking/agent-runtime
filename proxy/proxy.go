@@ -141,6 +141,12 @@ type Proxy struct {
 		sync.Mutex
 		m map[string]*attempt
 	}
+	// policyID is the configuration's PolicyID, which the gate records
+	// with every decision. recorded marks a proxy built to re-check
+	// recorded runs (Recheck), whose policy reads what reruns would have
+	// named from the record instead.
+	policyID string
+	recorded bool
 }
 
 // options are what a test changes.
@@ -181,6 +187,7 @@ func open(ctx context.Context, cfg *Config, o options) (*Proxy, []*mcp.Report, e
 		now:        o.now,
 		poll:       o.poll,
 		stopping:   make(chan struct{}),
+		policyID:   cfg.PolicyID(),
 	}
 	p.reruns.m = map[string]*attempt{}
 	fail := func(err error) (*Proxy, []*mcp.Report, error) {
@@ -193,46 +200,9 @@ func open(ctx context.Context, cfg *Config, o options) (*Proxy, []*mcp.Report, e
 	if err := cfg.checkReach(); err != nil {
 		return fail(err)
 	}
-	window := cfg.RepeatWindow.or(DefaultRepeatWindow)
-	var gateTools []agentrt.Tool
-	for _, sc := range cfg.Servers {
-		manifest, err := readManifest(sc.Manifest)
-		if err != nil {
-			return fail(fmt.Errorf("server %q: manifest: %w", sc.Name, err))
-		}
-		rules, err := sc.rules()
-		if err != nil {
-			return fail(err)
-		}
-		loaded, report, err := mcp.Load(ctx, sc.Server(), manifest, rules)
-		if report != nil {
-			p.reports = append(p.reports, report)
-		}
-		if err != nil {
-			return fail(err)
-		}
-		p.conns = append(p.conns, report.Connection)
-		// Load registers its tools in the order of report.Registered.
-		for i, at := range loaded {
-			reg := report.Registered[i]
-			spec := at.Spec()
-			spec.Terminal = true
-			if spec.Name == p.statusName {
-				return fail(fmt.Errorf("server %q registers tool %q under %q, the status tool's name: rename one (status_tool or the rule's rename)", sc.Name, reg.Tool, spec.Name))
-			}
-			if _, dup := p.tools[spec.Name]; dup {
-				return fail(fmt.Errorf("server %q registers %q, which another server already registered", sc.Name, spec.Name))
-			}
-			rule := sc.Rules[reg.Tool]
-			t := &tool{
-				name: spec.Name, server: sc.Name, remote: reg.Tool, class: spec.SideEffect, spec: spec,
-				fixed: rule.Fixed, outcome: rule.Outcome, window: rule.RepeatWindow.or(window), inner: at,
-			}
-			t.known = knownError(t)
-			p.tools[spec.Name] = t
-			p.order = append(p.order, spec.Name)
-			gateTools = append(gateTools, gateTool{t})
-		}
+	gateTools, err := p.load(ctx)
+	if err != nil {
+		return fail(err)
 	}
 	store, err := agentrt.OpenStore(cfg.Database)
 	if err != nil {
@@ -261,6 +231,56 @@ func open(ctx context.Context, cfg *Config, o options) (*Proxy, []*mcp.Report, e
 		return fail(err)
 	}
 	return p, p.reports, nil
+}
+
+// load connects to every upstream server, loads its tools against its
+// manifest and rules, and registers them with the proxy, returning them
+// as the gate registers them. The connections and reports are kept on p,
+// which Close releases.
+func (p *Proxy) load(ctx context.Context) ([]agentrt.Tool, error) {
+	cfg := p.cfg
+	window := cfg.RepeatWindow.or(DefaultRepeatWindow)
+	var gateTools []agentrt.Tool
+	for _, sc := range cfg.Servers {
+		manifest, err := readManifest(sc.Manifest)
+		if err != nil {
+			return nil, fmt.Errorf("server %q: manifest: %w", sc.Name, err)
+		}
+		rules, err := sc.rules()
+		if err != nil {
+			return nil, err
+		}
+		loaded, report, err := mcp.Load(ctx, sc.Server(), manifest, rules)
+		if report != nil {
+			p.reports = append(p.reports, report)
+		}
+		if err != nil {
+			return nil, err
+		}
+		p.conns = append(p.conns, report.Connection)
+		// Load registers its tools in the order of report.Registered.
+		for i, at := range loaded {
+			reg := report.Registered[i]
+			spec := at.Spec()
+			spec.Terminal = true
+			if spec.Name == p.statusName {
+				return nil, fmt.Errorf("server %q registers tool %q under %q, the status tool's name: rename one (status_tool or the rule's rename)", sc.Name, reg.Tool, spec.Name)
+			}
+			if _, dup := p.tools[spec.Name]; dup {
+				return nil, fmt.Errorf("server %q registers %q, which another server already registered", sc.Name, spec.Name)
+			}
+			rule := sc.Rules[reg.Tool]
+			t := &tool{
+				name: spec.Name, server: sc.Name, remote: reg.Tool, class: spec.SideEffect, spec: spec,
+				fixed: rule.Fixed, outcome: rule.Outcome, window: rule.RepeatWindow.or(window), inner: at,
+			}
+			t.known = knownError(t)
+			p.tools[spec.Name] = t
+			p.order = append(p.order, spec.Name)
+			gateTools = append(gateTools, gateTool{t})
+		}
+	}
+	return gateTools, nil
 }
 
 // checkDatabase refuses a database file that another user owns, or that
