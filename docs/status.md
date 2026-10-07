@@ -428,6 +428,25 @@ nested module, released as `proxy/v0.1.0`.
 | The demonstration runs with no model: an allowed read, an approval collected once, a crash that waits for the operator, and one execution with the proxy against two without | Verified | `proxy/example/main.go`, `TestDemo_RunsEveryStep` |
 | `mcp.ReadRules`, `ReadManifest`, and `ReadOwned` read the operator's files only when they are the user's own and nobody else can write them, and refuse unknown fields | Verified | `mcp/file.go`, `TestReadRules_ConvertsTheOperatorsFormat`, `TestReadRules_RefusesWhatItDoesNotKnow`, `TestReadOwned_RefusesAFileOthersCanWrite` |
 
+## Re-checkable decisions: the record
+
+| Capability | Status | Reference |
+|---|---|---|
+| Each distinct tool spec is stored once in `tool_specs` under the hex SHA-256 of its canonical JSON, every field included; each tool_call step naming a registered tool records the hash with its decision, valid or not, and its `step.policy` event names the same spec; `run.created` lists every registered tool's hash in name order; `Store.ToolSpec` reads a spec back and refuses one whose stored JSON no longer hashes | Verified | `record.go`, `TestToolSpec_StoredOnceAndReferencedByEachStep` |
+| A tool registered again with another description, timeout, or terminal flag is another spec, and both stay readable | Verified | `TestToolSpec_ChangedSpecIsAnotherHash` |
+| A policy implementing `IdentifiedPolicy` has its identity recorded on each step it evaluated and in that `step.policy`; a step it never saw, and a plain policy, record none; an identity over 256 bytes, not UTF-8, or holding a control character is refused by `NewDriver` and `NewGate` | Verified | `TestPolicyID_RecordedOnStepAndEvent`, `TestPolicyID_MalformedIsRefused` |
+| `step.policy` carries what the policy saw of the run: the run rebuilt from `run.created` and its `view` equals the `RunView`'s run field by field, and its step and approval counts are the run's first ones, in a model-backed loop, on resume, and through a gate | Verified | `TestPolicyView_IsWhatThePolicySawInTheLoop`, `TestPolicyView_IsWhatThePolicySawOnResume`, `TestPolicyView_IsWhatThePolicySawThroughAGate` |
+| Every event is chained to the previous one by seq across runs, in its writing transaction; the encoding (netstrings, SHA-256) is pinned by a literal and recomputed independently | Verified | `chain.go`, `TestEventHash_Golden`, `TestVerifyEvents_IntactChainAcrossRuns` |
+| `VerifyEvents` reports the first event that does not chain: an altered payload or time at its seq, a deleted event at the next seq, two swapped events at the first; a chain cut at its end verifies, and only a kept head (`ChainHead`, `EventHash`) shows it | Verified | `TestVerifyEvents_FindsTheFirstAlteredEvent` |
+| A field past a page is read and hashed in chunks of `MaxPageText`, and a change past the first chunk is found | Verified | `TestVerifyEvents_ReadsLongFieldsInChunks` |
+| Many runs written at once from several stores on one file leave one intact chain | Verified | `TestVerifyEvents_ConcurrentWritersKeepTheChain` |
+| The fixtures that emit every event type, a pause and resume, a crashed process taken over, a cancel with a late tool outcome, a model-backed run with a retry, form one intact chain, and the follower delivers all of it | Verified | `export/otel`, `TestFixtures_EventChainIsIntact` |
+| Migration 6 adds `tool_specs`, `steps.spec_hash` and `policy_id`, and `events.hash`, backfilling the hashes in seq order; a v0.4.0 database is refused by `OpenExisting` until migrated, then has its runs intact, the same hashes on every migration of the same events, an intact chain, and a waiting run that resumes onto it recording the spec it ran with; released migrations are pinned | Verified | `TestStore_V040DatabaseMigratesWithChainedEvents`, `TestStore_ReleasedMigrationsAreUnchanged` |
+| `agentrt verify [-from N] [-to N]` prints the head and "intact" or the first break with the hash expected and found, in text or JSON, exits 0, 1 on a break, 2 on bad arguments before opening anything, and does not change the file | Verified | `cmd/agentrt`, `TestVerify_IntactChainExitsZero`, `TestVerify_BrokenChainExitsOne`, `TestVerify_BadArgumentsAreUsage` |
+| The JSON Lines record of an event read back from the store is byte for byte as before: `Event` has no hash field | Verified | `TestJSONL_RecordIsByteStable` |
+| Recording specs, identities, views, and hashes reads no clock | Verified | `TestDriver_ClockReadingsAreStable` |
+| `export/otel` carries `policy_id` and `spec_hash` as `agentrt.policy.id` and `agentrt.policy.spec_hash` | Verified | `TestExporter_RunAndStepSpans` |
+
 ## Not implemented
 
 | Capability | Where it is planned |

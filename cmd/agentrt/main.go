@@ -1,7 +1,7 @@
 // Command agentrt is the operator surface over a runs database: list runs,
-// show one, print its event log, and approve, reject, or cancel. It reads
-// and decides; it never executes a step, and it never creates or migrates
-// the database it is pointed at.
+// show one, print its event log, verify the event log's hash chain, and
+// approve, reject, or cancel. It reads and decides; it never executes a
+// step, and it never creates or migrates the database it is pointed at.
 //
 //	agentrt [-db path] [-json] <command> [arguments]
 //
@@ -43,6 +43,7 @@ commands:
   approve <run>         grant the run's pending approval
   reject <run>          refuse it, which cancels the run
   cancel <run>          end a run that is not terminal
+  verify                check the hash chain over every run's events
 
 global flags:
   -db path              SQLite database (default: $AGENTRT_DB)
@@ -69,6 +70,16 @@ with none of those and stdin not a terminal, they refuse rather than guess.
 
 cancel flags (may come before or after the run id):
   -by who, -note text   as above, without the confirmation requirement
+
+verify flags:
+  -from n               first event to check, by seq (default: the first)
+  -to n                 last event to check, by seq (default: the newest)
+
+verify prints the chain's head and either "intact" or the first event that
+does not chain, and exits 1 for a break. It reads a page at a time and
+writes nothing. An intact chain shows the events were not altered only up
+to a head kept where whoever can write the database cannot reach: such a
+writer can recompute every hash after a row they changed.
 
 agentrt never creates a missing database and never migrates one on a
 different schema version than this build: that is the consumer's job.
@@ -317,6 +328,8 @@ func parse(cmd string, args []string) (*command, error) {
 		return parseDecide(args, false)
 	case "cancel":
 		return parseCancel(args)
+	case "verify":
+		return parseVerify(args)
 	default:
 		return nil, fmt.Errorf("%w: unknown command %q", errUsage, cmd)
 	}
@@ -452,6 +465,25 @@ func parseCancel(args []string) (*command, error) {
 	return &command{readOnly: false, exec: func(ctx context.Context, e *env) error {
 		return cmdCancel(ctx, e, runID, who(*by), *note)
 	}}, nil
+}
+
+func parseVerify(args []string) (*command, error) {
+	fs := newFlagSet("verify")
+	from := fs.Int64("from", 0, "first event to check, by seq")
+	to := fs.Int64("to", 0, "last event to check, by seq")
+	if err := fs.Parse(args); err != nil {
+		return nil, parseErr(err)
+	}
+	if fs.NArg() > 0 {
+		return nil, fmt.Errorf("%w: verify: unexpected argument %q", errUsage, fs.Arg(0))
+	}
+	if *from < 0 || *to < 0 {
+		return nil, fmt.Errorf("%w: verify: -from and -to are seq numbers, not negative", errUsage)
+	}
+	if *from > 0 && *to > 0 && *to < *from {
+		return nil, fmt.Errorf("%w: verify: -to %d is before -from %d", errUsage, *to, *from)
+	}
+	return &command{readOnly: true, exec: func(ctx context.Context, e *env) error { return cmdVerify(ctx, e, *from, *to) }}, nil
 }
 
 // cmdRuns lists runs, newest first, reading only the page it prints.
@@ -819,6 +851,72 @@ func cmdEvents(ctx context.Context, e *env, runID string, limit, offset int) err
 	}
 	fmt.Fprintf(e.out, "... %d more event(s); rerun with -offset %d to see them (showing %d of %d)\n",
 		total-offset-shown, offset+shown, shown, total)
+	return nil
+}
+
+// errChainBroken is verify's error for an event that does not chain,
+// after the break has been printed.
+var errChainBroken = errors.New("the event chain is broken")
+
+// cmdVerify checks the events' hash chain from -from to -to and prints the
+// head and what it found. The head is read first, so events committed
+// while it runs are not checked.
+func cmdVerify(ctx context.Context, e *env, from, to int64) error {
+	seq, hash, err := e.store.ChainHead(ctx)
+	if err != nil {
+		return err
+	}
+	if to == 0 {
+		to = seq
+	}
+	rep := agentrt.VerifyReport{}
+	if to > 0 {
+		if rep, err = e.store.VerifyEvents(ctx, from, to); err != nil {
+			return err
+		}
+	}
+	if e.json {
+		type head struct {
+			Seq  int64  `json:"seq"`
+			Hash string `json:"hash"`
+		}
+		type chainBreak struct {
+			Seq      int64  `json:"seq"`
+			Expected string `json:"expected"`
+			Found    string `json:"found"`
+			Detail   string `json:"detail"`
+		}
+		out := struct {
+			Head    head        `json:"head"`
+			From    int64       `json:"from"`
+			To      int64       `json:"to"`
+			Checked int64       `json:"checked"`
+			Intact  bool        `json:"intact"`
+			Break   *chainBreak `json:"break,omitempty"`
+		}{Head: head{seq, hash}, From: rep.From, To: rep.To, Checked: rep.Checked, Intact: rep.Break == nil}
+		if b := rep.Break; b != nil {
+			out.Break = &chainBreak{b.Seq, b.Expected, b.Found, b.Detail}
+		}
+		if err := printJSON(e.out, out); err != nil {
+			return err
+		}
+	} else {
+		if seq == 0 {
+			fmt.Fprintln(e.out, "head: no events")
+		} else {
+			fmt.Fprintf(e.out, "head: seq %d %s\n", seq, trace.Sanitize(hash))
+		}
+		if b := rep.Break; b != nil {
+			fmt.Fprintf(e.out, "broken at seq %d: %s\n  expected %s\n  found    %s\n", b.Seq, b.Detail, b.Expected, dash(trace.Sanitize(b.Found)))
+		} else if rep.Checked == 0 {
+			fmt.Fprintln(e.out, "intact: no events in the range")
+		} else {
+			fmt.Fprintf(e.out, "intact: %d event(s), seq %d to %d\n", rep.Checked, rep.From, rep.To)
+		}
+	}
+	if rep.Break != nil {
+		return fmt.Errorf("%w at seq %d", errChainBroken, rep.Break.Seq)
+	}
 	return nil
 }
 

@@ -196,6 +196,20 @@ cannot influence.
   tool's schema, fails the run as `reconcile_conflict` instead. A step
   that was executing a `ReadOnly` tool, or deciding, continues. With
   `Config.Reconcile`, the consumer's reconciliation decides.
+- The events are a hash chain: each event's stored hash covers the previous
+  event's hash and the event's own fields as stored, and is written in the
+  same transaction (`chain.go`). `Store.VerifyEvents` and `agentrt verify`
+  find the first event altered, deleted, or reordered by anything that did
+  not also rewrite the chain after it, which catches corruption and a
+  careless or partial edit. It is not a defence against whoever can write
+  the database: they can recompute every hash after the row they changed,
+  or cut events from the end, and the chain still verifies. It shows the
+  record unaltered only up to a head (`ChainHead`, `EventHash`) kept where
+  that writer cannot reach, and compared later. Events stored before
+  migration 6 were hashed when it ran, so their hashes say nothing about
+  what happened to them before. The chain covers events only: the state
+  tables are not chained, and an approval's own hash still binds the
+  approval.
 
 ### The database file
 
@@ -226,7 +240,9 @@ cannot influence.
   reads at most the rows asked for, caps every text column at
   `agentrt.MaxPageText` (64 Ki characters), and takes its "N more" total
   from a `COUNT`, so neither many rows nor one huge row can exhaust the
-  operator's memory. `approve`, `reject`, and `cancel` read the one run
+  operator's memory. `verify` reads 128 events at a time, each field in
+  chunks of at most `MaxPageText` bytes, and holds no event whole.
+  `approve`, `reject`, and `cancel` read the one run
   and approval they decide whole, because the decision is bound to the
   approval's hash.
 

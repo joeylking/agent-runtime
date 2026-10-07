@@ -276,6 +276,17 @@ type Step struct {
 	Observation *Observation
 	StartedAt   time.Time
 	FinishedAt  time.Time
+	// SpecHash is the hash of the spec of the tool a tool_call decision
+	// named, recorded with the decision when the tool was registered and
+	// readable whole with Store.ToolSpec; empty for any other decision and
+	// for a step written before it existed.
+	SpecHash string
+	// PolicyID is the identity of the policy that evaluated the step's
+	// request, recorded once the policy was asked: empty when it does not
+	// implement IdentifiedPolicy, when it was never asked, and when the
+	// step's Policy was written by a reconciliation or an interrupted
+	// side effect's pause rather than by the policy.
+	PolicyID string
 	// DecodeError is set when a stored column of the step could not be
 	// decoded; the fields it would have filled are left empty. It lets a
 	// damaged row be listed, shown, and cancelled rather than failing every
@@ -418,6 +429,18 @@ type Approval struct {
 // by the runtime and the agent has no influence over it.
 type Policy interface {
 	Evaluate(ctx context.Context, req ToolRequest, view RunView) (PolicyDecision, error)
+}
+
+// IdentifiedPolicy is a Policy that names itself, so a recorded decision
+// says which policy made it: a version, a digest of its rules, whatever
+// lets an operator tell two policies apart. NewDriver and NewGate read the
+// identity once, and refuse one longer than 256 bytes, not valid UTF-8, or
+// holding a control character. It is recorded on each step the policy
+// evaluated, as Step.PolicyID, and in its step.policy event. A policy
+// that does not implement it is recorded with an empty identity.
+type IdentifiedPolicy interface {
+	Policy
+	PolicyID() string
 }
 
 // StepInput is everything the agent receives when asked to decide. Steps are

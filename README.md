@@ -378,6 +378,7 @@ go run ./cmd/agentrt -db runs.db -json events <run>   # the same as JSON Lines
 go run ./cmd/agentrt -db runs.db approve <run> -approval <id> -by joey -note "ok"
 go run ./cmd/agentrt -db runs.db reject <run> -approval <id> -note "not this file"
 go run ./cmd/agentrt -db runs.db cancel <run>
+go run ./cmd/agentrt -db runs.db verify           # the events' hash chain
 ```
 
 `cmd/agentrt` reads `-db` or `AGENTRT_DB`, prints aligned text or JSON, and
@@ -389,6 +390,11 @@ exits 0, 1, or 2. `-db` and `-json` go before the subcommand. `approve`,
   migrates one.
 - `runs`, `show`, and `events` open the database read-only and page their
   output with `-limit` and `-offset`.
+- `verify` opens it read-only, checks the hash chain over every run's
+  events, `-from` and `-to` a range of seq, and prints the head and
+  "intact" or the first event that does not chain, exiting 1 for a break.
+  An intact chain means the events are unaltered only up to a head you kept
+  somewhere the database's writers cannot reach.
 - In text output, `approve` and `reject` print the waiting request first.
   They need
   `-approval <id>`, `-yes`, or a yes typed at a terminal, and the decision

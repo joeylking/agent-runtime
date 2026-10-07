@@ -285,15 +285,17 @@ const (
 	sqlSelectRun     = `SELECT id, goal, status, reason, reason_detail, limits_json, step_count, created_at, started_at, finished_at, result_json, model_calls, input_tokens, output_tokens, cached_input_tokens, estimated_cost_micros, active_ms FROM runs WHERE id = ?`
 	sqlRunStatus     = `SELECT status, lease_owner = ? FROM runs WHERE id = ?`
 	sqlClaimStep     = `UPDATE runs SET step_count = step_count + 1 WHERE id=? AND status=? AND step_count=? AND lease_owner=?`
-	sqlInsertStep    = `INSERT INTO steps (id, run_id, idx, status, decision_json, policy_json, observation_json, observation_hash, started_at, finished_at) VALUES (?,?,?,?,?,?,?,?,?,?)`
-	sqlUpdateStep    = `UPDATE steps SET status=?, decision_json=?, policy_json=?, observation_json=?, observation_hash=?, started_at=?, finished_at=? WHERE id=?`
+	sqlInsertStep    = `INSERT INTO steps (id, run_id, idx, status, decision_json, policy_json, observation_json, observation_hash, started_at, finished_at, spec_hash, policy_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+	sqlUpdateStep    = `UPDATE steps SET status=?, decision_json=?, policy_json=?, observation_json=?, observation_hash=?, started_at=?, finished_at=?, spec_hash=?, policy_id=? WHERE id=?`
 	sqlAddActiveTime = `UPDATE runs SET active_ms = active_ms + ? WHERE id=?`
-	sqlAppendEvent   = `INSERT INTO events (run_id, step_id, at, type, payload_json) VALUES (?,?,?,?,?) RETURNING seq`
+	sqlChainHead     = `SELECT MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0), COALESCE((SELECT MAX(seq) FROM events), 0)), COALESCE((SELECT hash FROM events ORDER BY seq DESC LIMIT 1), '')`
+	sqlAppendEvent   = `INSERT INTO events (seq, run_id, step_id, at, type, payload_json, hash) VALUES (?,?,?,?,?,?,?)`
+	sqlPutSpec       = `INSERT OR IGNORE INTO tool_specs (hash, spec_json) VALUES (?,?)`
 )
 
 func (s *Store) prepare(ctx context.Context) error {
 	s.stmts = map[string]*sql.Stmt{}
-	for _, q := range []string{sqlSelectRun, sqlRunStatus, sqlClaimStep, sqlInsertStep, sqlUpdateStep + stepGuard(1), sqlAddActiveTime, sqlAppendEvent} {
+	for _, q := range []string{sqlSelectRun, sqlRunStatus, sqlClaimStep, sqlInsertStep, sqlUpdateStep + stepGuard(1), sqlAddActiveTime, sqlChainHead, sqlAppendEvent, sqlPutSpec} {
 		st, err := s.db.PrepareContext(ctx, q)
 		if err != nil {
 			s.closeStmts()
@@ -515,10 +517,25 @@ var migrations = []string{
 	// Resume treats as expired.
 	`ALTER TABLE runs ADD COLUMN lease_owner TEXT NOT NULL DEFAULT '';
 	ALTER TABLE runs ADD COLUMN lease_expires_at TEXT NOT NULL DEFAULT '';`,
+	// What a decision can be rechecked against: each distinct tool spec by
+	// its hash, the spec and policy each step was decided under, and the
+	// hash chain over the events, which the migration backfills for the
+	// events already stored. A step written before it has neither.
+	`CREATE TABLE tool_specs (
+		hash TEXT PRIMARY KEY,
+		spec_json TEXT NOT NULL
+	);
+	ALTER TABLE steps ADD COLUMN spec_hash TEXT NOT NULL DEFAULT '';
+	ALTER TABLE steps ADD COLUMN policy_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE events ADD COLUMN hash TEXT NOT NULL DEFAULT '';`,
 }
 
 // leaseMigration is the version that added the run lease.
 const leaseMigration = 5
+
+// chainMigration is the version that added the event hash chain, whose
+// hashes it computes for the events already stored.
+const chainMigration = 6
 
 // preLeaseOwner is the lease owner stamped, with an expiry DefaultLeaseTTL
 // away, on every RUNNING run when the lease migration is applied: such a
@@ -561,6 +578,11 @@ func (s *Store) migrate(ctx context.Context) (err error) {
 			// in a process of that version, which ignores leases. It gets
 			// one lease's grace before Resume may take it over.
 			if _, err := tx.ExecContext(ctx, `UPDATE runs SET lease_owner=?, lease_expires_at=? WHERE status=?`, preLeaseOwner, formatTime(time.Now().Add(DefaultLeaseTTL)), StatusRunning); err != nil {
+				return fmt.Errorf("agentrt: migration %d: %w", i+1, err)
+			}
+		}
+		if i+1 == chainMigration {
+			if err := backfillChain(ctx, tx); err != nil {
 				return fmt.Errorf("agentrt: migration %d: %w", i+1, err)
 			}
 		}
@@ -686,7 +708,7 @@ func (s *Store) ListSteps(ctx context.Context, runID string) ([]Step, error) {
 }
 
 func (s *Store) listStepRows(ctx context.Context, runID string) ([]stepRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, idx, status, decision_json, policy_json, observation_json, started_at, finished_at FROM steps WHERE run_id = ? ORDER BY idx`, runID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, idx, status, decision_json, policy_json, observation_json, started_at, finished_at, spec_hash, policy_id FROM steps WHERE run_id = ? ORDER BY idx`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -694,7 +716,7 @@ func (s *Store) listStepRows(ctx context.Context, runID string) ([]stepRow, erro
 	var out []stepRow
 	for rows.Next() {
 		var r stepRow
-		if err := rows.Scan(&r.id, &r.runID, &r.index, &r.status, &r.decision, &r.policy, &r.observation, &r.started, &r.finished); err != nil {
+		if err := rows.Scan(&r.id, &r.runID, &r.index, &r.status, &r.decision, &r.policy, &r.observation, &r.started, &r.finished, &r.specHash, &r.policyID); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -708,6 +730,7 @@ type stepRow struct {
 	index                                                  int
 	status                                                 StepStatus
 	decision, policy, observation, hash, started, finished string
+	specHash, policyID                                     string
 	// src are the values the JSON columns were encoded from. The driver
 	// never writes through a step's pointers, it assigns new ones, so a
 	// later write of the same step reuses the text of any it kept.
@@ -721,7 +744,7 @@ type stepRow struct {
 // encodeStep is st as stored. prev, the row last written for the same step,
 // lends the text of the values st still points to.
 func encodeStep(st Step, prev *stepRow) (stepRow, error) {
-	r := stepRow{id: st.ID, runID: st.RunID, index: st.Index, status: st.Status, hash: obsHash(st.Observation), started: formatTime(st.StartedAt), finished: formatTime(st.FinishedAt)}
+	r := stepRow{id: st.ID, runID: st.RunID, index: st.Index, status: st.Status, hash: obsHash(st.Observation), started: formatTime(st.StartedAt), finished: formatTime(st.FinishedAt), specHash: st.SpecHash, policyID: st.PolicyID}
 	r.src.decision, r.src.policy, r.src.observation = st.Decision, st.Policy, st.Observation
 	if prev == nil || prev.id != st.ID {
 		prev = &stepRow{}
@@ -751,7 +774,7 @@ func encodeStep(st Step, prev *stepRow) (stepRow, error) {
 // not decode leaves its field empty and is named in DecodeError, so one
 // damaged row cannot make its run unreadable.
 func (r *stepRow) decode(prev *stepRow, prevStep *Step) Step {
-	st := Step{ID: r.id, RunID: r.runID, Index: r.index, Status: r.status}
+	st := Step{ID: r.id, RunID: r.runID, Index: r.index, Status: r.status, SpecHash: r.specHash, PolicyID: r.policyID}
 	if prev == nil || prevStep == nil || prev.id != r.id {
 		prev, prevStep = &stepRow{}, &Step{}
 	}
@@ -1084,7 +1107,7 @@ func (s *Store) ListStepsPage(ctx context.Context, runID string, limit, offset i
 		reduceJSON("decision_json", [2]string{"kind", extract("decision_json", "$.kind")}, [2]string{"tool", extract("decision_json", "$.tool")})+`, `+
 		reduceJSON("policy_json", [2]string{"outcome", extract("policy_json", "$.outcome")})+`, `+
 		reduceJSON("observation_json", [2]string{"kind", extract("observation_json", "$.kind")}, [2]string{"summary", extract("observation_json", "$.summary")})+`, `+
-		`length(decision_json), length(policy_json), length(observation_json), `+capText("started_at")+`, `+capText("finished_at")+
+		`length(decision_json), length(policy_json), length(observation_json), `+capText("started_at")+`, `+capText("finished_at")+`, `+capText("spec_hash")+`, `+capText("policy_id")+
 		` FROM steps WHERE run_id = ? ORDER BY idx LIMIT ? OFFSET ?`, runID, limit, offset)
 	if err != nil {
 		return nil, 0, err
@@ -1095,7 +1118,7 @@ func (s *Store) ListStepsPage(ctx context.Context, runID string, limit, offset i
 		pageRow()
 		var r stepRow
 		var lens [3]int
-		if err := rows.Scan(&r.id, &r.runID, &r.index, &r.status, &r.decision, &r.policy, &r.observation, &lens[0], &lens[1], &lens[2], &r.started, &r.finished); err != nil {
+		if err := rows.Scan(&r.id, &r.runID, &r.index, &r.status, &r.decision, &r.policy, &r.observation, &lens[0], &lens[1], &lens[2], &r.started, &r.finished, &r.specHash, &r.policyID); err != nil {
 			return nil, 0, err
 		}
 		st := r.decode(nil, nil)
@@ -1304,6 +1327,14 @@ type txn struct {
 	// run must hold, and the lease a move to RUNNING takes. The operator
 	// paths leave it nil: they need no lease.
 	lease *leaseTerms
+	// head is the last event in the chain, read at the transaction's
+	// first append and advanced by each, so a transaction that appends
+	// several events reads it once.
+	head struct {
+		seq  int64
+		hash string
+		read bool
+	}
 }
 
 func (s *Store) tx(ctx context.Context, obs Observer, fn func(t *txn) error) error {
@@ -1597,7 +1628,7 @@ func (t *txn) insertStep(ctx context.Context, st Step) error {
 		return err
 	}
 	if _, err := t.exec(ctx, sqlInsertStep,
-		r.id, r.runID, r.index, r.status, r.decision, r.policy, r.observation, r.hash, r.started, r.finished); err != nil {
+		r.id, r.runID, r.index, r.status, r.decision, r.policy, r.observation, r.hash, r.started, r.finished, r.specHash, r.policyID); err != nil {
 		return err
 	}
 	t.steps = append(t.steps, r)
@@ -1613,7 +1644,7 @@ func (t *txn) updateStep(ctx context.Context, st Step, from ...StepStatus) error
 		return err
 	}
 	res, err := t.exec(ctx, sqlUpdateStep+stepGuard(len(from)),
-		append([]any{r.status, r.decision, r.policy, r.observation, r.hash, r.started, r.finished, r.id}, stepArgs(from)...)...)
+		append([]any{r.status, r.decision, r.policy, r.observation, r.hash, r.started, r.finished, r.specHash, r.policyID, r.id}, stepArgs(from)...)...)
 	if err != nil {
 		return err
 	}
@@ -1737,15 +1768,29 @@ func (t *txn) emit(ctx context.Context, e Event, v any) error {
 	return t.appendEvent(ctx, e)
 }
 
+// appendEvent appends an event and its link in the chain: the hash over
+// the previous event's hash and this event's fields as stored. The
+// transaction holds the write lock from its start, so the head it reads
+// is the last event committed and no other writer can append before it
+// commits. The seq is the one AUTOINCREMENT would assign, past every seq
+// ever used, so a follower's cursor is never reused.
 func (t *txn) appendEvent(ctx context.Context, e Event) error {
 	if len(e.Payload) == 0 {
 		e.Payload = json.RawMessage("{}")
 	}
-	row := t.queryRow(ctx, sqlAppendEvent,
-		e.RunID, e.StepID, formatTime(e.At), e.Type, string(e.Payload))
-	if err := row.Scan(&e.Seq); err != nil {
+	if !t.head.read {
+		if err := t.queryRow(ctx, sqlChainHead).Scan(&t.head.seq, &t.head.hash); err != nil {
+			return err
+		}
+		t.head.read = true
+	}
+	e.Seq = t.head.seq + 1
+	at, payload := formatTime(e.At), string(e.Payload)
+	hash := eventHash(t.head.hash, e.Seq, e.RunID, e.StepID, at, e.Type, payload)
+	if _, err := t.exec(ctx, sqlAppendEvent, e.Seq, e.RunID, e.StepID, at, e.Type, payload, hash); err != nil {
 		return err
 	}
+	t.head.seq, t.head.hash = e.Seq, hash
 	t.events = append(t.events, e)
 	return nil
 }

@@ -2,6 +2,7 @@ package trace_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -385,4 +386,54 @@ func TestJSONLWithErr_SurfacesAWriteFailure(t *testing.T) {
 	if err := errFn(); !errors.Is(err, wantErr) {
 		t.Fatalf("Err() = %v, want %v", err, wantErr)
 	}
+}
+
+// A JSON Lines record is exactly what it was before events were chained:
+// the hash a stored event carries is read through the store, never through
+// Event, so an event read back from a database prints byte for byte as
+// these literals, which consumers compare traces against.
+func TestJSONL_RecordIsByteStable(t *testing.T) {
+	st, err := agentrt.OpenStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	at := time.Date(2026, 9, 25, 14, 3, 4, 500_000_000, time.UTC)
+	ids := 0
+	d, err := agentrt.NewDriver(agentrt.Config{Store: st, Policy: agentrt.DefaultPolicy(),
+		Agent: agentFunc(func(context.Context, agentrt.StepInput) (agentrt.Decision, error) {
+			return agentrt.Decision{Kind: agentrt.DecideComplete, Result: []byte(`{"a":"<b>"}`)}, nil
+		}),
+		Now:   func() time.Time { return at },
+		NewID: func() string { ids++; return fmt.Sprintf("id-%d", ids) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := d.Start(context.Background(), "g", agentrt.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := st.ListEvents(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	obs := trace.JSONL(&buf)
+	for _, e := range events[1:] {
+		obs(e)
+	}
+	want := `{"seq":2,"run_id":"id-1","at":"2026-09-25T14:03:04.5Z","type":"run.started","payload":{}}
+{"seq":3,"run_id":"id-1","step_id":"id-2","at":"2026-09-25T14:03:04.5Z","type":"step.started","payload":{"index":0}}
+{"seq":4,"run_id":"id-1","step_id":"id-2","at":"2026-09-25T14:03:04.5Z","type":"step.decided","payload":{"kind":"complete","result":{"a":"\u003cb\u003e"}}}
+{"seq":5,"run_id":"id-1","at":"2026-09-25T14:03:04.5Z","type":"run.finished","payload":{"detail":"","reason":"goal_completed","status":"COMPLETED","steps":1}}
+`
+	if buf.String() != want {
+		t.Fatalf("JSON Lines changed:\n%s\nwant\n%s", buf.String(), want)
+	}
+}
+
+type agentFunc func(context.Context, agentrt.StepInput) (agentrt.Decision, error)
+
+func (f agentFunc) Decide(ctx context.Context, in agentrt.StepInput) (agentrt.Decision, error) {
+	return f(ctx, in)
 }

@@ -58,6 +58,13 @@ type Driver struct {
 	reconcile func(ctx context.Context, view RunView) (Reconciliation, error)
 	now       func() time.Time
 	newID     func() string
+	// registered are the specs recorded on run.created, in specs' order,
+	// and specCache each tool's spec as last recorded, under specMu.
+	// policyID is the policy's identity, read once.
+	registered []*specEntry
+	specMu     sync.Mutex
+	specCache  map[string]*specEntry
+	policyID   string
 	// reload makes the loop load its steps and approvals from the store at
 	// every step and encode every field of each step it writes, as it did
 	// before it kept them; written is called after each write the loop
@@ -152,6 +159,19 @@ func newDriver(cfg GateConfig) (*Driver, error) {
 		d.specs = append(d.specs, spec)
 	}
 	sort.Slice(d.specs, func(i, j int) bool { return d.specs[i].Name < d.specs[j].Name })
+	d.specCache, d.registered = map[string]*specEntry{}, make([]*specEntry, 0, len(d.specs))
+	for _, spec := range d.specs {
+		e, err := d.recordedSpec(spec)
+		if err != nil {
+			return nil, fmt.Errorf("agentrt: tool %q: %w", spec.Name, err)
+		}
+		d.registered = append(d.registered, e)
+	}
+	id, err := policyID(cfg.Policy)
+	if err != nil {
+		return nil, err
+	}
+	d.policyID = id
 	return d, nil
 }
 

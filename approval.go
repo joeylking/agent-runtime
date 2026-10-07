@@ -45,8 +45,10 @@ func verifyHash(a Approval) error {
 // pause records a hash-bound approval for the step's request and parks
 // the run, which must be in one of from, returning the run and the
 // approval. The step moves to awaiting_approval from whatever status it
-// holds, and step.policy precedes approval.requested.
-func (d *Driver) pause(ctx context.Context, c *runCache, runID string, step *Step, req ToolRequest, pd PolicyDecision, from []RunStatus, policyAt time.Time) (Run, Approval, error) {
+// holds, and step.policy precedes approval.requested, carrying spec, the
+// recorded form of the request's spec, and view, what the policy saw, nil
+// when the decision is not the policy's.
+func (d *Driver) pause(ctx context.Context, c *runCache, runID string, step *Step, req ToolRequest, pd PolicyDecision, from []RunStatus, policyAt time.Time, spec *specEntry, view *policyView) (Run, Approval, error) {
 	now := d.now()
 	fromStep := step.Status
 	step.Status, step.Policy = StepAwaitingApproval, &pd
@@ -71,7 +73,7 @@ func (d *Driver) pause(ctx context.Context, c *runCache, runID string, step *Ste
 		if err := t.transition(ctx, r, from...); err != nil {
 			return err
 		}
-		if err := t.emit(ctx, Event{RunID: runID, StepID: step.ID, At: policyAt, Type: EventStepPolicy}, step.Policy); err != nil {
+		if err := t.policyEvent(ctx, step, policyAt, spec, view); err != nil {
 			return err
 		}
 		if err := t.insertApproval(ctx, a); err != nil {

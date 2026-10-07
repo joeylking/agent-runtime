@@ -485,12 +485,21 @@ func v021(t *testing.T, path string) {
 	}
 }
 
-// The first four migrations are what v0.2.1 applied; a migration is never
+// The first four migrations are what v0.2.1 applied, the first five what
+// v0.4.0 applied, and the sixth is this release's; a migration is never
 // edited once released, only followed by another.
 func TestStore_ReleasedMigrationsAreUnchanged(t *testing.T) {
 	sum := sha256.Sum256([]byte(strings.Join(migrations[:4], "\x00")))
 	if got := hex.EncodeToString(sum[:]); got != "6ea2e8d7079464c92debd7aea61e380770248ad161b796e9d86fa5b449b7869b" {
 		t.Fatalf("the v0.2.1 migrations changed: %s", got)
+	}
+	sum = sha256.Sum256([]byte(strings.Join(migrations[:5], "\x00")))
+	if got := hex.EncodeToString(sum[:]); got != "b47b3eb4c136cb32b67b9a5b9989c13a0b5dd7199b0a40578352d0a40b71ab8f" {
+		t.Fatalf("the v0.4.0 migrations changed: %s", got)
+	}
+	sum = sha256.Sum256([]byte(migrations[5]))
+	if got := hex.EncodeToString(sum[:]); got != "622261022550be143ddf7ff3b37cf9f38b75cccd67913fe04e4e6b4a87d94a5b" {
+		t.Fatalf("the chain migration changed: %s", got)
 	}
 }
 
@@ -515,7 +524,7 @@ func TestStore_V021DatabaseMigratesWithItsRuns(t *testing.T) {
 	defer st.Close()
 	var version int
 	st.DB().QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version)
-	if version != 5 || len(migrations) != 5 {
+	if version != 6 || len(migrations) != 6 {
 		t.Fatalf("version %d of %d", version, len(migrations))
 	}
 	ctx := context.Background()

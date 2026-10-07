@@ -1534,3 +1534,106 @@ func TestIsTerminal_RegularFileIsNotATerminal(t *testing.T) {
 		t.Fatal("a regular file must not be treated as a terminal")
 	}
 }
+
+// verify prints the chain's head and "intact" and exits 0 on an untouched
+// database, in text and JSON; it reads the database without changing it.
+func TestVerify_IntactChainExitsZero(t *testing.T) {
+	path, _, _ := pausedDB(t)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := agentrt.OpenExisting(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, hash, err := store.ChainHead(context.Background())
+	store.Close()
+	if err != nil || seq == 0 {
+		t.Fatalf("head %d %v", seq, err)
+	}
+	code, out, errw := exec(t, "-db", path, "verify")
+	requireOK(t, code, out, errw)
+	want := fmt.Sprintf("head: seq %d %s\nintact: %d event(s), seq 1 to %d\n", seq, hash, seq, seq)
+	if out != want {
+		t.Fatalf("stdout %q, want %q", out, want)
+	}
+	code, out, errw = exec(t, "-db", path, "-json", "verify", "-from", "3", "-to", "5")
+	requireOK(t, code, out, errw)
+	var got struct {
+		Head struct {
+			Seq  int64  `json:"seq"`
+			Hash string `json:"hash"`
+		} `json:"head"`
+		From, To, Checked int64
+		Intact            bool
+		Break             *json.RawMessage `json:"break"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if got.Head.Seq != seq || got.Head.Hash != hash || got.From != 3 || got.To != 5 || got.Checked != 3 || !got.Intact || got.Break != nil {
+		t.Fatalf("json %+v", got)
+	}
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(before, after) {
+		t.Fatal("verify changed the database file")
+	}
+}
+
+// An altered event is reported with the seq, the hash expected, and the
+// hash found, and verify exits 1; in JSON too.
+func TestVerify_BrokenChainExitsOne(t *testing.T) {
+	path, _, _ := pausedDB(t)
+	store, err := agentrt.OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE events SET payload_json = '{"forged":true}' WHERE seq = 4`); err != nil {
+		t.Fatal(err)
+	}
+	found, _ := store.EventHash(context.Background(), 4)
+	store.Close()
+	code, out, errw := exec(t, "-db", path, "verify")
+	if code != exitError || !strings.Contains(out, "broken at seq 4: ") || !strings.Contains(out, "\n  found    "+found+"\n") || !strings.Contains(errw, "the event chain is broken at seq 4") {
+		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errw)
+	}
+	code, out, _ = exec(t, "-db", path, "-json", "verify")
+	var got struct {
+		Intact bool
+		Break  *struct {
+			Seq             int64
+			Expected, Found string
+		}
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if code != exitError || got.Intact || got.Break == nil || got.Break.Seq != 4 || got.Break.Found != found || len(got.Break.Expected) != 64 || got.Break.Expected == found {
+		t.Fatalf("exit %d, json %s", code, out)
+	}
+	// Checking only what precedes the alteration finds it intact.
+	if code, out, errw := exec(t, "-db", path, "verify", "-to", "3"); code != exitOK || !strings.Contains(out, "intact: 3 event(s), seq 1 to 3") {
+		t.Fatalf("exit %d\n%s%s", code, out, errw)
+	}
+}
+
+// verify's arguments are checked before the database is opened, with the
+// usage exit status.
+func TestVerify_BadArgumentsAreUsage(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.db")
+	for _, args := range [][]string{
+		{"verify", "extra"},
+		{"verify", "-from", "-1"},
+		{"verify", "-to", "x"},
+		{"verify", "-from", "5", "-to", "4"},
+	} {
+		code, _, errw := exec(t, append([]string{"-db", missing}, args...)...)
+		if code != exitUsage {
+			t.Fatalf("%v: exit %d, %s", args, code, errw)
+		}
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a usage error touched the database: %v", err)
+	}
+}

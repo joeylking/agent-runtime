@@ -127,12 +127,17 @@ func (s *Session) resumeApproved(ctx context.Context, run Run) Verdict {
 	if verr := d.schemas[req.Spec.Name].validate(req.Args); verr != nil {
 		return s.resumeInvalid(ctx, run, step, granted, resumedAt, verr)
 	}
+	spec, err := d.recordedSpec(req.Spec)
+	if err != nil {
+		return s.finish(d.failInternal(ctx, run.ID, waiting, err))
+	}
 	prior := steps[:step.Index]
 	// Policy is evaluated while the run is still WAITING, so the move to
 	// RUNNING and what the policy decided commit together: a crash between
 	// them cannot drop the approved request.
-	pd, perr := d.policy.Evaluate(ctx, req, RunView{Run: run, Steps: cloneSteps(prior), Approvals: cloneApprovals(approvals)})
-	st := &OpenStep{s: s, step: *step, run: run, proposed: true}
+	view := RunView{Run: run, Steps: cloneSteps(prior), Approvals: cloneApprovals(approvals)}
+	st := &OpenStep{s: s, step: *step, run: run, proposed: true, toolSpec: req.Spec, spec: spec, view: seenBy(view)}
+	pd, perr := d.policy.Evaluate(ctx, req, view)
 	s.open = st
 	return st.apply(ctx, req, pd, perr, granted, resumedAt)
 }
@@ -355,8 +360,13 @@ func (s *Session) reconcilePause(ctx context.Context, run Run, executing *Step, 
 		}
 		return conflict("reconciliation asked to wait but no interrupted tool call can be paused ("+err.Error()+")", e)
 	}
-	executing.Observation, executing.FinishedAt = nil, time.Time{}
-	return s.pause(d.pause(ctx, nil, run.ID, executing, req, *rec.Pause, resumable, now))
+	spec, err := d.recordedSpec(req.Spec)
+	if err != nil {
+		return s.finish(d.failInternal(ctx, run.ID, resumable, err))
+	}
+	// The reconciliation's decision, not the policy's, is the step's now.
+	executing.Observation, executing.FinishedAt, executing.PolicyID = nil, time.Time{}, ""
+	return s.pause(d.pause(ctx, nil, run.ID, executing, req, *rec.Pause, resumable, now, spec, nil))
 }
 
 // InterruptedSideEffect is the approval kind a run pauses on when Resume,
@@ -388,7 +398,11 @@ func (s *Session) interruptedPause(ctx context.Context, run Run, st *Step, now t
 	if err != nil {
 		return s.finish(d.failInternal(ctx, run.ID, resumable, err))
 	}
+	spec, err := d.recordedSpec(req.Spec)
+	if err != nil {
+		return s.finish(d.failInternal(ctx, run.ID, resumable, err))
+	}
 	pd := PolicyDecision{Outcome: RequireApproval, Reason: "interrupted while executing; outcome unknown", Kind: InterruptedSideEffect, Capability: capability, Presentation: presentation}
-	st.Observation, st.FinishedAt = nil, time.Time{}
-	return s.pause(d.pause(ctx, nil, run.ID, st, req, pd, resumable, now))
+	st.Observation, st.FinishedAt, st.PolicyID = nil, time.Time{}, ""
+	return s.pause(d.pause(ctx, nil, run.ID, st, req, pd, resumable, now, spec, nil))
 }

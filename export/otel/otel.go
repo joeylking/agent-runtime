@@ -86,6 +86,8 @@
 //	agentrt.policy.outcome                    step        step.policy                allow, deny, abort, require_approval
 //	agentrt.policy.reason                     step        step.policy                text
 //	agentrt.policy.kind                       step        step.policy                approval kind, for require_approval
+//	agentrt.policy.id                         step        step.policy                the policy's identity, when it has one
+//	agentrt.policy.spec_hash                  step        step.policy                SHA-256 of the tool spec it was handed
 //	agentrt.tool.name                         step, late  step.tool_started/finished registered tool name
 //	agentrt.tool.duration_ms                  step, late  step.tool_finished         int
 //	agentrt.tool.summary                      step, late  step.tool_finished         text
@@ -377,7 +379,8 @@ func (x *Exporter) Handle(e agentrt.Event) error {
 		s.AddEvent(e.Type, trace.WithTimestamp(e.At))
 	case agentrt.EventStepPolicy:
 		s := x.stepSpan(r, e)
-		s.SetAttributes(valid(append(p.attrs, p.str("agentrt.policy.outcome", "outcome"), p.text("agentrt.policy.reason", "reason", x.maxText()), p.str("agentrt.policy.kind", "kind")))...)
+		s.SetAttributes(valid(append(p.attrs, p.str("agentrt.policy.outcome", "outcome"), p.text("agentrt.policy.reason", "reason", x.maxText()), p.str("agentrt.policy.kind", "kind"),
+			p.str("agentrt.policy.id", "policy_id"), p.str("agentrt.policy.spec_hash", "spec_hash")))...)
 		s.AddEvent(e.Type, trace.WithTimestamp(e.At))
 	case agentrt.EventStepToolStarted:
 		s := x.stepSpan(r, e)

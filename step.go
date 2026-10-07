@@ -23,7 +23,9 @@ func (d *Driver) startStep(ctx context.Context, c *runCache, run Run) (Step, err
 	return step, err
 }
 
-func (d *Driver) recordDecision(ctx context.Context, c *runCache, step *Step) error {
+// recordDecision records the step's decision and, for a tool call naming
+// a registered tool, the tool's spec, stored by its hash if it is not yet.
+func (d *Driver) recordDecision(ctx context.Context, c *runCache, step *Step, spec *specEntry) error {
 	now := d.now()
 	return d.write(ctx, c, func(t *txn) error {
 		if err := t.requireStatus(ctx, step.RunID, StatusRunning); err != nil {
@@ -31,6 +33,11 @@ func (d *Driver) recordDecision(ctx context.Context, c *runCache, step *Step) er
 		}
 		if err := t.updateStep(ctx, *step, StepDeciding); err != nil {
 			return err
+		}
+		if spec != nil {
+			if err := t.putSpec(ctx, spec); err != nil {
+				return err
+			}
 		}
 		return t.emit(ctx, Event{RunID: step.RunID, StepID: step.ID, At: now, Type: EventStepDecided}, step.Decision)
 	})

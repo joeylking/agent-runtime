@@ -114,7 +114,16 @@ func (d *Driver) begin(ctx context.Context, id, goal string, limits Limits) (*Se
 		if err := t.insertRun(ctx, run); err != nil {
 			return err
 		}
-		if err := t.emit(ctx, Event{RunID: run.ID, At: now, Type: EventRunCreated}, map[string]any{"goal": goal, "limits": limits}); err != nil {
+		// The tools the run was started with, by the hash of each spec,
+		// stored in the same transaction.
+		tools := make([]string, len(d.registered))
+		for i, e := range d.registered {
+			if err := t.putSpec(ctx, e); err != nil {
+				return err
+			}
+			tools[i] = e.hash
+		}
+		if err := t.emit(ctx, Event{RunID: run.ID, At: now, Type: EventRunCreated}, map[string]any{"goal": goal, "limits": limits, "tools": tools}); err != nil {
 			return err
 		}
 		return t.appendEvent(ctx, Event{RunID: run.ID, At: now, Type: EventRunStarted})
@@ -352,6 +361,13 @@ type OpenStep struct {
 	run Run
 	n   int
 	mc  ModelCaller
+	// toolSpec is the spec of the tool the decision named, as its Spec
+	// returned it, and spec its recorded form: recorded with the decision,
+	// and on resume the one the request now carries. view is what the
+	// policy saw of the run.
+	toolSpec ToolSpec
+	spec     *specEntry
+	view     *policyView
 	// An Allowed verdict leaves what execute starts: the request, the
 	// policy's clock reading, and on resume the grant and its reading.
 	allowed   bool

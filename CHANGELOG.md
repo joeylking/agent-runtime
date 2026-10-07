@@ -13,6 +13,62 @@ entry names a specific module only when the change is not in the core.
 
 ## [Unreleased]
 
+### Added
+
+- **Each decision records what it can be checked against.** A tool_call
+  step naming a registered tool records, with its decision, the hash of
+  that tool's spec (`Step.SpecHash`): the hex SHA-256 of the canonical JSON
+  of the whole `ToolSpec`, `Timeout` and `Terminal` included, because the
+  policy is handed all of it. Each distinct spec is stored once in a new
+  `tool_specs` table and read back whole with `Store.ToolSpec`, which
+  refuses a spec whose stored JSON no longer hashes. `run.created` gains
+  `tools`, the hashes of every registered tool's spec in name order.
+- **`IdentifiedPolicy`.** A policy with a `PolicyID() string` method has
+  that identity recorded on each step it evaluated (`Step.PolicyID`) and in
+  its `step.policy` event. `NewDriver` and `NewGate` read it once and refuse
+  one longer than 256 bytes, not valid UTF-8, or holding a control
+  character. A policy without it records an empty identity.
+- **What the policy saw.** `step.policy` gains `policy_id` (omitted when
+  empty), `spec_hash`, the spec the policy was handed, and `view`: the
+  run's status, step count, model calls, input, output, and cached tokens,
+  estimated cost, and active time as the `RunView` carried them, and how
+  many steps and approvals it held. With `run.created` it rebuilds the
+  run the policy was handed. A `step.policy` written by a reconciliation's
+  or an interrupted side effect's pause has no `view` or `policy_id`.
+- **The events are a hash chain.** Each event's hash covers the previous
+  event's hash and its own seq, run, step, time, type, and payload as
+  stored, computed in the transaction that writes it, one SHA-256 per
+  event. `Store.VerifyEvents(ctx, from, to)` reports the first event that
+  does not chain, in a `VerifyReport` with a `ChainBreak`;
+  `Store.ChainHead` and `Store.EventHash` read the head and any event's
+  hash, for a follower or an operator to keep elsewhere. `Event` has no new
+  field, so traces are unchanged. The chain proves integrity only against a
+  head kept where whoever can write the database cannot reach: such a
+  writer can recompute it.
+- **`agentrt verify [-from N] [-to N]`** prints the chain's head and
+  "intact" or the first break, in text or JSON, exiting 1 on a break. It
+  opens the database read-only and reads a page at a time.
+- `export/otel` maps `step.policy`'s `policy_id` and `spec_hash` to
+  `agentrt.policy.id` and `agentrt.policy.spec_hash`.
+
+### Changed
+
+- **Migration 6.** The first open by this version adds `tool_specs`,
+  `steps.spec_hash` and `steps.policy_id`, and `events.hash`, and computes
+  the hash of every event already stored, in seq order, in the migration's
+  transaction; steps already stored keep an empty spec and policy. Before
+  this version first opens a database, stop every process and operator
+  binary of v0.4.0 or earlier that has it open, as for migration 5: one
+  still writing after the migration appends events with no hash, and the
+  first such event breaks the chain. A v0.4.0 binary refuses a migrated
+  database with `ErrSchemaVersion`, and `OpenExisting` of this version
+  refuses an unmigrated one, as for any other version. The hashes of events
+  stored before the migration say what they held when it ran, not that they
+  were never changed before.
+- `run.created` and `step.policy` payloads gain the fields above; every
+  other payload, every event type and its order, and the content and
+  approval hashes are unchanged.
+
 ## [v0.4.0] - 2026-10-05
 
 Nested modules `mcp` released at v0.2.1, `export/otel` at v0.1.1, and

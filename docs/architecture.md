@@ -27,6 +27,29 @@ Every state change is written in the same SQLite transaction as its audit
 event, and the observer sees events only after commit. The tables are the
 state; the events are the explanation. Nothing is reconstructed by replay.
 
+A step records what its decision can be checked against later. A tool call
+naming a registered tool records, with the decision, the hash of that
+tool's spec (`Step.SpecHash`), the spec itself stored once by its hash in
+`tool_specs` (`Store.ToolSpec`); `run.created` lists the hash of every
+registered tool's spec. A step the policy evaluated records the policy's
+identity (`Step.PolicyID`), empty unless the policy implements
+`IdentifiedPolicy`, which `NewDriver` and `NewGate` read once and refuse
+when it is longer than 256 bytes, not UTF-8, or holds a control character.
+Its `step.policy` event carries, beside the decision's fields as before,
+`policy_id`, `spec_hash`, the spec the policy was handed, and `view`: what
+the policy saw of the run that the record does not otherwise keep, its
+status, step count, model calls, tokens, estimated cost, and active time as
+the `RunView` carried them, and how many steps and approvals it held, which
+are the run's first ones. In the loop the run is the one read when the step
+started, so a model call the step's own decision made is not in it; on
+resume it is the WAITING run. A `step.policy` written by a reconciliation's
+or an interrupted side effect's pause has no `view` and no `policy_id`,
+because no policy decided it, and such a pause clears the step's
+`PolicyID`. On resume the request carries the tool's spec as registered
+then: the event's `spec_hash` names that one, stored if it is new, while
+the step keeps the hash recorded with its decision. None of this reads a
+clock.
+
 A step that ends the run is written in the run's transaction, so a crash
 cannot leave a finished terminal step under a running run. Run and step
 status transitions are compare-and-set inside that transaction: a loop
@@ -388,9 +411,14 @@ decision on an expired approval returns `ErrApprovalExpired`.
 ## Persistence
 
 One SQLite file in WAL mode with runs, steps, model_calls, approvals,
-events, and a schema_migrations table. Migrations are forward only and a
-released one is never edited; the fifth, the run lease, is the first since
-v0.1, and a database written by v0.2.1 migrates with its runs intact. A
+events, tool_specs, and a schema_migrations table. Migrations are forward
+only and a released one is never edited; the fifth, the run lease, is the
+first since v0.1, and a database written by v0.2.1 migrates with its runs
+intact. The sixth adds `tool_specs`, each step's `spec_hash` and
+`policy_id`, empty on the steps already stored, and the events' `hash`,
+which it computes for every event already stored, in seq order, in the
+migration's transaction. A database written by v0.4.0 migrates with its
+runs intact and its events chained. A
 consumer may keep its own tables in the same file under its own
 migrations. Every transaction begins IMMEDIATE and waits on the busy
 timeout, migrations are applied in one such transaction so concurrent
@@ -409,6 +437,37 @@ and nothing in the file can stop it. When the lease migration is applied,
 each RUNNING run is given a lease one `DefaultLeaseTTL` long under a
 placeholder owner, so a loop of the older version still inside a call has
 that long before a current process may take the run over.
+
+The same holds for migration 6: a process of v0.4.0 or earlier still
+holding the file open after it is applied appends events with no hash and
+steps with no spec, and the first such event breaks the chain. A v0.4.0
+binary opening a migrated database refuses it with `ErrSchemaVersion`.
+
+The events are a hash chain. Each event's `hash` is the hex SHA-256 of
+seven netstrings (the length in bytes, a colon, the bytes, a comma): the
+previous event's hash, empty for the first; the event's seq in decimal;
+and its run_id, step_id, at, type, and payload_json exactly as stored. The
+previous event is the one with the next lower seq across every run, so the
+chain follows commit order. Each write reads the head inside its
+transaction, which began IMMEDIATE and so holds the write lock, and gives
+the event the seq AUTOINCREMENT would have, so concurrent writers, in one
+process or several, extend one chain; a rolled-back write leaves no gap.
+`Store.VerifyEvents` walks a range of it a page at a time, reading each
+field in bounded chunks, and reports the first event whose stored hash is
+not the one its fields and its predecessor's hash give, or whose seq does
+not follow its predecessor's; `ChainHead` and `EventHash` read the head and
+any event's hash, and `agentrt verify` prints both. The `Event` a consumer
+receives has no hash field, so a trace is byte for byte what it was.
+
+What the chain proves is limited. Whoever can write the database can
+recompute every hash after a row they changed, so an intact chain shows the
+record unaltered only up to a head compared with one kept where that writer
+cannot reach; a chain cut at its end verifies on its own, and only such a
+kept head shows it is short. Within the file it catches corruption and an
+event altered, deleted, or reordered by anything that did not rewrite the
+chain after it. The events stored before migration 6 carry no claim beyond
+the backfill: their hashes say what they held when the migration ran, not
+that they were never changed before.
 
 A store opened for writing syncs every commit (`synchronous=FULL`): in
 WAL mode `NORMAL` can lose the last commits on power loss, and the last
@@ -437,7 +496,8 @@ such a file uses the page reads, `ListRunsPage`, `GetRunCapped`,
 text column at `MaxPageText` characters, and takes its total from a
 `COUNT`, so neither many rows nor one huge row can exhaust its memory.
 `cmd/agentrt`'s `runs`, `show`, and `events` read only through them, by
-way of `view.RunsPage` and `view.DetailPage`; `approve`, `reject`, and
+way of `view.RunsPage` and `view.DetailPage`, and `verify` through
+`VerifyEvents`, which holds no event whole; `approve`, `reject`, and
 `cancel` read the one run and approval they decide whole, because a
 decision is bound to the approval's hash.
 

@@ -154,6 +154,30 @@ func TestFixtures_EmitEveryEventType(t *testing.T) {
 	}
 }
 
+// The fixtures' events, every type the runtime writes from a completed
+// run, a pause and resume, a crashed process and its takeover, a cancel
+// with a late tool outcome, and a model-backed run with a retry, written
+// by several drivers and processes into one file, form one intact hash
+// chain, and the follower delivers every event of it.
+func TestFixtures_EventChainIsIntact(t *testing.T) {
+	f := loadFixtures(t)
+	var delivered int64
+	if err := (&export.Follower{Store: f.store, Once: true}).Follow(context.Background(), func(agentrt.Event) error {
+		delivered++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := f.store.VerifyEvents(context.Background(), 0, 0)
+	if err != nil || rep.Break != nil || rep.Checked != delivered || rep.From != 1 {
+		t.Fatalf("%d events delivered, report %+v %v", delivered, rep, err)
+	}
+	seq, head, err := f.store.ChainHead(context.Background())
+	if err != nil || seq != rep.To || head != rep.Hash {
+		t.Fatalf("head %d %s, report %+v %v", seq, head, rep, err)
+	}
+}
+
 // A completed run is one run span with a step span per step, parented to
 // it, in the trace derived from the run id; the decision, policy, and tool
 // outcome are attributes of the step; a failed step carries its status.
@@ -198,6 +222,10 @@ func TestExporter_RunAndStepSpans(t *testing.T) {
 	if len(str(t, s, "agentrt.tool.content_hash")) != 64 {
 		t.Fatalf("content hash %q", str(t, s, "agentrt.tool.content_hash"))
 	}
+	if len(str(t, s, "agentrt.policy.spec_hash")) != 64 {
+		t.Fatalf("spec hash %q", str(t, s, "agentrt.policy.spec_hash"))
+	}
+	noAttr(t, s, "agentrt.policy.id")
 	for _, name := range []string{agentrt.EventStepDecided, agentrt.EventStepPolicy, agentrt.EventStepToolStarted} {
 		if _, ok := event(s, name); !ok {
 			t.Fatalf("step 0 has no %s event; has %v", name, s.Events)

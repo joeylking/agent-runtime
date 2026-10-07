@@ -163,7 +163,17 @@ func (st *OpenStep) propose(ctx context.Context, decision Decision) Verdict {
 	decision = blankAsAbsent(decision)
 	recorded := recordable(decision)
 	st.step.Decision = &recorded
-	if err := d.recordDecision(ctx, s.c, &st.step); err != nil {
+	if t, ok := d.tools[decision.Tool]; ok && decision.Kind == DecideToolCall {
+		// The spec is read once, recorded by its hash with the decision,
+		// and is the one the policy is handed.
+		st.toolSpec = t.Spec()
+		spec, err := d.recordedSpec(st.toolSpec)
+		if err != nil {
+			return s.lose(ctx, err)
+		}
+		st.spec, st.step.SpecHash = spec, spec.hash
+	}
+	if err := d.recordDecision(ctx, s.c, &st.step, st.spec); err != nil {
 		return s.lose(ctx, err)
 	}
 
@@ -186,9 +196,10 @@ func (st *OpenStep) propose(ctx context.Context, decision Decision) Verdict {
 	}
 
 	// tool_call
-	req := ToolRequest{RunID: st.run.ID, StepID: st.step.ID, Spec: d.tools[decision.Tool].Spec(), Args: orEmptyObject(decision.Args)}
+	req := ToolRequest{RunID: st.run.ID, StepID: st.step.ID, Spec: st.toolSpec, Args: orEmptyObject(decision.Args)}
 	view := RunView{Run: st.run}
 	view.Steps, view.Approvals = s.c.policy.view(s.c, st.n)
+	st.view = seenBy(view)
 	pd, perr := d.policy.Evaluate(ctx, req, view)
 	return st.apply(ctx, req, pd, perr, nil, time.Time{})
 }
@@ -389,6 +400,7 @@ func (st *OpenStep) apply(ctx context.Context, req ToolRequest, pd PolicyDecisio
 	s, d := st.s, st.s.d
 	c, run, step := s.c, st.run, &st.step
 	st.granted, st.resumedAt = granted, resumedAt
+	step.PolicyID = d.policyID
 	from, suffix := running, ""
 	if granted != nil {
 		from, suffix = waiting, " on resume"
@@ -460,7 +472,7 @@ func (st *OpenStep) apply(ctx context.Context, req ToolRequest, pd PolicyDecisio
 		// In the loop this is the first request; on resume the policy now
 		// wants something other than what was granted, so the run pauses
 		// again.
-		r, a, err := d.pause(ctx, c, run.ID, step, req, pd, from, st.policyAt)
+		r, a, err := d.pause(ctx, c, run.ID, step, req, pd, from, st.policyAt, st.spec, st.view)
 		if err != nil {
 			return st.lose(ctx, err)
 		}
@@ -474,10 +486,10 @@ func (st *OpenStep) apply(ctx context.Context, req ToolRequest, pd PolicyDecisio
 }
 
 // policyEvent appends the step's policy decision as step.policy, at the
-// reading apply took for it.
+// reading apply took for it, with what the policy was handed.
 func (st *OpenStep) policyEvent(ctx context.Context) func(t *txn) error {
 	return func(t *txn) error {
-		return t.emit(ctx, Event{RunID: st.run.ID, StepID: st.step.ID, At: st.policyAt, Type: EventStepPolicy}, st.step.Policy)
+		return t.policyEvent(ctx, &st.step, st.policyAt, st.spec, st.view)
 	}
 }
 
