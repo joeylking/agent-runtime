@@ -125,15 +125,20 @@ already have. It exists for the controls around each action.
 
 ## Status
 
-The current release is v0.4.0. Both consumers still run on v0.3.x, and v0.4.0
-only adds to it: an upgrade needs nothing beyond re-pinning. It carries the
-gate, which lets a program with its own loop use the runtime's controls, the
-exported `agentrt.CanonicalJSON`, and a security fix for numbers that crashed
-schema validation, present in every release through v0.3.2. The nested module
-`proxy`, a local MCP proxy built on the gate, is tagged at v0.1.0 as an
-experiment. The runtime includes the packages that both consumers had
-written separately, an adapter that puts the tools of any MCP server behind
-the policy, and the groundwork for outside contributors. These are items 1,
+The current release is v0.5.0. It carries re-checkable decisions (item 10):
+each step records its tool's spec and the policy's identity, the events are
+hash-chained (`agentrt verify`), and a finished run can be replayed through a
+policy (`Recheck`). It adds a schema migration, so every older process must
+be stopped before the first open, and one behaviour change: a policy is
+handed the arguments and the schema in `PolicyJSON` form on every path.
+Both consumers still run on v0.4.0 until they are re-pinned. v0.4.0 added
+the gate, which lets a program with its own loop use the runtime's controls,
+the exported `agentrt.CanonicalJSON`, and a security fix for numbers that
+crashed schema validation, present in every release through v0.3.2. The
+nested module `proxy`, a local MCP proxy built on the gate, is tagged at
+v0.2.0 as an experiment. The runtime includes the packages that both
+consumers had written separately, an adapter that puts the tools of any MCP
+server behind the policy, and the groundwork for outside contributors. These are items 1,
 2, and 8 of the [roadmap](docs/roadmap.md). Items 3 to 6, the evaluation
 vocabulary, the test kit, event export, and the approval channel, shipped in
 v0.3.1, and both consumers run on them. Item 7, writing up the ideas,
@@ -156,15 +161,16 @@ The three that matter most:
 The provider adapters and the MCP adapter are separate modules inside this
 repository, tagged with a directory prefix: `providers/ollama/v0.2.0`,
 `providers/anthropic/v0.2.0`, `providers/openai/v0.2.0`, `mcp/v0.2.1`,
-`export/otel/v0.1.1`, and `proxy/v0.1.0`. On `main` each requires core
-v0.4.0; the providers' tags still pin v0.3.0, which v0.4.0 only adds to.
+`export/otel/v0.1.2`, and `proxy/v0.2.0`. On `main` each requires core
+v0.5.0; the providers' tags still pin v0.3.0, which v0.4.0 only adds to.
 `bench/v0.1.1` has no requirements at all.
 
-The next release, v0.5.0, is to carry item 10 of the roadmap: re-checkable
+The current release, v0.5.0, carries item 10 of the roadmap: re-checkable
 decisions. It adds a schema migration, so every older process must be stopped
 before the first open, and one behaviour change: a policy is handed the
-arguments and the schema in one form on every path. It is built and tested in
-the repository and is not released.
+arguments and the schema in one form, `PolicyJSON`, on every path. The
+consumers, repo-steward and casework, still run on v0.4.0 until they are
+re-pinned.
 
 The API is pre-1.0 and changes when a consumer needs it to.
 

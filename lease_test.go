@@ -497,9 +497,9 @@ func TestStore_ReleasedMigrationsAreUnchanged(t *testing.T) {
 	if got := hex.EncodeToString(sum[:]); got != "b47b3eb4c136cb32b67b9a5b9989c13a0b5dd7199b0a40578352d0a40b71ab8f" {
 		t.Fatalf("the v0.4.0 migrations changed: %s", got)
 	}
-	sum = sha256.Sum256([]byte(migrations[5]))
-	if got := hex.EncodeToString(sum[:]); got != "622261022550be143ddf7ff3b37cf9f38b75cccd67913fe04e4e6b4a87d94a5b" {
-		t.Fatalf("the chain migration changed: %s", got)
+	sum = sha256.Sum256([]byte(strings.Join(migrations[:6], "\x00")))
+	if got := hex.EncodeToString(sum[:]); got != "de6beb7af02c5b44ad782e073e32d3001191213cc1eb674ea5da3b6bdc2a564a" {
+		t.Fatalf("the v0.5.0 migrations changed: %s", got)
 	}
 }
 

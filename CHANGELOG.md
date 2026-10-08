@@ -13,18 +13,27 @@ entry names a specific module only when the change is not in the core.
 
 ## [Unreleased]
 
-Planned as core v0.5.0. Of the nested modules, `proxy` and `export/otel`
-changed and will need new tags, pinning that core release; `mcp`,
-`providers/ollama`, `providers/anthropic`, `providers/openai`, and `bench`
-did not change and will only be re-pinned or left as they are.
+## [v0.5.0] - 2026-10-08
+
+Nested modules `proxy` released at v0.2.0, which adds the recheck subcommand
+and `Config.PolicyID`, and `export/otel` at v0.1.2, which carries the
+`agentrt.policy.id` and `agentrt.policy.spec_hash` attributes; both pin this
+core release. `mcp`, `providers/ollama`, `providers/anthropic`,
+`providers/openai`, and `bench` did not change and are re-pinned only where
+their go.mod was updated, without a new tag.
 
 This release records what a decision needs to be decided again, chains the
 events, and replays a finished run through a policy (roadmap item 10,
-[ADR 9](docs/decisions/0009-recheckable-decisions.md)). It adds a schema
-migration and one behaviour change, both under Changed. The migration needs
-an operator step, given under Migration 6, before the first open. A policy
-evaluation recorded before the migration is reported by a re-check as not
-re-checkable.
+[ADR 9](docs/decisions/0009-recheckable-decisions.md)). The minor bump marks
+two changes under Changed: a schema migration and a behaviour change, that a
+policy is now handed the request's arguments and its tool's schema in
+`PolicyJSON` form on every path.
+
+An upgrade requires an operator step, given under Migration 6: stop every
+older process and operator binary that has the database open before the
+first open of this version. A v0.4.0 binary refuses a migrated database, and
+the migration hashes every stored event once. A policy evaluation recorded
+before this release is reported by a re-check as not re-checkable.
 
 ### Added
 
@@ -972,7 +981,8 @@ step, failure, loop, call, token, cost, and time limits, an accounting
 model caller with retries, record and replay models, and an audit log
 written with the state. See `docs/architecture.md` and `docs/status.md`.
 
-[Unreleased]: https://github.com/joeylking/agent-runtime/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/joeylking/agent-runtime/compare/v0.5.0...HEAD
+[v0.5.0]: https://github.com/joeylking/agent-runtime/compare/v0.4.0...v0.5.0
 [v0.4.0]: https://github.com/joeylking/agent-runtime/compare/v0.3.2...v0.4.0
 [v0.3.2]: https://github.com/joeylking/agent-runtime/compare/v0.3.1...v0.3.2
 [v0.3.1]: https://github.com/joeylking/agent-runtime/compare/v0.3.0...v0.3.1

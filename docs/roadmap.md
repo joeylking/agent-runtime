@@ -291,8 +291,8 @@ same policy would decide it again.
 identity, events are hash-chained, and a finished run can be replayed
 through a policy to show the same decisions.
 
-**Status.** Built and verified, to be released in core v0.5.0 with migration
-6, and with new tags for `proxy` and `export/otel`, whose code changed. It
+**Status.** Built, verified, and released in core v0.5.0 with proxy/v0.2.0 and
+export/otel/v0.1.2, with migration 6. It
 records each tool call's spec by hash and the policy's identity, chains the
 events (`agentrt verify`), and replays a finished run through a policy
 (`agentrt.Recheck`, `testkit.Recheck`, `agentrt-proxy recheck`,
@@ -341,6 +341,6 @@ each idea built from here.
 The gate, item 9, was added on 2026-10-05 after the research pass ADR 7
 records, and is released in v0.4.0; its first form outside Go, the stdio MCP
 proxy of ADR 8, followed the same day and is released as `proxy/v0.1.0`. Item
-10, re-checkable decisions, was built on 2026-10-07 after that and is to be
-released in core v0.5.0. The order from there is items 11 and 12, with item 12
+10, re-checkable decisions, was built on 2026-10-07 after that and was
+released in core v0.5.0 on 2026-10-08, with `proxy/v0.2.0` and `export/otel/v0.1.2`. The order from there is items 11 and 12, with item 12
 as research.
