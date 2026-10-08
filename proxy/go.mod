@@ -7,7 +7,7 @@ go 1.26.0
 require (
 	// The proxy needs the Gate, in core v0.4.0, and mcp.ReadOwned and its
 	// readers, in mcp/v0.2.1.
-	github.com/joeylking/agent-runtime v0.4.0
+	github.com/joeylking/agent-runtime v0.5.0
 	github.com/joeylking/agent-runtime/mcp v0.2.1
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 )
