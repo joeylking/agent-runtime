@@ -117,6 +117,14 @@ func dsn(path string, q url.Values) string {
 	return prefix + escaped + "?" + q.Encode()
 }
 
+// busyTimeout is how long a connection waits for SQLite's write lock before
+// a statement fails with SQLITE_BUSY. A variable rather than a constant so a
+// test that starts two dozen runs at once on one file can lengthen the wait:
+// on a slow, shared CI runner under the race detector the last writer in
+// that queue has waited past five seconds, and the test is about the chain
+// those writers leave, not about how long one of them waits.
+var busyTimeout = 5 * time.Second
+
 // fileParams are the connection settings of every file-backed store. The
 // schema is not trusted to run functions with side effects, and defensive
 // mode stops SQL from corrupting the file's own structures, because the
@@ -125,7 +133,7 @@ func dsn(path string, q url.Values) string {
 // would lose a committed step.tool_started for a tool that ran.
 func fileParams(write bool) url.Values {
 	q := url.Values{}
-	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeout.Milliseconds()))
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", "trusted_schema(0)")
 	q.Set("_defensive", "1")

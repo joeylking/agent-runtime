@@ -200,6 +200,11 @@ func TestVerifyEvents_ReadsLongFieldsInChunks(t *testing.T) {
 // under the write lock it began with.
 func TestVerifyEvents_ConcurrentWritersKeepTheChain(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "chain.db")
+	// Two dozen writers on one file have kept the last of them waiting past
+	// the default five seconds on a slow, shared CI runner; the chain they
+	// leave is what this test checks, not how long one of them waits.
+	defer func(d time.Duration) { busyTimeout = d }(busyTimeout)
+	busyTimeout = time.Minute
 	const stores, runsPer = 4, 6
 	var wg sync.WaitGroup
 	errs := make(chan error, stores*runsPer)
