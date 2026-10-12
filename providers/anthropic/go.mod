@@ -3,7 +3,7 @@ module github.com/joeylking/agent-runtime/providers/anthropic
 go 1.26.0
 
 require (
-	github.com/anthropics/anthropic-sdk-go v1.76.0
+	github.com/anthropics/anthropic-sdk-go v1.78.0
 	github.com/joeylking/agent-runtime v0.5.0
 )
 
