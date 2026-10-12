@@ -77,7 +77,7 @@ Install the two tools at the versions CI pins (`.github/workflows/ci.yml`
 names the current ones):
 
 ```sh
-go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
+go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
 go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
 ```
 

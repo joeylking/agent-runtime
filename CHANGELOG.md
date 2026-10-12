@@ -13,6 +13,13 @@ entry names a specific module only when the change is not in the core.
 
 ## [Unreleased]
 
+### Security
+
+- `export/otel` requires golang.org/x/net v0.60.0, which fixes
+  [GO-2026-6617](https://pkg.go.dev/vuln/GO-2026-6617) (CVE-2026-97032, an
+  HTTP/2 server crash from a race in the HPACK encoder) that govulncheck
+  reports against v0.59.0.
+
 ## [v0.5.0] - 2026-10-08
 
 Nested modules `proxy` released at v0.2.0, which adds the recheck subcommand
